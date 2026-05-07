@@ -14,11 +14,13 @@ Verify that a Claude Code session survives a hard process kill and can be resume
 
 ## Setup (both scenarios)
 
+> **Safety note:** this demo kills a Claude Code process. The `kill-by-cwd.sh` script in this directory only targets the Claude whose working directory is `/tmp/claude-crash-demo`, so other Claude sessions (including the one you may be reading this README in) are not affected. Do **not** substitute `pkill -f claude` — that matches every Claude process on your machine.
+
 ```bash
 mkdir -p /tmp/claude-crash-demo && cd /tmp/claude-crash-demo
 ```
 
-Open a second terminal (terminal B) in any directory — it only needs to run `pkill`.
+Open a second terminal (terminal B). It can be in any directory — it only needs a path to the kill script in this demo dir.
 
 ---
 
@@ -57,10 +59,10 @@ At this point, `notes.md` exists on disk and Claude's conversation context conta
 
 ### Step 3. Kill the process
 
-Terminal B:
+Terminal B (replace `<path-to-demo>` with wherever you cloned this repo):
 
 ```bash
-pkill -9 -f "claude"
+<path-to-demo>/claude_code_local_single/kill-by-cwd.sh /tmp/claude-crash-demo
 ```
 
 Terminal A should drop back to the shell prompt.
@@ -124,7 +126,7 @@ Watch for Claude to start the Bash tool call. Do not wait for it to finish.
 Terminal B, while the tool call is still running (within ~30 seconds):
 
 ```bash
-pkill -9 -f "claude"
+<path-to-demo>/claude_code_local_single/kill-by-cwd.sh /tmp/claude-crash-demo
 ```
 
 ### Step 4. Resume
@@ -164,7 +166,7 @@ Keep rough notes for comparison with later demos (local_multi, kind, openshell):
 - **Where state lives on disk:** path and format
 - **What survived the kill:** conversation turns, tool calls, tool results, cwd
 - **What was lost:** anything only in memory
-- **Graceful vs. hard kill:** `pkill -9` is hard; `pkill` without `-9` is worth trying as a comparison
+- **Graceful vs. hard kill:** the script uses `kill -9` (hard); editing it to drop `-9` (SIGTERM) is worth trying as a comparison
 - **Mid-tool-call behavior:** replay? skip? error? orphan process?
 
 ## Open questions (revisit after running)
