@@ -169,6 +169,40 @@ Keep rough notes for comparison with later demos (local_multi, kind, openshell):
 - **Graceful vs. hard kill:** the script uses `kill -9` (hard); editing it to drop `-9` (SIGTERM) is worth trying as a comparison
 - **Mid-tool-call behavior:** replay? skip? error? orphan process?
 
+## Cleanup
+
+After you're done recording observations, tear down the demo artifacts. Session records under `~/.claude/projects/` are left in place — they're the evidence trail for what survived the kill.
+
+### 1. Check for orphaned processes (Scenario B only)
+
+The `sleep 60` from Scenario B can outlive the killed Claude. Check for survivors and kill only those spawned from the demo directory:
+
+```bash
+ps -eo pid,ppid,command | awk '/sleep 60/ && !/awk/ {print}'
+```
+
+If you see a `sleep 60` still running from the demo, kill it by PID:
+
+```bash
+kill <pid>
+```
+
+Do **not** run `pkill sleep` — it matches every `sleep` on your machine.
+
+### 2. Remove the scratch directory
+
+```bash
+rm -rf /tmp/claude-crash-demo
+```
+
+This removes `notes.md`, `sleep-result.txt`, and anything else Claude wrote during the run.
+
+### 3. (Optional) Close the resumed session
+
+If the resumed `claude` in terminal A is still attached, exit it normally (`/exit` or Ctrl-D) so it flushes cleanly rather than being killed again.
+
+---
+
 ## Open questions (revisit after running)
 
 - Exact on-disk format of session state (per-session file? append-only log? snapshot?)
