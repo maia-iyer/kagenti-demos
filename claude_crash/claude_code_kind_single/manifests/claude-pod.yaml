@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-crash-demo
+  labels:
+    app: claude-crash-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claude-crash-demo
+  template:
+    metadata:
+      labels:
+        app: claude-crash-demo
+    spec:
+      containers:
+        - name: claude
+          image: node:20-slim
+          command: ["sleep", "infinity"]
+          workingDir: /workspace
+          env:
+            - name: HOME
+              value: /root
+            - name: ANTHROPIC_BASE_URL
+              value: http://host.docker.internal:11434
+            - name: ANTHROPIC_AUTH_TOKEN
+              value: ollama
+            - name: ANTHROPIC_API_KEY
+              value: ""
+          volumeMounts:
+            - name: claude-home
+              mountPath: /root/.claude
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: claude-home
+          emptyDir: {}
+        - name: workspace
+          emptyDir: {}
