@@ -20,6 +20,15 @@ spec:
               value: /root
             - name: ANTHROPIC_API_KEY
               value: ""
+            - name: ANTHROPIC_BASE_URL
+              value: ${MY_LITELLM}
+            - name: ANTHROPIC_MODEL
+              value: ${ANTHROPIC_MODEL}
+            - name: ANTHROPIC_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: claude-litellm
+                  key: ANTHROPIC_AUTH_TOKEN
           volumeMounts:
             - name: claude-home
               mountPath: /root/.claude

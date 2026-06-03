@@ -77,26 +77,17 @@ Pick a model id your LiteLLM serves and export it alongside `MY_LITELLM` and `MY
 export ANTHROPIC_MODEL="<the model id your LiteLLM serves>"
 ```
 
-Apply the Sandbox:
-
-```bash
-kubectl apply -f manifests/sandbox.yaml
-```
-
-Create a Secret from your LiteLLM token. The Sandbox controller doesn't expose `set env` shorthand the way `kubectl set env deployment/...` does, so we patch the Sandbox's `podTemplate.spec.containers[0].env` directly:
+Create the Secret from your LiteLLM token first (the Sandbox references it by name on creation):
 
 ```bash
 kubectl create secret generic claude-litellm \
   --from-literal=ANTHROPIC_AUTH_TOKEN="$MY_LITELLM_TOKEN"
+```
 
-kubectl patch sandbox claude-crash-demo --type=json -p="$(cat <<EOF
-[
-  {"op": "add", "path": "/spec/podTemplate/spec/containers/0/env/-", "value": {"name": "ANTHROPIC_BASE_URL", "value": "$MY_LITELLM"}},
-  {"op": "add", "path": "/spec/podTemplate/spec/containers/0/env/-", "value": {"name": "ANTHROPIC_MODEL", "value": "$ANTHROPIC_MODEL"}},
-  {"op": "add", "path": "/spec/podTemplate/spec/containers/0/env/-", "value": {"name": "ANTHROPIC_AUTH_TOKEN", "valueFrom": {"secretKeyRef": {"name": "claude-litellm", "key": "ANTHROPIC_AUTH_TOKEN"}}}}
-]
-EOF
-)"
+The Sandbox manifest references `${MY_LITELLM}` and `${ANTHROPIC_MODEL}` directly — substitute them at apply time with `envsubst` so the pod is born with the right env (the controller does **not** reconcile pod env when you patch the Sandbox after creation):
+
+```bash
+envsubst < manifests/sandbox.yaml | kubectl apply -f -
 ```
 
 Wait for the pod to be Ready:
@@ -238,6 +229,6 @@ podman machine stop
 
 ## Open questions (revisit after running)
 
-- The `kubectl patch` env-injection step is uglier than `kubectl set env`. Is there an idiomatic agent-sandbox way to layer envFrom/secretRef without rewriting the manifest, or should the manifest just be templated (envsubst, kustomize) up front?
+- The Sandbox controller does not reconcile pod env when you patch the Sandbox after creation — the pod has to be deleted to pick up env changes. We sidestepped that by templating with `envsubst` before the first apply. Worth confirming whether this is intentional or a v0.4.x limitation.
 - `volumeClaimTemplates` accept `accessModes: [ReadWriteOnce]`. Does that block the upcoming "two pods briefly overlapping during recreation" question, or does the Sandbox controller serialize pod transitions enough that RWO is always fine here?
 - `shutdownPolicy: Retain` keeps PVCs alive past Sandbox deletion. Worth a follow-up demo that flips to `shutdownPolicy: Delete` and shows the GC behavior — different blast radius from a pod-level kill.
