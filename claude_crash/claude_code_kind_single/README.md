@@ -39,19 +39,21 @@ kubectl cluster-info
 
 ## Build the demo image
 
-Claude Code is baked into the image so the pod is ready to use as soon as it's running — no in-pod `npm install` step. Build it with podman and load it into the Kind cluster:
+Claude Code is baked into the image so the pod is ready to use as soon as it's running — no in-pod `npm install` step. Build it with podman and load it into the Kind cluster via an archive (podman tags local images under `localhost/`, so `kind load docker-image` doesn't pick them up cleanly):
 
 ```bash
-podman build -t claude-crash-demo:local .
-kind load docker-image claude-crash-demo:local
+podman build -t localhost/claude-crash-demo:local .
+podman save localhost/claude-crash-demo:local -o /tmp/claude-crash-demo.tar
+kind load image-archive /tmp/claude-crash-demo.tar
 ```
 
-> If `kind load docker-image` errors out under podman, use the archive form instead:
-> ```bash
-> podman save claude-crash-demo:local | kind load image-archive /dev/stdin
-> ```
+Confirm the image landed on the node:
 
-The manifest references `claude-crash-demo:local` with `imagePullPolicy: IfNotPresent`, so Kind uses the loaded image directly.
+```bash
+podman exec kind-control-plane crictl images | grep claude
+```
+
+The manifest references `localhost/claude-crash-demo:local` with `imagePullPolicy: IfNotPresent`, so Kind uses the loaded image directly.
 
 ## Setup
 

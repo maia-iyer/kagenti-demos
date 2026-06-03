@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: claude
-          image: claude-crash-demo:local
+          image: localhost/claude-crash-demo:local
           imagePullPolicy: IfNotPresent
           workingDir: /workspace
           env:
