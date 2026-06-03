@@ -20,19 +20,31 @@ if ! command -v lsof >/dev/null 2>&1; then
   exit 2
 fi
 
+# lsof reports the fully resolved path (e.g. /tmp -> /private/tmp on macOS),
+# so resolve the target the same way before comparing.
+resolve_path() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+target_cwd_resolved="$(resolve_path "$target_cwd")"
+
 pid=""
 for candidate in $(pgrep -f "claude" || true); do
   cwd="$(lsof -a -p "$candidate" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2)}')"
-  if [ "$cwd" = "$target_cwd" ]; then
+  if [ -z "$cwd" ]; then
+    continue
+  fi
+  cwd_resolved="$(resolve_path "$cwd")"
+  if [ "$cwd_resolved" = "$target_cwd_resolved" ]; then
     pid="$candidate"
     break
   fi
 done
 
 if [ -z "$pid" ]; then
-  echo "no claude process with cwd=$target_cwd found" >&2
+  echo "no claude process with cwd=$target_cwd_resolved found" >&2
   exit 1
 fi
 
-echo "killing claude pid=$pid (cwd=$target_cwd)"
+echo "killing claude pid=$pid (cwd=$target_cwd_resolved)"
 kill -9 "$pid"

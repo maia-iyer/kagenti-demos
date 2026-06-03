@@ -10,11 +10,31 @@ Show that when `~/.claude/` lives on `emptyDir`, a `kubectl delete pod` wipes th
 
 ## Prerequisites
 
-- A running Kind cluster (`kind create cluster` — see https://kind.sigs.k8s.io/)
+- A running Kind cluster on top of a Podman machine (see below)
 - `kubectl` configured against that cluster (`kubectl cluster-info`)
 - **Ollama on the host**, with a model pulled (example below uses `qwen3.5` as in the [Ollama + Claude Code docs](https://docs.ollama.com/integrations/claude-code))
 
 Two terminals side-by-side: terminal A execs into the pod and runs Claude Code; terminal B issues the `kubectl delete`.
+
+### Start the Podman machine and Kind cluster
+
+This demo uses Podman as Kind's container runtime. On macOS, Podman runs in a VM that must be started before Kind can talk to it.
+
+```bash
+# One-time: create the VM (skip if `podman machine list` already shows one)
+podman machine init
+
+# Start the VM (and verify it's up)
+podman machine start
+podman info >/dev/null && echo "podman ready"
+
+# Tell kind to use podman, then create the cluster
+export KIND_EXPERIMENTAL_PROVIDER=podman
+kind create cluster
+kubectl cluster-info
+```
+
+> Keep `KIND_EXPERIMENTAL_PROVIDER=podman` exported in any shell that runs `kind` against this cluster (including the kill-script terminal), or kind will default to docker and fail to find the cluster.
 
 ## Host Ollama (required)
 
@@ -182,10 +202,11 @@ Same columns as the local demo, so the two rows sit next to each other in your n
 kubectl delete -f manifests/claude-pod.yaml
 ```
 
-Optionally tear down the cluster:
+Optionally tear down the cluster (and stop the Podman VM):
 
 ```bash
 kind delete cluster
+podman machine stop
 ```
 
 ## Open questions (revisit after running)
