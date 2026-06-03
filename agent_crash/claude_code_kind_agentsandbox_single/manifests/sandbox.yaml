@@ -1,0 +1,44 @@
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: claude-crash-demo
+  labels:
+    app: claude-crash-demo
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        app: claude-crash-demo
+    spec:
+      containers:
+        - name: claude
+          image: localhost/claude-crash-demo:local
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: HOME
+              value: /root
+            - name: ANTHROPIC_API_KEY
+              value: ""
+          volumeMounts:
+            - name: claude-home
+              mountPath: /root/.claude
+            - name: workspace
+              mountPath: /workspace
+  volumeClaimTemplates:
+    - metadata:
+        name: claude-home
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: workspace
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
