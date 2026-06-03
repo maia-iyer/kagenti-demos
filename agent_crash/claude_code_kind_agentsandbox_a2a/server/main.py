@@ -47,6 +47,14 @@ def save_session_id(session_id: str) -> None:
 
 class ClaudeCodeAgentExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        if context.current_task is None:
+            initial_task = T.Task(
+                id=context.task_id,
+                context_id=context.context_id,
+                status=T.TaskStatus(state=T.TaskState.TASK_STATE_SUBMITTED),
+            )
+            await event_queue.enqueue_event(initial_task)
+
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
         await updater.start_work(
             message=updater.new_agent_message(
@@ -119,7 +127,11 @@ def build_agent_card(host: str, port: int) -> T.AgentCard:
         default_output_modes=["text/plain"],
         capabilities=T.AgentCapabilities(streaming=False),
         supported_interfaces=[
-            T.AgentInterface(protocol_binding="JSONRPC", url=public_url),
+            T.AgentInterface(
+                protocol_binding="JSONRPC",
+                url=public_url,
+                protocol_version="1.0",
+            ),
         ],
         skills=[skill],
     )
