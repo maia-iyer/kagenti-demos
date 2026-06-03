@@ -84,11 +84,15 @@ kubectl create secret generic claude-litellm \
   --from-literal=ANTHROPIC_AUTH_TOKEN="$MY_LITELLM_TOKEN"
 ```
 
-The Sandbox manifest references `${MY_LITELLM}` and `${ANTHROPIC_MODEL}` directly — substitute them at apply time with `envsubst` so the pod is born with the right env (the controller does **not** reconcile pod env when you patch the Sandbox after creation):
+The Sandbox manifest references `${MY_LITELLM}` and `${ANTHROPIC_MODEL}` directly — substitute them at apply time so the pod is born with the right env (the controller does **not** reconcile pod env when you patch the Sandbox after creation):
 
 ```bash
-envsubst < manifests/sandbox.yaml | kubectl apply -f -
+sed -e "s|\${MY_LITELLM}|$MY_LITELLM|g" \
+    -e "s|\${ANTHROPIC_MODEL}|$ANTHROPIC_MODEL|g" \
+    manifests/sandbox.yaml | kubectl apply -f -
 ```
+
+> `sed` is on stock macOS; `envsubst` is not. If you have `envsubst` installed (e.g. via `brew install gettext`), `envsubst < manifests/sandbox.yaml | kubectl apply -f -` works too.
 
 Wait for the pod to be Ready:
 
