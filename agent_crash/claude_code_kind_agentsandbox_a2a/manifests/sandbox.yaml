@@ -1,0 +1,71 @@
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: claude-crash-demo
+  labels:
+    app: claude-crash-demo
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        app: claude-crash-demo
+    spec:
+      containers:
+        - name: claude
+          image: localhost/claude-crash-demo-a2a:local
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          ports:
+            - name: a2a
+              containerPort: 8000
+          env:
+            - name: HOME
+              value: /root
+            - name: ANTHROPIC_API_KEY
+              value: ""
+            - name: ANTHROPIC_BASE_URL
+              value: ${MY_LITELLM}
+            - name: ANTHROPIC_MODEL
+              value: ${ANTHROPIC_MODEL}
+            - name: ANTHROPIC_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: claude-litellm
+                  key: ANTHROPIC_AUTH_TOKEN
+          volumeMounts:
+            - name: claude-home
+              mountPath: /root/.claude
+            - name: workspace
+              mountPath: /workspace
+  volumeClaimTemplates:
+    - metadata:
+        name: claude-home
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: workspace
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-crash-demo-a2a
+  labels:
+    app: claude-crash-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: claude-crash-demo
+  ports:
+    - name: a2a
+      port: 8000
+      targetPort: a2a

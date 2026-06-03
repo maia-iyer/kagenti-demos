@@ -11,8 +11,9 @@ The forcing question: when a harness process is killed, what state must the plat
 | 1 | [claude_code_local_single](./claude_code_local_single/) | Claude Code | Local | Sketch |
 | 2 | [claude_code_kind_single](./claude_code_kind_single/) | Claude Code | Kind (emptyDir, Deployment) | Sketch |
 | 3 | [claude_code_kind_agentsandbox_single](./claude_code_kind_agentsandbox_single/) | Claude Code | Kind (PVC, agent-sandbox) | Sketch |
+| 4 | [claude_code_kind_agentsandbox_a2a](./claude_code_kind_agentsandbox_a2a/) | Claude Code (via A2A) | Kind (PVC, agent-sandbox) | Sketch |
 
-Demos 2 and 3 share the harness, image, workload, and kill mechanism — only the storage layer and the controller change. Demo 2 is the negative control (loss expected); demo 3 is the positive control (survival expected).
+Demos 2 and 3 share the harness, image, workload, and kill mechanism — only the storage layer and the controller change. Demo 2 is the negative control (loss expected); demo 3 is the positive control (survival expected). Demo 4 reuses demo 3's storage model but swaps the host-to-pod surface from `kubectl exec` to A2A, probing whether a local-TUI harness can be exposed as an A2A agent without harness changes.
 
 Additional scenarios (Claude Code multi-session, OpenShell local/multi/Kind) are outlined in [`scratch.md`](./scratch.md) and will be promoted into their own demo directories as they are built.
 
