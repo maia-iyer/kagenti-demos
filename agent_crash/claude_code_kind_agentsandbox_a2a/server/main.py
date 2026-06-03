@@ -4,6 +4,8 @@ Each inbound A2A message/send is handed to query() with resume=<session_id>
 so the conversation continues across requests. The session_id is persisted
 to /root/.claude/a2a-session-id so it also survives pod restarts (the file
 lives on the PVC mounted at /root/.claude).
+
+Targets a2a-sdk 1.1.x (proto-backed types) and claude-agent-sdk 0.1.x.
 """
 
 from __future__ import annotations
@@ -12,24 +14,12 @@ import os
 from pathlib import Path
 
 import uvicorn
+from a2a import types as T
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
-from a2a.types import (
-    AgentCapabilities,
-    AgentCard,
-    AgentInterface,
-    AgentSkill,
-    TaskState,
-)
-from a2a.utils import (
-    get_message_text,
-    new_task_from_user_message,
-    new_text_message,
-    new_text_part,
-)
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -57,22 +47,19 @@ def save_session_id(session_id: str) -> None:
 
 class ClaudeCodeAgentExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        task = context.current_task
-        if task is None:
-            task = new_task_from_user_message(context.message)
-            await event_queue.enqueue_event(task)
-
-        updater = TaskUpdater(event_queue, task.id, task.contextId)
-        await updater.update_status(
-            TaskState.TASK_STATE_WORKING,
-            message=new_text_message("Forwarding to Claude Code..."),
+        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        await updater.start_work(
+            message=updater.new_agent_message(
+                parts=[T.Part(text="Forwarding to Claude Code...")]
+            )
         )
 
-        prompt = get_message_text(context.message) or ""
+        prompt = context.get_user_input() or ""
         if not prompt:
-            await updater.update_status(
-                TaskState.TASK_STATE_COMPLETED,
-                message=new_text_message("No text input provided."),
+            await updater.complete(
+                message=updater.new_agent_message(
+                    parts=[T.Part(text="No text input provided.")]
+                )
             )
             return
 
@@ -100,21 +87,21 @@ class ClaudeCodeAgentExecutor(AgentExecutor):
             save_session_id(last_session_id)
 
         text = final_result or "".join(collected) or "(no text returned)"
-        await updater.add_artifact(parts=[new_text_part(text=text, media_type="text/plain")])
-        await updater.update_status(
-            TaskState.TASK_STATE_COMPLETED,
-            message=new_text_message("Done."),
-        )
+        await updater.add_artifact(parts=[T.Part(text=text)], name="reply")
+        await updater.complete()
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise NotImplementedError("cancel not supported")
 
 
-def build_agent_card(host: str, port: int) -> AgentCard:
-    skill = AgentSkill(
+def build_agent_card(host: str, port: int) -> T.AgentCard:
+    skill = T.AgentSkill(
         id="claude_code",
         name="Claude Code",
-        description="Run a Claude Code prompt against the pod's /workspace; session resumes across requests.",
+        description=(
+            "Run a Claude Code prompt against the pod's /workspace; "
+            "session resumes across requests."
+        ),
         tags=["claude-code", "kagenti", "agent-crash"],
         examples=[
             "Create notes.md with three sections.",
@@ -124,15 +111,15 @@ def build_agent_card(host: str, port: int) -> AgentCard:
         output_modes=["text/plain"],
     )
     public_url = os.environ.get("A2A_PUBLIC_URL", f"http://{host}:{port}")
-    return AgentCard(
+    return T.AgentCard(
         name="claude-code-a2a",
         description="Claude Code wrapped behind A2A, running in a Kagenti agent-sandbox.",
         version="0.1.0",
         default_input_modes=["text/plain"],
         default_output_modes=["text/plain"],
-        capabilities=AgentCapabilities(streaming=False),
+        capabilities=T.AgentCapabilities(streaming=False),
         supported_interfaces=[
-            AgentInterface(protocol_binding="JSONRPC", url=public_url),
+            T.AgentInterface(protocol_binding="JSONRPC", url=public_url),
         ],
         skills=[skill],
     )
