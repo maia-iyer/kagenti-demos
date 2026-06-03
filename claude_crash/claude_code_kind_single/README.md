@@ -55,20 +55,7 @@ ollama pull qwen3.5
 ### Reaching the host from the pod
 
 - **Docker Desktop (macOS / Windows):** `host.docker.internal` usually resolves from Kind workloads; the manifest uses that URL by default.
-- **Linux (Kind on docker-ce / podman):** `host.docker.internal` is often **missing**. Point the Deployment at the Docker bridge gateway instead (commonly `172.17.0.1`; confirm with `ip addr show docker0` or your runtime’s docs), for example:
-
-```bash
-kubectl set env deployment/claude-crash-demo ANTHROPIC_BASE_URL=http://172.17.0.1:11434
-```
-
-Smoke-test from the cluster before installing Claude Code:
-
-```bash
-kubectl run -it --rm hostping --image=curlimages/curl --restart=Never -- \
-  curl -sS -o /dev/null -w "%{http_code}\n" http://host.docker.internal:11434/api/tags
-```
-
-If that fails with “Could not resolve host”, use the Linux `kubectl set env` URL above (or add a `hostAliases` entry to the Pod template with your host’s reachable IP).
+- **Linux (Kind on docker-ce / podman):** `host.docker.internal` is often **missing**. After you apply the manifest in the Setup step below, point the Deployment at the Docker bridge gateway instead (commonly `172.17.0.1`; confirm with `ip addr show docker0` or your runtime’s docs).
 
 ## Setup
 
@@ -80,6 +67,22 @@ Apply the manifest (no Secret — auth is local):
 kubectl apply -f manifests/claude-pod.yaml
 kubectl rollout status deployment/claude-crash-demo
 ```
+
+**Linux only:** override the base URL now that the Deployment exists:
+
+```bash
+kubectl set env deployment/claude-crash-demo ANTHROPIC_BASE_URL=http://172.17.0.1:11434
+kubectl rollout status deployment/claude-crash-demo
+```
+
+Smoke-test from the cluster before installing Claude Code:
+
+```bash
+kubectl run -it --rm hostping --image=curlimages/curl --restart=Never -- \
+  curl -sS -o /dev/null -w "%{http_code}\n" http://host.docker.internal:11434/api/tags
+```
+
+If that fails with “Could not resolve host” on Linux, the `kubectl set env` override above is what you need (or add a `hostAliases` entry to the Pod template with your host’s reachable IP).
 
 Get the pod name and exec in:
 
