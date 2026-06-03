@@ -16,16 +16,12 @@ spec:
     spec:
       containers:
         - name: claude
-          image: node:20-slim
-          command: ["sleep", "infinity"]
+          image: claude-crash-demo:local
+          imagePullPolicy: IfNotPresent
           workingDir: /workspace
           env:
             - name: HOME
               value: /root
-            - name: ANTHROPIC_BASE_URL
-              value: http://host.docker.internal:11434
-            - name: ANTHROPIC_AUTH_TOKEN
-              value: ollama
             - name: ANTHROPIC_API_KEY
               value: ""
           volumeMounts:
