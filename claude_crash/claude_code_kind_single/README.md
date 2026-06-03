@@ -39,13 +39,14 @@ kubectl cluster-info
 
 ## Build the demo image
 
-Claude Code is baked into the image so the pod is ready to use as soon as it's running — no in-pod `npm install` step. Build it with podman and load it into the Kind cluster via an archive (podman tags local images under `localhost/`, so `kind load docker-image` doesn't pick them up cleanly):
+Claude Code is baked into the image so the pod is ready to use as soon as it's running — no in-pod `npm install` step. Build it with podman and load it into the Kind cluster:
 
 ```bash
 podman build -t localhost/claude-crash-demo:local .
-podman save localhost/claude-crash-demo:local -o /tmp/claude-crash-demo.tar
-kind load image-archive /tmp/claude-crash-demo.tar
+kind load docker-image localhost/claude-crash-demo:local
 ```
+
+> Use the `localhost/` prefix throughout. Podman tags local builds under that registry, and the manifest references the same name; without the prefix, the kubelet treats it as a Docker Hub image and the pull fails.
 
 Confirm the image landed on the node:
 
