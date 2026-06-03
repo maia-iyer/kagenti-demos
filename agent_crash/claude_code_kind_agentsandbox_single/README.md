@@ -45,10 +45,10 @@ Pin a release tag from <https://github.com/kubernetes-sigs/agent-sandbox/release
 export AGENT_SANDBOX_VERSION="v0.4.6"
 kubectl apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/manifest.yaml"
 kubectl wait --for=condition=Available --timeout=120s \
-  deployment/agent-sandbox-controller-manager -n agent-sandbox-system
+  deployment/agent-sandbox-controller -n agent-sandbox-system
 ```
 
-> If the namespace name printed by `kubectl get ns | grep sandbox` differs from `agent-sandbox-system`, adjust the `wait` accordingly. The controller name has been stable across recent releases.
+> If `kubectl get deploy -n agent-sandbox-system` shows a different deployment name, adjust the `wait` accordingly.
 
 Verify the CRD is registered:
 
