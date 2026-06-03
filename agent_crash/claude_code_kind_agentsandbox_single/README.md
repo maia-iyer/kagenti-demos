@@ -10,12 +10,32 @@ Show that moving session state off `emptyDir` and onto PVC storage owned by the 
 
 ## Prerequisites
 
-- A running Kind cluster on top of a Podman machine (see [`claude_code_kind_single`](../claude_code_kind_single/README.md) for the macOS+Podman setup if you don't have one)
+- A running Kind cluster on top of a Podman machine (see below)
 - `kubectl` configured against that cluster (`kubectl cluster-info`)
 - A **LiteLLM endpoint** that speaks the Anthropic API, plus an API key for it
-- The endpoint URL and key exported in your shell as `MY_LITELLM` and `MY_LITELLM_TOKEN`
+- The endpoint URL and key exported in your shell as `MY_LITELLM` and `MY_LITELLM_TOKEN` (the Setup commands read those names directly)
 
 Two terminals side-by-side: terminal A execs into the pod and runs Claude Code; terminal B issues the `kubectl delete`.
+
+### Start the Podman machine and Kind cluster
+
+This demo uses Podman as Kind's container runtime. On macOS, Podman runs in a VM that must be started before Kind can talk to it.
+
+```bash
+# One-time: create the VM (skip if `podman machine list` already shows one)
+podman machine init
+
+# Start the VM (and verify it's up)
+podman machine start
+podman info >/dev/null && echo "podman ready"
+
+# Tell kind to use podman, then create the cluster
+export KIND_EXPERIMENTAL_PROVIDER=podman
+kind create cluster
+kubectl cluster-info
+```
+
+> Keep `KIND_EXPERIMENTAL_PROVIDER=podman` exported in any shell that runs `kind` against this cluster (including the kill-script terminal), or kind will default to docker and fail to find the cluster.
 
 ## Install agent-sandbox
 
