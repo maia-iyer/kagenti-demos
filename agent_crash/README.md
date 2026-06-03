@@ -16,4 +16,12 @@ Demos 2 and 3 share the harness, image, workload, and kill mechanism — only th
 
 Additional scenarios (Claude Code multi-session, OpenShell local/multi/Kind) are outlined in [`scratch.md`](./scratch.md) and will be promoted into their own demo directories as they are built.
 
+## Future demos
+
+Each agent-sandbox extension addresses a different platform capability. Each one motivates its own demo — keep the existing demos focused on a single variable, and let new demos grow the track.
+
+- **Multi-user crash recovery** (`SandboxTemplate` + `SandboxClaim`) — many concurrent users, each backed by a per-user `SandboxClaim` against a shared `SandboxTemplate`. Kill user A's pod and confirm A's PVC returns to A's replacement pod, not B's. Tests PVC partitioning across many sandboxes from one template.
+- **Fast resume via warm pool** (`SandboxWarmPool`) — keep N pre-warmed Sandboxes ready so claims resolve without the image-pull + PVC-provisioning latency. Different question from crash recovery (provisioning latency, not state survival), but a real platform capability worth demonstrating on its own. Note: a warm pool hands out a *different* Sandbox with *different* PVCs, so it would break the survival contract of the current PVC demo if mixed in.
+- **Graceful suspend vs. abrupt kill** (Sandbox snapshots) — contrast `OperatingMode: Suspended` (or `sandbox.suspend()` from the SDK) with the `kubectl delete pod` flow. Both end with the pod down, but only suspend preserves in-memory state via a snapshot. Currently tied to gVisor + GKE Autopilot, so this demo would target GKE rather than Kind.
+
 Shared helpers, manifests, and libraries will move into `shared/` the first time two demos need the same piece.
