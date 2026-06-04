@@ -10,6 +10,14 @@ spec:
       labels:
         app: claude-crash-demo
     spec:
+      # Run as the non-root `agent` user baked into the image. Claude Code
+      # refuses --dangerously-skip-permissions (i.e. the SDK's
+      # permission_mode="bypassPermissions") when running as root. fsGroup
+      # ensures the PVCs come up writable by uid 1000.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: claude
           image: localhost/claude-crash-demo-a2a:local
@@ -20,7 +28,7 @@ spec:
               containerPort: 8000
           env:
             - name: HOME
-              value: /root
+              value: /home/node
             - name: ANTHROPIC_API_KEY
               value: ""
             - name: ANTHROPIC_BASE_URL
@@ -34,7 +42,7 @@ spec:
                   key: ANTHROPIC_AUTH_TOKEN
           volumeMounts:
             - name: claude-home
-              mountPath: /root/.claude
+              mountPath: /home/node/.claude
             - name: workspace
               mountPath: /workspace
   volumeClaimTemplates:

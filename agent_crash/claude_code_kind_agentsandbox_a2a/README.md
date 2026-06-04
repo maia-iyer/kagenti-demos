@@ -23,13 +23,13 @@ send.sh ──► localhost:8000 ──port-forward──► svc/claude-crash-de
                                                  pod (Sandbox-managed)
                                                   ├── server/main.py  (a2a-sdk)
                                                   │     └── claude-agent-sdk.query()
-                                                  │           ├─ resume=<id from /root/.claude/a2a-session-id>
+                                                  │           ├─ resume=<id from /home/node/.claude/a2a-session-id>
                                                   │           └─ cwd=/workspace
-                                                  ├── /root/.claude   (PVC)
+                                                  ├── /home/node/.claude   (PVC)
                                                   └── /workspace      (PVC)
 ```
 
-The server captures `ResultMessage.session_id` from the SDK on the first call and writes it to `/root/.claude/a2a-session-id`. Subsequent calls (and calls from the *replacement* pod after a kill) read that file and pass `resume=<id>` to `query()`, so the conversation continues.
+The server captures `ResultMessage.session_id` from the SDK on the first call and writes it to `/home/node/.claude/a2a-session-id`. Subsequent calls (and calls from the *replacement* pod after a kill) read that file and pass `resume=<id>` to `query()`, so the conversation continues.
 
 ## Prerequisites
 
@@ -147,7 +147,7 @@ Each call returns the assistant's text reply. Confirm `notes.md` was actually wr
 ```bash
 POD=$(kubectl get pod -l app=claude-crash-demo -o jsonpath='{.items[0].metadata.name}')
 kubectl exec "$POD" -- cat /workspace/notes.md
-kubectl exec "$POD" -- cat /root/.claude/a2a-session-id
+kubectl exec "$POD" -- cat /home/node/.claude/a2a-session-id
 ```
 
 The pointer file should contain a UUID; that's the Claude Code session being reused across A2A calls.
@@ -162,7 +162,7 @@ Terminal C:
 ./kill-by-pod.sh default --force
 ```
 
-Terminal A's `port-forward` will drop (the pod it was attached to is gone). The Sandbox controller schedules a replacement pod onto the same PVCs; the new pod's container restarts the A2A server, which reads the same `/root/.claude/a2a-session-id` from the PVC.
+Terminal A's `port-forward` will drop (the pod it was attached to is gone). The Sandbox controller schedules a replacement pod onto the same PVCs; the new pod's container restarts the A2A server, which reads the same `/home/node/.claude/a2a-session-id` from the PVC.
 
 ### Step 3. Re-establish the port-forward against the new pod
 
@@ -194,7 +194,7 @@ Expected:
 
 - The new pod's `notes.md` contains all four sections from before (PVC-backed `/workspace`).
 - The third bullet is appended to `Goals` — Claude Code understood "the Goals section of notes.md" without being re-told what `notes.md` is or what's in it. That's session continuity through the kill.
-- `kubectl exec "$POD" -- cat /root/.claude/a2a-session-id` returns the same UUID as before. The session-id pointer survived because the file lives on the `/root/.claude` PVC.
+- `kubectl exec "$POD" -- cat /home/node/.claude/a2a-session-id` returns the same UUID as before. The session-id pointer survived because the file lives on the `/home/node/.claude` PVC.
 
 ---
 
@@ -202,10 +202,10 @@ Expected:
 
 Same columns as demos 1–3, with two added rows for the A2A surface:
 
-- **Where state lives on disk (pod):** `/root/.claude/` (incl. `a2a-session-id` pointer) and `/workspace`, both PVC-backed via the Sandbox's `volumeClaimTemplates` — scoped to the **Sandbox**, not the pod
+- **Where state lives on disk (pod):** `/home/node/.claude/` (incl. `a2a-session-id` pointer) and `/workspace`, both PVC-backed via the Sandbox's `volumeClaimTemplates` — scoped to the **Sandbox**, not the pod
 - **Where state lives (off-pod):** the LiteLLM endpoint, the loaded image (`claude-crash-demo-a2a:local`), the `claude-litellm` Secret, the `Sandbox` object, the `claude-crash-demo-a2a` Service, and the two PVCs
 - **Host-side state:** the `kubectl port-forward` TCP session — does not survive pod kill, must be re-run; no other host state
-- **What survived the kill:** session history + project metadata under `/root/.claude`, `notes.md`, `a2a-session-id`, the Service (Service IP unchanged), the Sandbox, the PVCs, the image, the LiteLLM endpoint
+- **What survived the kill:** session history + project metadata under `/home/node/.claude`, `notes.md`, `a2a-session-id`, the Service (Service IP unchanged), the Sandbox, the PVCs, the image, the LiteLLM endpoint
 - **What was lost:** the in-pod uvicorn process and its in-memory `InMemoryTaskStore` (so old A2A `Task` objects from before the kill are not addressable by id from the new pod — the *conversation* continues but *Task objects* don't)
 - **Kill mechanism:** `kubectl delete pod` — the kubelet SIGTERMs the container and the agent-sandbox controller schedules a new pod that re-mounts the existing PVCs and restarts the server
 
@@ -213,8 +213,8 @@ Same columns as demos 1–3, with two added rows for the A2A surface:
 
 Two things had to survive the kill for the A2A conversation to continue:
 
-1. **Claude Code's own transcript** under `/root/.claude/projects/` — already PVC-backed in the prior demo, no change here.
-2. **The Claude Code `session_id` the A2A server passes to `query(resume=...)`** — persisted to `/root/.claude/a2a-session-id`, also on the PVC. Without this, the replacement pod's server would mint a fresh session and the model would have no idea what `notes.md` is.
+1. **Claude Code's own transcript** under `/home/node/.claude/projects/` — already PVC-backed in the prior demo, no change here.
+2. **The Claude Code `session_id` the A2A server passes to `query(resume=...)`** — persisted to `/home/node/.claude/a2a-session-id`, also on the PVC. Without this, the replacement pod's server would mint a fresh session and the model would have no idea what `notes.md` is.
 
 The A2A server's `InMemoryTaskStore` does **not** survive the kill. For the single-conversation case in this demo that doesn't matter — the host is using `message/send` and reading the assistant's reply synchronously. For workflows that depend on long-lived A2A `Task` ids (e.g. polling `tasks/get`, push notifications), the task store would also need to be PVC-backed or moved to an external store. That's the next variable to isolate, not part of this demo.
 

@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 )
 from starlette.applications import Starlette
 
-SESSION_FILE = Path("/root/.claude/a2a-session-id")
+SESSION_FILE = Path(os.environ.get("HOME", "/home/node")) / ".claude" / "a2a-session-id"
 WORKSPACE = "/workspace"
 
 
@@ -76,6 +76,7 @@ class ClaudeCodeAgentExecutor(AgentExecutor):
             cwd=WORKSPACE,
             setting_sources=[],
             resume=resume_id,
+            permission_mode="bypassPermissions",
         )
 
         collected: list[str] = []
