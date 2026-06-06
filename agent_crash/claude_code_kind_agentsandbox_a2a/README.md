@@ -31,6 +31,8 @@ send.sh ──► localhost:8000 ──port-forward──► svc/claude-crash-de
 
 The server captures `ResultMessage.session_id` from the SDK on the first call and writes it to `/home/node/.claude/a2a-session-id`. Subsequent calls (and calls from the *replacement* pod after a kill) read that file and pass `resume=<id>` to `query()`, so the conversation continues.
 
+> **Note on `claude-agent-sdk`.** Despite the name, the Python SDK is not a direct API client — `query()` spawns the Claude Code CLI (`@anthropic-ai/claude-code`, the Node binary) as a subprocess and talks to it over JSON-on-stdio. That's why this image is `node:20-slim` with `npm install -g @anthropic-ai/claude-code` baked in, and why session transcripts land in the same `~/.claude/projects/<cwd>/` location the interactive CLI uses. Each A2A request ultimately drives a `claude` child process inside the pod.
+
 ## Prerequisites
 
 - A running Kind cluster on top of a Podman machine (see below)
@@ -245,3 +247,21 @@ podman machine stop
 - **Does `InMemoryTaskStore` loss matter in practice?** The kill drops Task objects. If a host workflow uses `tasks/get` for retry or audit, the task store needs the same PVC-or-external-store treatment as the session pointer.
 - **Port-forward is fine for a demo, but does it bias the kill scenario?** The host's TCP session always drops on pod kill regardless of state strategy. A NodePort or Ingress would let us isolate "did the conversation survive?" from "did the transport survive?" — relevant if we extend this to a long-running host client.
 - **The June 2026 SDK billing change** (separate Agent SDK credit pool on subscription plans) does not apply here because the LiteLLM proxy authenticates with `ANTHROPIC_AUTH_TOKEN`. Worth noting if anyone reproduces this with a direct Anthropic key on a subscription account.
+
+## Inspecting the in-pod session interactively
+
+If you `kubectl exec` into the pod and want to open the session the A2A server has been driving, the bare-picker form does **not** show it:
+
+```bash
+kubectl exec -it "$POD" -- bash
+cd /workspace
+claude --resume        # picker is empty (or omits the SDK session)
+```
+
+The transcript is on disk — `ls ~/.claude/projects/-workspace/` shows the JSONL — but the CLI's interactive picker filters it out. Records written by the SDK are tagged `"entrypoint":"sdk-py"` / `"promptSource":"sdk"`, and the picker appears to scope to human/CLI-originated sessions. Pass the id directly instead:
+
+```bash
+claude --resume "$(cat /home/node/.claude/a2a-session-id)"
+```
+
+This loads the SDK-driven session as expected. Useful for debugging what the A2A server actually said to Claude Code across a kill.
