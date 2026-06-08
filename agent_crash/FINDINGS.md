@@ -32,11 +32,18 @@ Working stance under test: **platform preserves, harness reconstructs** — memo
 - Demos: `claude_code_kind_agentsandbox_a2a`
 - Bears on: harness interface design (see Questions surfaced)
 - Result: The A2A server collapses every `SendMessage` into the same Claude Code session and never reads A2A's `contextId`. Three consequences: two unrelated A2A clients on the same pod cross-contaminate transcripts; the host can't address prior conversations; Task records aren't addressable across kills. The principled shape is `contextId → claude_session_id` persisted on the PVC, with the same store backing `TaskStore`. Treat this as evidence the single-session contract works, not as a template for multi-session harness servers.
+- Update 2026-06-08: the transcript-cross-contamination half is now fixed in `claude_code_kind_agentsandbox_a2a` — sessions are keyed on `contextId` (commit `d8c77d1`). The demo now demonstrates session isolation at the *transcript* layer; the *filesystem* layer is the still-broken half, captured separately below.
 
 ### 2026-06-04 — emptyDir loss is total and silent on the replacement pod
 - Demos: `claude_code_kind_single`
 - Bears on: open question "Is `emptyDir` loss silent for Claude Code (fresh session, no error)?"
 - Result: After `kubectl delete pod` on a Deployment whose `/workspace` and `/root/.claude` were `emptyDir`, the replacement pod came up with both directories empty — no `notes.md`, no `projects/` subtree, no marker that prior state ever existed. The harness has no signal that it's a *replacement* rather than a *first* boot; from inside the pod the situation is indistinguishable from a clean install. This argues the preservation contract needs an explicit failure mode (e.g. a controller annotation or sentinel file the harness can read) — silent loss makes "platform preserves" undetectable from inside the harness.
+
+### 2026-06-08 — Per-`contextId` session keying isolates transcripts but not workspace state
+- Demos: `claude_code_kind_agentsandbox_a2a`
+- Bears on: open question "For multi-session harnesses, what is the unit of isolation — one Claude Code session per `contextId`, or one pod per user with multiple sessions inside?"
+- Result: The A2A server now persists one Claude Code `session_id` per A2A `contextId` under `/home/node/.claude/a2a-sessions/`, so two `contextId`s on the same pod hold independent *transcripts* — session B does not see session A's conversation history, and each one survives pod kill independently. But both sessions share `/workspace` (the agent's cwd) and the rest of `~/.claude/` outside the per-context pointer file. The same PVC-backed `/workspace` that gives us "kill survives" gives session B read/write access to every file session A produced; session B is told nothing about that history and treats those files as ambient ground truth. Session A then sees session B's mutations in subsequent turns with no signal that another conversation made them. Sometimes intended (a shared agent workspace where all conversations should converge on the same artifacts) and sometimes a leak (parallel users on one pod, supposedly isolated, sharing files anyway). The per-`contextId` *transcript* boundary does not imply a per-`contextId` *filesystem* boundary; on this demo's layout there isn't one.
+- Implication: "isolated session" needs to name *which substrate* is isolated. Strong isolation requires per-`contextId` partitioning of the writable filesystem too — separate cwd per context, or a pod-per-context model that pushes the partition up to the platform. Either choice trades against the cross-session shared-workspace pattern, which becomes impossible. The stance should make this a deliberate choice the harness/manifest declares, not a side-effect of which paths the platform happens to mount.
 
 ## Questions surfaced
 
@@ -54,7 +61,7 @@ Promote into the initiative page once sharp.
 - Is there an observable difference between killing between turns vs. mid-turn on PVC-backed storage, or does the preservation contract collapse to a single case?
 - What should the harness-to-A2A interface look like for a multi-session agent? `contextId → session_id` mapping seems right — where does the mapping live (PVC file, sqlite, external store) and which component owns its schema?
 - Should the platform offer `TaskStore` as a primitive (PVC-backed or external), so individual harness authors don't each re-derive whether their A2A `Task` records survive a kill?
-- For multi-session harnesses, what is the unit of isolation — one Claude Code session per `contextId`, or one pod per user with multiple sessions inside? Affects whether PVC partitioning (per-`contextId` or per-user) is the right shape.
+- For multi-session harnesses, what is the unit of isolation — one Claude Code session per `contextId`, or one pod per user with multiple sessions inside? Affects whether PVC partitioning (per-`contextId` or per-user) is the right shape. The 2026-06-08 finding shows transcript-level isolation is cheap (a directory of pointer files) but filesystem-level isolation is not free — pick one substrate, the other one leaks.
 - Is there a minimum interface harness authors should declare to the platform — a manifest of "paths I need preserved" + "RPC surface I expose" — so the platform can enforce the preservation contract instead of trusting per-harness convention?
 
 ## Superseded
