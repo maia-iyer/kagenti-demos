@@ -1,16 +1,20 @@
 """A2A server that bridges to Claude Code via claude-agent-sdk.
 
 Each inbound A2A message/send is handed to query() with resume=<session_id>
-so the conversation continues across requests. The session_id is persisted
-to /root/.claude/a2a-session-id so it also survives pod restarts (the file
-lives on the PVC mounted at /root/.claude).
+so the conversation continues across requests. The Claude Code session_id is
+keyed by the A2A request's contextId and persisted to
+~/.claude/a2a-sessions/<contextId> so multiple concurrent conversations are
+supported and each one survives pod restarts (the directory lives on the PVC
+mounted at ~/.claude).
 
 Targets a2a-sdk 1.1.x (proto-backed types) and claude-agent-sdk 0.1.x.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from pathlib import Path
 
 import uvicorn
@@ -29,20 +33,33 @@ from claude_agent_sdk import (
 )
 from starlette.applications import Starlette
 
-SESSION_FILE = Path(os.environ.get("HOME", "/home/node")) / ".claude" / "a2a-session-id"
+SESSIONS_DIR = Path(os.environ.get("HOME", "/home/node")) / ".claude" / "a2a-sessions"
 WORKSPACE = "/workspace"
 
+_SAFE_KEY = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
-def load_session_id() -> str | None:
-    if SESSION_FILE.exists():
-        sid = SESSION_FILE.read_text().strip()
+
+def _session_path(context_id: str) -> Path:
+    # contextId is normally a UUID, but treat it as untrusted: hash anything
+    # that isn't a tame ASCII slug so it can't escape SESSIONS_DIR.
+    key = context_id if _SAFE_KEY.match(context_id) else hashlib.sha256(
+        context_id.encode("utf-8")
+    ).hexdigest()
+    return SESSIONS_DIR / key
+
+
+def load_session_id(context_id: str) -> str | None:
+    path = _session_path(context_id)
+    if path.exists():
+        sid = path.read_text().strip()
         return sid or None
     return None
 
 
-def save_session_id(session_id: str) -> None:
-    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SESSION_FILE.write_text(session_id)
+def save_session_id(context_id: str, session_id: str) -> None:
+    path = _session_path(context_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(session_id)
 
 
 class ClaudeCodeAgentExecutor(AgentExecutor):
@@ -71,7 +88,7 @@ class ClaudeCodeAgentExecutor(AgentExecutor):
             )
             return
 
-        resume_id = load_session_id()
+        resume_id = load_session_id(context.context_id)
         options = ClaudeAgentOptions(
             cwd=WORKSPACE,
             setting_sources=[],
@@ -93,7 +110,7 @@ class ClaudeCodeAgentExecutor(AgentExecutor):
                 final_result = message.result
 
         if last_session_id and last_session_id != resume_id:
-            save_session_id(last_session_id)
+            save_session_id(context.context_id, last_session_id)
 
         text = final_result or "".join(collected) or "(no text returned)"
         await updater.add_artifact(parts=[T.Part(text=text)], name="reply")

@@ -1,8 +1,8 @@
-# Claude Code in Kind — Single Session, A2A surface (PVC-backed)
+# Claude Code in Kind — Multi-Session A2A surface (PVC-backed)
 
 Same harness, same workload, and same kill mechanism as [`claude_code_kind_agentsandbox_single`](../claude_code_kind_agentsandbox_single/), but the user does **not** `kubectl exec` into the pod. Instead, a small A2A server runs inside the pod and forwards each `message/send` to Claude Code via `claude-agent-sdk`. The host talks to the cluster over `kubectl port-forward`.
 
-The forcing question this demo probes: **what happens to a host-side A2A conversation when the agent's pod dies?** With `~/.claude` on a PVC and the server persisting Claude Code's `session_id` to that PVC, the conversation should resume cleanly on the replacement pod — no host-side reconnect logic, no lost transcript.
+The forcing question this demo probes: **what happens to a host-side A2A conversation when the agent's pod dies?** With `~/.claude` on a PVC and the server persisting one Claude Code `session_id` per A2A `contextId` to that PVC, each conversation should resume cleanly on the replacement pod — no host-side reconnect logic, no lost transcript, and multiple concurrent conversations on the same pod are supported.
 
 This is the A2A counterpart to the PVC positive control. It does **not** replace it; it adds the host-to-pod communication channel that earlier demos sidestepped with `kubectl exec`.
 
@@ -23,13 +23,13 @@ send.sh ──► localhost:8000 ──port-forward──► svc/claude-crash-de
                                                  pod (Sandbox-managed)
                                                   ├── server/main.py  (a2a-sdk)
                                                   │     └── claude-agent-sdk.query()
-                                                  │           ├─ resume=<id from /home/node/.claude/a2a-session-id>
+                                                  │           ├─ resume=<id from /home/node/.claude/a2a-sessions/<contextId>>
                                                   │           └─ cwd=/workspace
                                                   ├── /home/node/.claude   (PVC)
                                                   └── /workspace      (PVC)
 ```
 
-The server captures `ResultMessage.session_id` from the SDK on the first call and writes it to `/home/node/.claude/a2a-session-id`. Subsequent calls (and calls from the *replacement* pod after a kill) read that file and pass `resume=<id>` to `query()`, so the conversation continues.
+The server captures `ResultMessage.session_id` from the SDK on the first call for a given A2A `contextId` and writes it to `/home/node/.claude/a2a-sessions/<contextId>`. Subsequent calls with that same `contextId` (and calls from the *replacement* pod after a kill) read that file and pass `resume=<id>` to `query()`, so the conversation continues. Different `contextId`s map to different Claude Code sessions, so multiple conversations can run side-by-side against the same pod.
 
 > **Note on `claude-agent-sdk`.** Despite the name, the Python SDK is not a direct API client — `query()` spawns the Claude Code CLI (`@anthropic-ai/claude-code`, the Node binary) as a subprocess and talks to it over JSON-on-stdio. That's why this image is `node:20-slim` with `npm install -g @anthropic-ai/claude-code` baked in, and why session transcripts land in the same `~/.claude/projects/<cwd>/` location the interactive CLI uses. Each A2A request ultimately drives a `claude` child process inside the pod.
 
@@ -144,15 +144,16 @@ Terminal B (from this demo directory):
 ./client/send.sh 'In the "Goals" section, replace the placeholder bullets with: "ship v1 by end of quarter" and "onboard two new contributors".'
 ```
 
-Each call returns the assistant's text reply. Confirm `notes.md` was actually written and the session-id pointer exists:
+Each call returns the assistant's text reply. The client defaults `contextId` to `default`; export `A2A_CONTEXT_ID=...` to drive a different conversation in parallel. Confirm `notes.md` was actually written and the session-id pointer exists:
 
 ```bash
 POD=$(kubectl get pod -l app=claude-crash-demo -o jsonpath='{.items[0].metadata.name}')
 kubectl exec "$POD" -- cat /workspace/notes.md
-kubectl exec "$POD" -- cat /home/node/.claude/a2a-session-id
+kubectl exec "$POD" -- ls /home/node/.claude/a2a-sessions/
+kubectl exec "$POD" -- cat /home/node/.claude/a2a-sessions/default
 ```
 
-The pointer file should contain a UUID; that's the Claude Code session being reused across A2A calls.
+`a2a-sessions/` should contain one file per A2A `contextId` you've used, and each file holds the Claude Code session UUID being reused across A2A calls for that conversation.
 
 ### Step 2. Delete the pod
 
@@ -164,7 +165,7 @@ Terminal C:
 ./kill-by-pod.sh default --force
 ```
 
-Terminal A's `port-forward` will drop (the pod it was attached to is gone). The Sandbox controller schedules a replacement pod onto the same PVCs; the new pod's container restarts the A2A server, which reads the same `/home/node/.claude/a2a-session-id` from the PVC.
+Terminal A's `port-forward` will drop (the pod it was attached to is gone). The Sandbox controller schedules a replacement pod onto the same PVCs; the new pod's container restarts the A2A server, which reads the same `/home/node/.claude/a2a-sessions/<contextId>` files from the PVC.
 
 ### Step 3. Re-establish the port-forward against the new pod
 
@@ -196,7 +197,7 @@ Expected:
 
 - The new pod's `notes.md` contains all four sections from before (PVC-backed `/workspace`).
 - The third bullet is appended to `Goals` — Claude Code understood "the Goals section of notes.md" without being re-told what `notes.md` is or what's in it. That's session continuity through the kill.
-- `kubectl exec "$POD" -- cat /home/node/.claude/a2a-session-id` returns the same UUID as before. The session-id pointer survived because the file lives on the `/home/node/.claude` PVC.
+- `kubectl exec "$POD" -- cat /home/node/.claude/a2a-sessions/default` returns the same UUID as before. The session-id pointer survived because the file lives on the `/home/node/.claude` PVC.
 
 ---
 
@@ -204,10 +205,10 @@ Expected:
 
 Same columns as demos 1–3, with two added rows for the A2A surface:
 
-- **Where state lives on disk (pod):** `/home/node/.claude/` (incl. `a2a-session-id` pointer) and `/workspace`, both PVC-backed via the Sandbox's `volumeClaimTemplates` — scoped to the **Sandbox**, not the pod
+- **Where state lives on disk (pod):** `/home/node/.claude/` (incl. one file per A2A `contextId` under `a2a-sessions/`) and `/workspace`, both PVC-backed via the Sandbox's `volumeClaimTemplates` — scoped to the **Sandbox**, not the pod
 - **Where state lives (off-pod):** the LiteLLM endpoint, the loaded image (`claude-crash-demo-a2a:local`), the `claude-litellm` Secret, the `Sandbox` object, the `claude-crash-demo-a2a` Service, and the two PVCs
 - **Host-side state:** the `kubectl port-forward` TCP session — does not survive pod kill, must be re-run; no other host state
-- **What survived the kill:** session history + project metadata under `/home/node/.claude`, `notes.md`, `a2a-session-id`, the Service (Service IP unchanged), the Sandbox, the PVCs, the image, the LiteLLM endpoint
+- **What survived the kill:** session history + project metadata under `/home/node/.claude`, `notes.md`, every `a2a-sessions/<contextId>` pointer, the Service (Service IP unchanged), the Sandbox, the PVCs, the image, the LiteLLM endpoint
 - **What was lost:** the in-pod uvicorn process and its in-memory `InMemoryTaskStore` (so old A2A `Task` objects from before the kill are not addressable by id from the new pod — the *conversation* continues but *Task objects* don't)
 - **Kill mechanism:** `kubectl delete pod` — the kubelet SIGTERMs the container and the agent-sandbox controller schedules a new pod that re-mounts the existing PVCs and restarts the server
 
@@ -216,9 +217,9 @@ Same columns as demos 1–3, with two added rows for the A2A surface:
 Two things had to survive the kill for the A2A conversation to continue:
 
 1. **Claude Code's own transcript** under `/home/node/.claude/projects/` — already PVC-backed in the prior demo, no change here.
-2. **The Claude Code `session_id` the A2A server passes to `query(resume=...)`** — persisted to `/home/node/.claude/a2a-session-id`, also on the PVC. Without this, the replacement pod's server would mint a fresh session and the model would have no idea what `notes.md` is.
+2. **The Claude Code `session_id` the A2A server passes to `query(resume=...)`**, keyed by A2A `contextId` — persisted to `/home/node/.claude/a2a-sessions/<contextId>`, also on the PVC. Without this, the replacement pod's server would mint a fresh session and the model would have no idea what `notes.md` is.
 
-The A2A server's `InMemoryTaskStore` does **not** survive the kill. For the single-conversation case in this demo that doesn't matter — the host is using `message/send` and reading the assistant's reply synchronously. For workflows that depend on long-lived A2A `Task` ids (e.g. polling `tasks/get`, push notifications), the task store would also need to be PVC-backed or moved to an external store. That's the next variable to isolate, not part of this demo.
+The A2A server's `InMemoryTaskStore` does **not** survive the kill. For the synchronous request/reply pattern in this demo that doesn't matter — the host is using `message/send` and reading the assistant's reply inline. For workflows that depend on long-lived A2A `Task` ids (e.g. polling `tasks/get`, push notifications), the task store would also need to be PVC-backed or moved to an external store. That's the next variable to isolate, not part of this demo.
 
 Streaming (`AgentCapabilities(streaming=True)` + `message/stream`) is a natural fit for `query()`'s async iterator and would let the host see assistant tokens as they arrive. Left off in v1 to keep the wire format minimal.
 
@@ -242,7 +243,7 @@ podman machine stop
 
 ## Open questions (revisit after running)
 
-- **Where should `session_id` actually live?** A flat file on the PVC works for one conversation. A2A's own `contextId` is the natural key for multi-conversation: the server should map `contextId → claude_code_session_id` and store the map on the PVC. Out of scope for the single-session demo, but the obvious next variable.
+- **What if a client sends no `contextId`?** a2a-sdk mints one per request when the field is absent, which means each such call gets a fresh Claude Code session — fine for stateless calls, surprising if a client expected continuity. The demo client always sends `contextId` (defaulting to `"default"`); a server option to refuse contextId-less requests, or to pin them all to a single fallback session, is the next ergonomics call.
 - **What does A2A streaming look like with `claude-agent-sdk`?** `query()` yields messages incrementally; an A2A streaming endpoint would map each `AssistantMessage` to a `TaskStatusUpdateEvent` or partial `Artifact`. Worth a follow-up when the host wants progress visibility.
 - **Does `InMemoryTaskStore` loss matter in practice?** The kill drops Task objects. If a host workflow uses `tasks/get` for retry or audit, the task store needs the same PVC-or-external-store treatment as the session pointer.
 - **Port-forward is fine for a demo, but does it bias the kill scenario?** The host's TCP session always drops on pod kill regardless of state strategy. A NodePort or Ingress would let us isolate "did the conversation survive?" from "did the transport survive?" — relevant if we extend this to a long-running host client.
@@ -261,7 +262,7 @@ claude --resume        # picker is empty (or omits the SDK session)
 The transcript is on disk — `ls ~/.claude/projects/-workspace/` shows the JSONL — but the CLI's interactive picker filters it out. Records written by the SDK are tagged `"entrypoint":"sdk-py"` / `"promptSource":"sdk"`, and the picker appears to scope to human/CLI-originated sessions. Pass the id directly instead:
 
 ```bash
-claude --resume "$(cat /home/node/.claude/a2a-session-id)"
+claude --resume "$(cat /home/node/.claude/a2a-sessions/default)"
 ```
 
-This loads the SDK-driven session as expected. Useful for debugging what the A2A server actually said to Claude Code across a kill.
+(Substitute the `contextId` whose conversation you want to inspect — `ls /home/node/.claude/a2a-sessions/` shows all of them.) This loads the SDK-driven session as expected. Useful for debugging what the A2A server actually said to Claude Code across a kill.
