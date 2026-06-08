@@ -128,9 +128,9 @@ You should see the `claude-code-a2a` agent card with one `claude_code` skill.
 
 ---
 
-## Scenario — Drive the conversation from the host, then kill the pod
+## Scenario — Drive the conversation from the host, kill the pod, then open a second conversation
 
-The workload mirrors demos 1–3 (same three prompts) so you can compare row-for-row, but every prompt is sent from the **host** via A2A rather than typed inside `kubectl exec`.
+The workload mirrors demos 1–3 (same three prompts) so you can compare row-for-row, but every prompt is sent from the **host** via A2A rather than typed inside `kubectl exec`. Steps 1–4 prove one conversation survives a pod kill; Step 5 then opens a second `contextId` against the same pod to prove conversations are isolated, not multiplexed onto a single Claude Code session.
 
 ### Step 1. Build up some state from the host
 
@@ -198,6 +198,39 @@ Expected:
 - The new pod's `notes.md` contains all four sections from before (PVC-backed `/workspace`).
 - The third bullet is appended to `Goals` — Claude Code understood "the Goals section of notes.md" without being re-told what `notes.md` is or what's in it. That's session continuity through the kill.
 - `kubectl exec "$POD" -- cat /home/node/.claude/a2a-sessions/default` returns the same UUID as before. The session-id pointer survived because the file lives on the `/home/node/.claude` PVC.
+
+### Step 5. Open a second, independent conversation
+
+The previous four steps all ran against `contextId=default` (the client's default). Set a different `contextId` and the server should resume — or in this case, mint — a *different* Claude Code session that knows nothing about `notes.md`.
+
+Terminal B:
+
+```bash
+A2A_CONTEXT_ID=ctx-bravo ./client/send.sh 'What files exist in the current working directory? List them, then create a file called bravo.md with a single line: "second conversation".'
+```
+
+Expected:
+
+- The reply enumerates `/workspace` (so it can see `notes.md` on the shared PVC) but treats this as a fresh conversation — it does not reference the Goals/Risks/Next Steps structure or the prior edits, because the model has no transcript for them. That's session *isolation* between A2A `contextId`s on the same pod.
+- A new pointer file appears alongside the existing one:
+
+  ```bash
+  POD=$(kubectl get pod -l app=claude-crash-demo -o jsonpath='{.items[0].metadata.name}')
+  kubectl exec "$POD" -- ls /home/node/.claude/a2a-sessions/
+  # default
+  # ctx-bravo
+  kubectl exec "$POD" -- cat /workspace/bravo.md
+  # second conversation
+  ```
+
+Send another message in the same `ctx-bravo` to confirm continuity within the second conversation, then a message back on `default` to confirm it still remembers the original transcript:
+
+```bash
+A2A_CONTEXT_ID=ctx-bravo ./client/send.sh 'Append a second line to bravo.md: "still in the bravo session".'
+./client/send.sh 'What is the fourth section of notes.md called?'
+```
+
+The first call edits `bravo.md` without re-introducing it; the second call answers "Risks" without being shown `notes.md` again. Two conversations, two Claude Code sessions, one pod, one set of PVCs.
 
 ---
 
