@@ -1,0 +1,68 @@
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: claude-crash-demo-template
+  labels:
+    app: claude-crash-demo
+spec:
+  # Let the controller create a headless Service for sandboxes derived from
+  # this template. The Service name matches the Sandbox name (which is the
+  # SandboxClaim name when claimed via warmpool), so port-forward against
+  # whatever the claim ends up named — see README.
+  service: true
+  podTemplate:
+    metadata:
+      labels:
+        app: claude-crash-demo
+    spec:
+      # Run as the non-root `node` user (uid 1000) baked into the image.
+      # Claude Code refuses --dangerously-skip-permissions when running as
+      # root; fsGroup ensures the PVCs come up writable.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: claude
+          image: localhost/claude-crash-demo-a2a:local
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          ports:
+            - name: a2a
+              containerPort: 8000
+          env:
+            - name: HOME
+              value: /home/node
+            - name: ANTHROPIC_API_KEY
+              value: ""
+            - name: ANTHROPIC_BASE_URL
+              value: ${MY_LITELLM}
+            - name: ANTHROPIC_MODEL
+              value: ${ANTHROPIC_MODEL}
+            - name: ANTHROPIC_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: claude-litellm
+                  key: ANTHROPIC_AUTH_TOKEN
+          volumeMounts:
+            - name: claude-home
+              mountPath: /home/node/.claude
+            - name: workspace
+              mountPath: /workspace
+  volumeClaimTemplates:
+    - metadata:
+        name: claude-home
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: workspace
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

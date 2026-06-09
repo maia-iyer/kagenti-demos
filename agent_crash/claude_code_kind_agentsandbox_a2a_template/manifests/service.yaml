@@ -1,0 +1,24 @@
+# The controller-managed headless Service from `template.spec.service: true`
+# only provides stable DNS for the sandbox; it has no ports declared, so the
+# host can't port-forward against it. Add an explicit Service that matches
+# the pod's app label and exposes the A2A port. Selecting on app label means
+# this survives sandbox replacement (e.g. after claim delete + recreate).
+#
+# Caveat: with replicas>1 in the warmpool, this Service would round-robin
+# across all sandboxes carrying the label, including the unclaimed warm
+# spare. The kill-by-pod selector has the same caveat — see README.
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-crash-demo-a2a
+  labels:
+    app: claude-crash-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: claude-crash-demo
+    role: claimed
+  ports:
+    - name: a2a
+      port: 8000
+      targetPort: 8000

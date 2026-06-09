@@ -1,0 +1,16 @@
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxClaim
+metadata:
+  name: claude-crash-demo
+  labels:
+    app: claude-crash-demo
+spec:
+  sandboxTemplateRef:
+    name: claude-crash-demo-template
+  warmpool: claude-crash-demo-pool
+  # Stamp a stable label onto whichever pod the claim adopts so the
+  # Service and kill-by-pod selectors only match the claimed pod, not the
+  # unclaimed warm spare(s) the pool keeps idling.
+  additionalPodMetadata:
+    labels:
+      role: claimed
