@@ -58,13 +58,10 @@ the deny yourself. If a deny happens, re-issue the command through
 
 ## How to prove you're in the sandbox
 
-Sandbox output is prefixed with a banner like:
-
-    [sandbox sess-abcd1234 alpine] $ <command>
-
-so you can see at a glance that the command reached the remote actor. To
-sanity-check, `~/bin/substrate-sandbox-hook exec -- uname -a` should print
-Linux (Alpine), not Darwin.
+To sanity-check that a command actually reached the actor,
+`~/bin/substrate-sandbox-hook exec -- uname -a` should print Linux
+(Alpine), not Darwin. `~/bin/substrate-sandbox-hook exec -- cat
+/etc/os-release` should say `NAME="Alpine Linux"`.
 
 ## Things to know
 

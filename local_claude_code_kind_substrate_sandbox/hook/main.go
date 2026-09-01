@@ -5,16 +5,20 @@
 //
 //   session-start   Invoked by the SessionStart hook. Reads session_id from
 //                   stdin JSON, derives an actor name, creates or resumes the
-//                   actor via `kubectl ate`, and writes the actor name to a
-//                   pin file for `exec` to read.
+//                   actor via `kubectl ate`, and writes an `export
+//                   SUBSTRATE_ACTOR_NAME=<name>` line to $CLAUDE_ENV_FILE so
+//                   `exec` (running under Claude's Bash tool) sees the actor
+//                   in its environment. The env-file is per-session, so two
+//                   concurrent sessions in the same scratch dir pick up
+//                   different actor names.
 //
 //   session-end     Invoked by the SessionEnd hook. Reads session_id from
-//                   stdin JSON, suspends the actor, removes the pin file.
+//                   stdin JSON, re-derives the actor name, suspends it.
 //
-//   exec -- <cmd>   Invoked by Claude via a skill. Tars the workspace,
-//                   uploads it to the actor via POST /process with the
-//                   command composed in, prints stdout/stderr, exits with
-//                   the sandbox's exit code.
+//   exec -- <cmd>   Invoked by Claude via a skill. Reads SUBSTRATE_ACTOR_NAME
+//                   from the environment, tars the workspace, uploads it to
+//                   the actor via POST /process with the command composed in,
+//                   prints stdout/stderr, exits with the sandbox's exit code.
 //
 //   check-bash      Invoked by the PreToolUse hook on Bash. Reads the tool
 //                   input JSON from stdin; if the command is not routed
@@ -44,12 +48,12 @@ import (
 )
 
 const (
-	atespace     = "claude-sandbox"
-	template     = "ate-demo-sandbox/sandbox-template"
-	dnsSuffix    = "actors.resources.substrate.ate.dev"
-	pinFileName  = "substrate-sandbox-actor"
-	atenetAddr   = "localhost:8000"
-	execTimeout  = 5 * time.Minute
+	atespace        = "claude-sandbox"
+	template        = "ate-demo-sandbox/sandbox-template"
+	dnsSuffix       = "actors.resources.substrate.ate.dev"
+	actorEnvVar     = "SUBSTRATE_ACTOR_NAME"
+	atenetAddr      = "localhost:8000"
+	execTimeout     = 5 * time.Minute
 )
 
 // skipDirs are workspace subdirectories not uploaded to the actor.
@@ -123,10 +127,6 @@ func projectDir() string {
 	return d
 }
 
-func pinFilePath() string {
-	return filepath.Join(projectDir(), ".claude", pinFileName)
-}
-
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "substrate-sandbox-hook: "+format+"\n", args...)
 	os.Exit(1)
@@ -137,22 +137,6 @@ func fatal(format string, args ...any) {
 func sessionStart() {
 	sessionID := readSessionID()
 	name := actorName(sessionID)
-
-	// Refuse to start if a pin file already exists in this scratch dir.
-	// Multiple concurrent Claude sessions must run in distinct scratch dirs
-	// so their pin files (and thus their target actors) don't collide.
-	// A pin file left behind by a crashed session for the SAME actor is
-	// treated as a resume and allowed through.
-	pinPath := pinFilePath()
-	if existing, err := os.ReadFile(pinPath); err == nil {
-		if strings.TrimSpace(string(existing)) != name {
-			fatal("another substrate-sandbox session is active in this scratch dir "+
-				"(pin file references actor %q, this session wants %q).\n"+
-				"Run a concurrent Claude session from a different scratch directory, "+
-				"or remove %s if the previous session ended abnormally.",
-				strings.TrimSpace(string(existing)), name, pinPath)
-		}
-	}
 
 	// Create the actor if it doesn't exist; ignore AlreadyExists.
 	if out, err := runKube("kubectl", "ate", "create", "actor", name, "-a", atespace, "--template", template); err != nil {
@@ -166,13 +150,17 @@ func sessionStart() {
 		fatal("resume actor %s: %v\n%s", name, err, out)
 	}
 
-	// Write the pin file so `exec` knows the actor name.
-	path := pinFilePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		fatal("mkdir pin dir: %v", err)
+	// Publish the actor name to $CLAUDE_ENV_FILE so `exec` (invoked from
+	// Claude's Bash tool as a subprocess) reads it via the environment.
+	// This is per-session, so two concurrent Claude sessions in the same
+	// scratch dir each carry their own actor name in their own preamble.
+	envFile := os.Getenv("CLAUDE_ENV_FILE")
+	if envFile == "" {
+		fatal("CLAUDE_ENV_FILE not set — SessionStart must run under Claude Code so the actor name reaches `exec`")
 	}
-	if err := os.WriteFile(path, []byte(name+"\n"), 0o644); err != nil {
-		fatal("write pin file: %v", err)
+	line := fmt.Sprintf("export %s=%s\n", actorEnvVar, name)
+	if err := os.WriteFile(envFile, []byte(line), 0o644); err != nil {
+		fatal("write CLAUDE_ENV_FILE: %v", err)
 	}
 }
 
@@ -186,8 +174,6 @@ func sessionEnd() {
 	if _, err := runKube("kubectl", "ate", "suspend", "actor", name, "-a", atespace); err != nil {
 		fmt.Fprintf(os.Stderr, "substrate-sandbox-hook: suspend actor %s failed: %v\n", name, err)
 	}
-
-	_ = os.Remove(pinFilePath())
 }
 
 // runKube runs a kubectl-ate command and returns the combined output.
@@ -211,14 +197,12 @@ func execCmd(args []string) {
 		fatal("exec: empty command")
 	}
 
-	// Read pin file to learn the target actor.
-	pinBytes, err := os.ReadFile(pinFilePath())
-	if err != nil {
-		fatal("read pin file (SessionStart may not have run): %v", err)
-	}
-	actor := strings.TrimSpace(string(pinBytes))
+	// Read the target actor from the environment. SessionStart publishes it
+	// to $CLAUDE_ENV_FILE, which Claude Code sources as a preamble before
+	// every Bash command.
+	actor := strings.TrimSpace(os.Getenv(actorEnvVar))
 	if actor == "" {
-		fatal("pin file empty")
+		fatal("%s not set in environment (SessionStart may not have run, or $CLAUDE_ENV_FILE was not sourced)", actorEnvVar)
 	}
 
 	// Serialize concurrent execs against the same actor.
@@ -253,8 +237,6 @@ func execCmd(args []string) {
 		fatal("POST /process: %v", err)
 	}
 
-	// Banner so it's visually unambiguous which side ran the command.
-	fmt.Printf("[sandbox %s alpine] $ %s\n", actor, userCmd)
 	if respPayload.Stdout != "" {
 		fmt.Print(respPayload.Stdout)
 	}

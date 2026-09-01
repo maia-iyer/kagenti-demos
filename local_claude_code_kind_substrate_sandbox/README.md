@@ -24,8 +24,11 @@ Three mechanisms cooperate:
 
 1. **Lifecycle hooks (`SessionStart`, `SessionEnd`).** These call
    `substrate-sandbox-hook` to create/resume the session's actor on start and
-   suspend it on end. `SessionStart` writes the actor's name to a pin file
-   at `<scratch>/.claude/substrate-sandbox-actor`.
+   suspend it on end. `SessionStart` publishes the actor's name to
+   `$CLAUDE_ENV_FILE` as `export SUBSTRATE_ACTOR_NAME=<name>`. Claude Code
+   sources that file as a preamble before every Bash command, so `exec`
+   sees the actor in its environment. The env-file is per-session, which is
+   what lets two Claude sessions share a scratch dir without colliding.
 
 2. **A skill (`substrate-sandbox`).** This tells Claude that every shell
    command must be invoked as:
@@ -34,9 +37,8 @@ Three mechanisms cooperate:
 
    The binary reads the pin file to find the actor, tars up the workspace,
    POSTs to Substrate's `/process` endpoint with the workspace and command
-   composed together, and prints the sandbox's stdout/stderr locally prefixed
-   with a `[sandbox <actor> alpine] $ ...` banner so it's visually obvious
-   the command ran remotely. Exit code is the sandbox command's exit code.
+   composed together, and prints the sandbox's stdout/stderr locally. Exit
+   code is the sandbox command's exit code.
 
 3. **A `PreToolUse` hook on the Bash tool** (`substrate-sandbox-hook
    check-bash`). This is the enforcement layer. If Claude tries to call the
@@ -106,7 +108,8 @@ kubectl port-forward -n ate-system svc/atenet-router 8000:80
 
 Create a **scratch directory**. This is a disposable working directory —
 you'll throw it away at will. Do not use one of your real project
-directories; the hook rewrites files under `.claude/` there.
+directories; every command in this demo tars up the whole scratch dir and
+uploads it to the sandbox, so keep it small and disposable.
 
 ```bash
 mkdir -p ~/tmp/claude-sandbox-scratch/.claude/skills
@@ -135,31 +138,105 @@ kubectl ate get actors -a claude-sandbox
 
 You should see a `sess-<hash>` actor in `ACTOR_STATE_RUNNING`.
 
-## Concurrent sessions
+## Verify the sandbox from inside Claude
 
-Two concurrent Claude sessions must use **different** scratch directories.
-The pin file lives in the scratch dir, so two sessions in the same scratch
-dir would fight over it — `SessionStart` refuses to overwrite a pin file
-pointing at a different actor, so the conflict is loud (an error at session
-start), not silent.
+There are two things to prove:
 
-Simplest pattern:
+1. Shell commands actually run in Alpine, not on your Mac.
+2. Files you create locally in the scratch dir do reach the sandbox's
+   `/workspace`.
+
+### Step 1: prove commands run in Alpine
+
+Paste this into your Claude session:
+
+> Run `uname -a` and `cat /etc/os-release`. Show me the raw output.
+
+On a correctly wired scratch dir:
+
+- Claude's first attempt goes through the built-in Bash tool and is
+  denied by the `PreToolUse` hook. You'll see a message in the transcript
+  saying the command was blocked because it did not go through the
+  sandbox binary, with instructions to re-issue via
+  `~/bin/substrate-sandbox-hook exec -- <cmd>`.
+- Claude re-issues through the sandbox. Claude Code shows you a
+  permission prompt whose command is literally
+  `~/bin/substrate-sandbox-hook exec -- uname -a` — read that string,
+  it's your visual proof the command is going to the actor, then
+  approve.
+- Output comes back as `Linux ... 6.x.x ...` (not `Darwin`), and
+  `/etc/os-release` says `NAME="Alpine Linux"`.
+
+If you see `Darwin`, or you never get a permission prompt whose command
+starts with `substrate-sandbox-hook exec --`, shell commands are running
+on your laptop. Fix: re-copy `settings.json.example` into
+`.claude/settings.json`, make sure `$HOME/bin/substrate-sandbox-hook` is
+up to date (`./setup.sh`), and restart Claude.
+
+### Step 2: prove the local workspace lands in the sandbox
+
+The tar-and-upload happens on every `exec` call, so an `ls` alone won't
+tell you much if the workspace was empty when you started. Give it
+something to see.
+
+**From your laptop terminal**, in the scratch dir, create two files:
 
 ```bash
-# Session A
-mkdir -p ~/tmp/scratch-a/.claude/skills
-cp settings.json.example ~/tmp/scratch-a/.claude/settings.json
-cp -r skill ~/tmp/scratch-a/.claude/skills/substrate-sandbox
-cd ~/tmp/scratch-a && claude
-
-# Session B (in another terminal)
-mkdir -p ~/tmp/scratch-b/.claude/skills
-cp settings.json.example ~/tmp/scratch-b/.claude/settings.json
-cp -r skill ~/tmp/scratch-b/.claude/skills/substrate-sandbox
-cd ~/tmp/scratch-b && claude
+cd ~/tmp/claude-sandbox-scratch
+echo "hello from the laptop" > note.txt
+cat > run.sh <<'EOF'
+#!/bin/sh
+echo "running inside: $(uname -s) $(cat /etc/alpine-release 2>/dev/null || echo not-alpine)"
+echo "pwd: $(pwd)"
+echo "note.txt says:"
+cat note.txt
+EOF
+chmod +x run.sh
 ```
 
-Both sessions run in parallel, each backed by its own actor.
+Then paste this into Claude:
+
+> List the files in the workspace, then run `./run.sh` and show me the
+> output.
+
+You should see:
+
+- `ls` output that includes `note.txt` and `run.sh` — proof the tarball
+  from your laptop was extracted into `/workspace` on the actor.
+- `run.sh` output showing:
+  - `running inside: Linux <version>` (from the Alpine actor)
+  - `pwd: /workspace`
+  - `note.txt says: hello from the laptop` (proving the *contents* of
+    files you created locally are what the sandbox saw, not just their
+    names)
+
+If `ls` is empty, the tar upload failed silently — check that
+`$HOME/bin/substrate-sandbox-hook` is up to date, that the port-forwards
+to `svc/api` and `svc/atenet-router` are running, and that the pinned
+actor is in `ACTOR_STATE_RUNNING` (`kubectl ate get actors -a
+claude-sandbox`).
+
+## Concurrent sessions
+
+Two concurrent Claude sessions can share a scratch directory or use
+separate ones — either works. Each session gets its own actor (the actor
+name is derived from Claude's session ID), and the actor name reaches
+`exec` through `$CLAUDE_ENV_FILE`, which Claude Code isolates per session.
+
+Same scratch dir:
+
+```bash
+# Terminal A
+cd ~/tmp/claude-sandbox-scratch && claude
+
+# Terminal B
+cd ~/tmp/claude-sandbox-scratch && claude
+```
+
+Both sessions share the workspace files but run against different actors.
+`kubectl ate get actors -a claude-sandbox` will show two `sess-*` actors.
+Note that both sessions upload the same workspace on each `exec` — if one
+session writes a file locally, the other will see it on its next command.
 
 ## Resume with warm state
 
@@ -208,21 +285,20 @@ kubectl ate suspend actor sess-yyyyyyyy -a claude-sandbox
 
 Or bump replicas: `kubectl -n ate-demo-sandbox scale workerpool/sandbox-workerpool --replicas=8`.
 
-**"read pin file: no such file"** — `SessionStart` didn't run. Check that
-`.claude/settings.json` in the scratch dir points at the built binary and
-that `$HOME/bin/substrate-sandbox-hook` exists.
+**"SUBSTRATE_ACTOR_NAME not set in environment"** — `SessionStart`
+didn't run, or its `$CLAUDE_ENV_FILE` write didn't reach the Bash preamble.
+Check that `.claude/settings.json` in the scratch dir points at the built
+binary and that `$HOME/bin/substrate-sandbox-hook` exists. Restarting
+Claude re-runs `SessionStart`.
 
-**Confirming a command really ran in the sandbox.** Every sandbox invocation
-prints a banner as the first line of stdout:
-
-    [sandbox sess-abcd1234 alpine] $ <the command>
-
-If you don't see that banner, the command didn't reach the actor. As a
-smoke test, ask Claude to run `uname -a` — it should print a Linux/Alpine
-kernel string, not `Darwin`. If it prints Darwin, the `PreToolUse` hook is
-not wired up: check that `.claude/settings.json` in the scratch dir includes
-the `check-bash` entry and that `$HOME/bin/substrate-sandbox-hook` is
-up-to-date (re-run `./setup.sh`).
+**Confirming a command really ran in the sandbox.** See the "Verify the
+sandbox from inside Claude" section above — the sequence is a `uname -a`
+smoke test that should return Linux (not Darwin), plus a `run.sh` /
+`note.txt` round trip that proves your local workspace files land in
+`/workspace` on the actor. If either fails, the `PreToolUse` hook is
+probably not wired up: check that `.claude/settings.json` in the scratch
+dir includes the `check-bash` entry and that
+`$HOME/bin/substrate-sandbox-hook` is up-to-date (re-run `./setup.sh`).
 
 **A local Bash call was denied and I actually wanted it to run locally.** The
 `check-bash` hook denies every Bash call that isn't routed through the
@@ -232,15 +308,6 @@ in `hook/main.go` (see `isSandboxRouted`) to also accept your command's
 prefix, then rebuild. Modifying the hook is preferable to loosening the
 enforcement — the whole point of the demo is that shell commands
 demonstrably reach the sandbox.
-
-**"another substrate-sandbox session is active in this scratch dir"** —
-You started a second Claude session in a scratch dir that already has an
-active session. Use a different scratch dir, or if the prior session ended
-abnormally, delete the pin file:
-
-```bash
-rm ~/tmp/scratch/.claude/substrate-sandbox-actor
-```
 
 ## Security note
 
