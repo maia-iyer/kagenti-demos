@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/bin/substrate-sandbox-hook session-start-lazy"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
@@ -16,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/bin/substrate-sandbox-hook check-bash-lazy"
+            "command": "$HOME/bin/substrate-sandbox-hook check-bash"
           }
         ]
       }

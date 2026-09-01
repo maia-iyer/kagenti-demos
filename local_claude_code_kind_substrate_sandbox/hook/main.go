@@ -3,22 +3,32 @@
 //
 // Subcommands:
 //
-//   session-start   Invoked by the SessionStart hook. Reads session_id from
-//                   stdin JSON, derives an actor name, creates or resumes the
-//                   actor via `kubectl ate`, and writes an `export
-//                   SUBSTRATE_ACTOR_NAME=<name>` line to $CLAUDE_ENV_FILE so
-//                   `exec` (running under Claude's Bash tool) sees the actor
-//                   in its environment. The env-file is per-session, so two
-//                   concurrent sessions in the same scratch dir pick up
-//                   different actor names.
+//   session-start      Eager-mode SessionStart. Derives an actor name from
+//                      session_id, creates or resumes the actor via
+//                      `kubectl ate`, and writes
+//                      `export SUBSTRATE_ACTOR_NAME=<name>` to $CLAUDE_ENV_FILE
+//                      so `exec` (running under Claude's Bash tool) sees the
+//                      actor in its environment. The env-file is per-session,
+//                      so two concurrent sessions in the same scratch dir
+//                      pick up different actor names.
 //
-//   session-end     Invoked by the SessionEnd hook. Reads session_id from
-//                   stdin JSON, re-derives the actor name, suspends it.
+//   session-start-lazy Lazy-mode SessionStart. Same env-file write as above,
+//                      plus `export SUBSTRATE_SANDBOX_LAZY=1`. Does NO
+//                      cluster work — the actor is created on the first
+//                      `exec` call. Sessions that never shell out never
+//                      touch the cluster.
 //
-//   exec -- <cmd>   Invoked by Claude via a skill. Reads SUBSTRATE_ACTOR_NAME
-//                   from the environment, tars the workspace, uploads it to
-//                   the actor via POST /process with the command composed in,
-//                   prints stdout/stderr, exits with the sandbox's exit code.
+//   session-end        Suspends the actor.
+//
+//   session-end-lazy   Same, but skips silently if the actor was never
+//                      created (session never shelled out).
+//
+//   exec -- <cmd>      Reads SUBSTRATE_ACTOR_NAME (and SUBSTRATE_SANDBOX_LAZY)
+//                      from the environment, tars the workspace, uploads it
+//                      to the actor via POST /process. In lazy mode: creates
+//                      the actor if needed, resumes before the POST, suspends
+//                      after a successful POST. Prints stdout/stderr; exits
+//                      with the sandbox's exit code.
 //
 //   check-bash      Invoked by the PreToolUse hook on Bash. Reads the tool
 //                   input JSON from stdin; if the command is not routed
@@ -69,11 +79,13 @@ var skipDirs = map[string]bool{
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: substrate-sandbox-hook {session-start|session-end|session-end-lazy|exec -- <cmd>|check-bash|check-bash-lazy}")
+		fatal("usage: substrate-sandbox-hook {session-start|session-start-lazy|session-end|session-end-lazy|exec -- <cmd>|check-bash}")
 	}
 	switch os.Args[1] {
 	case "session-start":
 		sessionStart()
+	case "session-start-lazy":
+		sessionStartLazy()
 	case "session-end":
 		sessionEnd()
 	case "session-end-lazy":
@@ -82,8 +94,6 @@ func main() {
 		execCmd(os.Args[2:])
 	case "check-bash":
 		checkBash()
-	case "check-bash-lazy":
-		checkBashLazy()
 	default:
 		fatal("unknown subcommand: %s", os.Args[1])
 	}
@@ -169,6 +179,25 @@ func sessionStart() {
 	}
 }
 
+// sessionStartLazy is the lazy-mode SessionStart. It does NO cluster work —
+// it just derives the actor name from the session ID and publishes it (plus
+// the lazy-mode flag) to $CLAUDE_ENV_FILE. The actor is created on the
+// first `exec` call, not here, so a session that never shells out never
+// touches the cluster.
+func sessionStartLazy() {
+	sessionID := readSessionID()
+	name := actorName(sessionID)
+
+	envFile := os.Getenv("CLAUDE_ENV_FILE")
+	if envFile == "" {
+		fatal("CLAUDE_ENV_FILE not set — session-start-lazy must run under Claude Code so the actor name reaches `exec`")
+	}
+	content := fmt.Sprintf("export %s=%s\nexport %s=1\n", actorEnvVar, name, lazyEnvVar)
+	if err := os.WriteFile(envFile, []byte(content), 0o644); err != nil {
+		fatal("write CLAUDE_ENV_FILE: %v", err)
+	}
+}
+
 // --- session-end ---
 
 func sessionEnd() {
@@ -243,13 +272,19 @@ func execCmd(args []string) {
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
-	// Lazy mode: resume the actor for this call, suspend it after. This
-	// releases the worker slot between commands so a user who steps away
-	// for ten minutes isn't holding one. Create was done by check-bash-lazy;
-	// resume is idempotent on an already-running actor. Only reached when
-	// the SessionStart hook chose lazy mode by exporting SUBSTRATE_SANDBOX_LAZY.
+	// Lazy mode: create-if-missing, then resume for this call, suspend after.
+	// This releases the worker slot between commands so a user who steps away
+	// for ten minutes isn't holding one. Create is idempotent (AlreadyExists
+	// after the first call); resume is a no-op on an already-running actor.
+	// SessionStart in lazy mode does no cluster work, so the first `exec` in
+	// a session pays the create cost; subsequent calls just resume/suspend.
 	lazy := os.Getenv(lazyEnvVar) == "1"
 	if lazy {
+		if out, err := runKube("kubectl", "ate", "create", "actor", actor, "-a", atespace, "--template", template); err != nil {
+			if !strings.Contains(out, "AlreadyExists") && !strings.Contains(out, "already exists") {
+				fatal("create actor %s (lazy): %v\n%s", actor, err, out)
+			}
+		}
 		if out, err := runKube("kubectl", "ate", "resume", "actor", actor, "-a", atespace); err != nil {
 			fatal("resume actor %s (lazy): %v\n%s", actor, err, out)
 		}
@@ -406,7 +441,6 @@ func tarWorkspace(root string) ([]byte, error) {
 // the command through `substrate-sandbox-hook exec --`.
 
 type bashHookInput struct {
-	SessionID string `json:"session_id"`
 	ToolName  string `json:"tool_name"`
 	ToolInput struct {
 		Command string `json:"command"`
@@ -424,7 +458,13 @@ type hookSpecificOutput struct {
 }
 
 func checkBash() {
-	in := parseBashHookInput()
+	var in bashHookInput
+	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
+		// Fail closed: if we can't parse the input we can't verify the command,
+		// so deny with an explanation.
+		emitBashDeny("substrate-sandbox-hook check-bash: could not parse hook input: " + err.Error())
+		return
+	}
 	cmd := strings.TrimSpace(in.ToolInput.Command)
 	if isSandboxRouted(cmd) {
 		// Allow: no output is a passthrough, exit 0.
@@ -441,75 +481,6 @@ func checkBash() {
 			"something on the laptop, ask the user first — they can approve a specific " +
 			"local command by adding it to the allow list in .claude/settings.json.",
 	)
-}
-
-// checkBashLazy is the lazy-mode variant of checkBash. Same enforcement
-// (deny non-sandbox-routed Bash), plus: if this is the first sandbox-routed
-// call in the session, create the actor and publish its name to
-// $CLAUDE_ENV_FILE so `exec` (running as a subprocess of this same Bash
-// call, after Claude sources the env-file into its preamble) picks it up.
-// Actor is created but left suspended; `exec` resumes and re-suspends
-// around each POST /process.
-func checkBashLazy() {
-	in := parseBashHookInput()
-	cmd := strings.TrimSpace(in.ToolInput.Command)
-	if !isSandboxRouted(cmd) {
-		emitBashDeny(
-			"This session runs shell commands inside a remote Agent Substrate sandbox " +
-				"(Alpine Linux), NOT on the local laptop. The Bash command you attempted " +
-				"was blocked because it did not go through the sandbox binary.\n\n" +
-				"Re-issue the command as:\n\n" +
-				"    ~/bin/substrate-sandbox-hook exec -- <your command>\n\n" +
-				"Everything after `--` runs inside the sandbox actor with /workspace as CWD. " +
-				"See the substrate-sandbox skill for details.",
-		)
-		return
-	}
-
-	// Sandbox-routed call. Attach the actor if we haven't yet in this session.
-	// We can't check the current env of `exec` from here, but $CLAUDE_ENV_FILE
-	// is a fresh empty path per hook invocation, so instead we check: did the
-	// prior hook run already write the export line? If so, skip the create.
-	// The simpler alternative — always call create — is idempotent, so we go
-	// with that: it's one `kubectl ate create` per Bash call in the worst case,
-	// but kubectl-ate returns AlreadyExists fast and we don't wait on resume
-	// (exec does that).
-	if in.SessionID == "" {
-		emitBashDeny("substrate-sandbox-hook check-bash-lazy: hook input missing session_id")
-		return
-	}
-	name := actorName(in.SessionID)
-	if out, err := runKube("kubectl", "ate", "create", "actor", name, "-a", atespace, "--template", template); err != nil {
-		if !strings.Contains(out, "AlreadyExists") && !strings.Contains(out, "already exists") {
-			emitBashDeny(fmt.Sprintf("substrate-sandbox-hook check-bash-lazy: create actor %s: %v\n%s", name, err, out))
-			return
-		}
-	}
-
-	// Publish the actor name AND the lazy-mode flag to $CLAUDE_ENV_FILE.
-	// Claude Code sources this before running the Bash command, so `exec`
-	// (invoked by that command) sees both in its environment.
-	envFile := os.Getenv("CLAUDE_ENV_FILE")
-	if envFile == "" {
-		emitBashDeny("substrate-sandbox-hook check-bash-lazy: CLAUDE_ENV_FILE not set")
-		return
-	}
-	content := fmt.Sprintf("export %s=%s\nexport %s=1\n", actorEnvVar, name, lazyEnvVar)
-	if err := os.WriteFile(envFile, []byte(content), 0o644); err != nil {
-		emitBashDeny(fmt.Sprintf("substrate-sandbox-hook check-bash-lazy: write CLAUDE_ENV_FILE: %v", err))
-		return
-	}
-	// Allow: passthrough exit 0.
-}
-
-// parseBashHookInput decodes the PreToolUse Bash hook JSON. Fails closed
-// via emitBashDeny if the input can't be parsed.
-func parseBashHookInput() bashHookInput {
-	var in bashHookInput
-	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
-		emitBashDeny("substrate-sandbox-hook: could not parse hook input: " + err.Error())
-	}
-	return in
 }
 
 // isSandboxRouted returns true if the command's first token is the sandbox

@@ -56,10 +56,10 @@ There are two flavors of the demo, differing only in the hook wiring:
 - **Eager** (default, `settings.json.example`) — `SessionStart` creates
   and resumes the actor up front. Actor stays Running for the whole
   session.
-- **Lazy** (`settings.json.lazy.example`) — no `SessionStart`; the actor
-  is created on the first shell command and then resumed-per-call and
-  suspended-after-each-call, so worker slots are only held while a
-  command is actually executing. See "Lazy mode" below.
+- **Lazy** (`settings.json.lazy.example`) — `SessionStart` does no
+  cluster work; the actor is created on the first shell command and then
+  resumed-per-call and suspended-after-each-call, so worker slots are only
+  held while a command is actually executing. See "Lazy mode" below.
 
 For the full design, see [PLAN.md](PLAN.md).
 
@@ -274,11 +274,12 @@ not shelling out.
 actually running. It's aimed at the workflow where you come back to a
 Claude session every ten minutes to make a bit more progress:
 
-- No actor is created until the first `~/bin/substrate-sandbox-hook exec`
-  call. Sessions that never shell out never touch the cluster.
-- The actor is created once (lazily), then **resumed before each `exec`
-  call and suspended immediately after**. Between calls it's Suspended, so
-  it isn't holding a worker.
+- `SessionStart` does no cluster work — it only publishes the actor name
+  and a `SUBSTRATE_SANDBOX_LAZY=1` flag to the Bash environment. Sessions
+  that never shell out never touch the cluster.
+- The actor is created lazily on the first `exec` call, then **resumed
+  before each `exec` call and suspended immediately after**. Between
+  calls it's Suspended, so it isn't holding a worker.
 - `/workspace` state — installed packages, build caches, generated files —
   persists across suspends, so the second `npm install` is still near-
   instant. The only per-call overhead is a `kubectl ate resume` +
@@ -295,11 +296,12 @@ cd ~/tmp/claude-sandbox-scratch
 claude
 ```
 
-The wiring difference is small: no `SessionStart` hook, and the
-`PreToolUse` and `SessionEnd` entries point at `check-bash-lazy` and
-`session-end-lazy` respectively. Both modes share the same `exec` path;
-lazy mode is toggled by the `SUBSTRATE_SANDBOX_LAZY` env var that
-`check-bash-lazy` writes to `$CLAUDE_ENV_FILE` alongside the actor name.
+The wiring differs from eager mode by which subcommands the hooks call:
+`session-start-lazy` and `session-end-lazy` in place of the eager
+equivalents. `PreToolUse` still points at plain `check-bash`. Both modes
+share the same `exec` path; lazy behavior is triggered by the
+`SUBSTRATE_SANDBOX_LAZY` env var that `session-start-lazy` writes to
+`$CLAUDE_ENV_FILE` alongside the actor name.
 
 You can verify it's working by watching `kubectl ate get actors -a
 claude-sandbox` while you interact with Claude: the actor should flip to
@@ -378,7 +380,7 @@ hook/main.go                       The substrate-sandbox-hook binary
 hook/go.mod
 skill/SKILL.md                     Skill Claude reads to route shell through the sandbox
 settings.json.example              Eager-mode hook wiring (SessionStart + SessionEnd + PreToolUse)
-settings.json.lazy.example         Lazy-mode hook wiring (PreToolUse + SessionEnd only)
+settings.json.lazy.example         Lazy-mode hook wiring (SessionStart writes env only; no cluster work up front)
 setup.sh                           Scales workerpool, creates atespace, builds binary
 teardown.sh                        Prunes actors, restores workerpool replica count
 ```
