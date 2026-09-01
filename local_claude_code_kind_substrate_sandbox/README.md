@@ -55,13 +55,13 @@ From your `substrate/` checkout:
 ./hack/create-kind-cluster.sh
 
 # 2. Substrate itself.
-./hack/install-ate.sh --deploy-ate-system
+./hack/install-ate-kind.sh --deploy-ate-system
 
 # 3. Counter demo — proves snapshot storage works on kind.
-./hack/install-ate.sh --deploy-demo-counter
+./hack/install-ate-kind.sh --deploy-demo-counter
 
 # 4. Sandbox demo — deploys the WorkerPool and ActorTemplate we reuse.
-./hack/install-ate.sh --deploy-demo-sandbox
+./hack/install-ate-kind.sh --deploy-demo-sandbox
 ```
 
 You also need:

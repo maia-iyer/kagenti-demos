@@ -61,10 +61,10 @@ Invocation style is **explicit tool-shape**: SKILL.md tells Claude "every Bash o
 The kind cluster and Substrate install are **not** set up by this demo. The user runs the existing counter demo first, which does all of that:
 
 1. `substrate/hack/create-kind-cluster.sh` — creates the kind cluster and local registry.
-2. `substrate/hack/install-ate.sh --deploy-ate-system` — installs Substrate.
-3. `substrate/hack/install-ate.sh --deploy-demo-counter` — deploys the counter WorkerPool and ActorTemplate, which also proves the snapshot-storage story works on kind.
+2. `substrate/hack/install-ate-kind.sh --deploy-ate-system` — installs Substrate (kind-specific installer).
+3. `substrate/hack/install-ate-kind.sh --deploy-demo-counter` — deploys the counter WorkerPool and ActorTemplate, which also proves the snapshot-storage story works on kind.
 
-In addition to counter, the user runs `substrate/hack/install-ate.sh --deploy-demo-sandbox` once — this deploys the existing `ate-demo-sandbox` namespace, WorkerPool, and `sandbox-template` ActorTemplate. Our demo reuses that template directly.
+In addition to counter, the user runs `substrate/hack/install-ate-kind.sh --deploy-demo-sandbox` once — this deploys the existing `ate-demo-sandbox` namespace, WorkerPool, and `sandbox-template` ActorTemplate. Our demo reuses that template directly.
 
 Then the user runs `setup.sh` from this directory, which does the following:
 
