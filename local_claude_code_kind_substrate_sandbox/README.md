@@ -1,65 +1,42 @@
 # Local Claude Code with a Kind-hosted Substrate Sandbox
 
-A demo where Claude Code runs on your laptop and every shell command it wants
-to run is executed inside a per-session sandbox actor on an
-[Agent Substrate](https://github.com/agent-substrate/substrate) cluster running
-locally in kind. Each Claude session gets its own actor. `--resume` reuses the
-same actor, so build caches and installed dependencies survive across days.
-
-## What this demo shows
-
-- **Actor-per-session multiplexing.** Multiple concurrent Claude sessions map
-  to multiple actors sharing a small pool of Kubernetes worker pods. Substrate
-  handles the packing.
-- **State persistence across sessions.** An actor's `/workspace` (uploaded
-  source) and any state your commands leave behind (`node_modules`, build
-  outputs, `.pytest_cache`, etc.) stay in the actor between commands and
-  survive `--resume`.
-- **No changes to Claude Code or Substrate.** The demo lives entirely in this
-  directory and consumes both upstream projects unchanged.
+Claude Code runs on your laptop; every shell command it issues runs inside a
+per-session sandbox actor on an
+[Agent Substrate](https://github.com/agent-substrate/substrate) cluster in
+kind. Each Claude session gets its own actor and `--resume` reuses it, so
+build caches and installed dependencies survive across days. Nothing
+upstream is modified — everything demo-specific lives in this directory.
 
 ## How it works
 
 Three mechanisms cooperate:
 
-1. **Lifecycle hooks (`SessionStart`, `SessionEnd`).** These call
-   `substrate-sandbox-hook` to create/resume the session's actor on start and
-   suspend it on end. `SessionStart` publishes the actor's name to
-   `$CLAUDE_ENV_FILE` as `export SUBSTRATE_ACTOR_NAME=<name>`. Claude Code
-   sources that file as a preamble before every Bash command, so `exec`
-   sees the actor in its environment. The env-file is per-session, which is
-   what lets two Claude sessions share a scratch dir without colliding.
+1. **Lifecycle hooks (`SessionStart`, `SessionEnd`).** Create/resume the
+   session's actor on start, suspend on end. `SessionStart` also writes
+   `export SUBSTRATE_ACTOR_NAME=<name>` to `$CLAUDE_ENV_FILE`, which Claude
+   sources before every Bash command — that's how `exec` finds its actor.
+   The env-file is per-session, so two sessions in one scratch dir don't
+   collide.
 
-2. **A skill (`substrate-sandbox`).** This tells Claude that every shell
-   command must be invoked as:
+2. **A skill (`substrate-sandbox`).** Tells Claude that every shell
+   command must be invoked as `~/bin/substrate-sandbox-hook exec --
+   <command>`. The binary tars the workspace, POSTs to Substrate's
+   `/process` endpoint, and prints the sandbox's stdout/stderr locally.
 
-       ~/bin/substrate-sandbox-hook exec -- <command>
+3. **A `PreToolUse` hook on Bash** (`check-bash`). Denies any Bash call
+   that isn't routed through the sandbox binary — without this, the skill
+   is advisory and Claude can silently run commands on the laptop.
 
-   The binary reads the pin file to find the actor, tars up the workspace,
-   POSTs to Substrate's `/process` endpoint with the workspace and command
-   composed together, and prints the sandbox's stdout/stderr locally. Exit
-   code is the sandbox command's exit code.
+Read/Edit/Grep/Glob still operate locally — only shell is redirected.
 
-3. **A `PreToolUse` hook on the Bash tool** (`substrate-sandbox-hook
-   check-bash`). This is the enforcement layer. If Claude tries to call the
-   built-in Bash tool with a command that isn't routed through
-   `substrate-sandbox-hook exec --`, the hook denies the call with a reason
-   telling Claude to re-issue through the sandbox binary. Without this hook
-   the skill is advisory — Claude can (and did) silently run commands on the
-   laptop, which is how you got a `Darwin` from `uname` in earlier runs.
+There are two flavors:
 
-Read/Edit/Grep/Glob still operate on your laptop's local filesystem — only
-shell commands are redirected.
-
-There are two flavors of the demo, differing only in the hook wiring:
-
-- **Eager** (default, `settings.json.example`) — `SessionStart` creates
-  and resumes the actor up front. Actor stays Running for the whole
-  session.
-- **Lazy** (`settings.json.lazy.example`) — `SessionStart` does no
-  cluster work; the actor is created on the first shell command and then
-  resumed-per-call and suspended-after-each-call, so worker slots are only
-  held while a command is actually executing. See "Lazy mode" below.
+- **Eager** (default, `settings.json.example`) — actor is created and
+  kept Running for the whole session.
+- **Lazy** (`settings.json.lazy.example`) — actor is created on first
+  shell command, resumed before each `exec` and suspended after, so a
+  worker slot is only held while a command is actually running. See
+  "Lazy mode" below.
 
 For the full design, see [PLAN.md](PLAN.md).
 
@@ -150,103 +127,60 @@ You should see a `sess-<hash>` actor in `ACTOR_STATE_RUNNING`.
 
 ## Verify the sandbox from inside Claude
 
-There are two things to prove:
+One flow proves three things: shell runs on Alpine, laptop files land in
+`/workspace`, and two sessions keep independent sandbox state.
 
-1. Shell commands actually run in Alpine, not on your Mac.
-2. Files you create locally in the scratch dir do reach the sandbox's
-   `/workspace`.
-
-### Step 1: prove commands run in Alpine
-
-Paste this into your Claude session:
-
-> Run `uname -a` and `cat /etc/os-release`. Show me the raw output.
-
-On a correctly wired scratch dir:
-
-- Claude's first attempt goes through the built-in Bash tool and is
-  denied by the `PreToolUse` hook. You'll see a message in the transcript
-  saying the command was blocked because it did not go through the
-  sandbox binary, with instructions to re-issue via
-  `~/bin/substrate-sandbox-hook exec -- <cmd>`.
-- Claude re-issues through the sandbox. Claude Code shows you a
-  permission prompt whose command is literally
-  `~/bin/substrate-sandbox-hook exec -- uname -a` — read that string,
-  it's your visual proof the command is going to the actor, then
-  approve.
-- Output comes back as `Linux ... 6.x.x ...` (not `Darwin`), and
-  `/etc/os-release` says `NAME="Alpine Linux"`.
-
-If you see `Darwin`, or you never get a permission prompt whose command
-starts with `substrate-sandbox-hook exec --`, shell commands are running
-on your laptop. Fix: re-copy `settings.json.example` into
-`.claude/settings.json`, make sure `$HOME/bin/substrate-sandbox-hook` is
-up to date (`./setup.sh`), and restart Claude.
-
-### Step 2: prove the local workspace lands in the sandbox
-
-The tar-and-upload happens on every `exec` call, so an `ls` alone won't
-tell you much if the workspace was empty when you started. Give it
-something to see.
-
-**From your laptop terminal**, in the scratch dir, create two files:
+**On the laptop**, drop a file into the scratch dir so there's something
+to see:
 
 ```bash
 cd ~/tmp/claude-sandbox-scratch
 echo "hello from the laptop" > note.txt
-cat > run.sh <<'EOF'
-#!/bin/sh
-echo "running inside: $(uname -s) $(cat /etc/alpine-release 2>/dev/null || echo not-alpine)"
-echo "pwd: $(pwd)"
-echo "note.txt says:"
-cat note.txt
-EOF
-chmod +x run.sh
 ```
 
-Then paste this into Claude:
+**Open two Claude sessions in the same scratch dir** (Terminal A and
+Terminal B, both `cd ~/tmp/claude-sandbox-scratch && claude`). Each gets
+its own actor — `kubectl ate get actors -a claude-sandbox` will show two
+`sess-*` actors.
 
-> List the files in the workspace, then run `./run.sh` and show me the
-> output.
+In **session A**, paste:
 
-You should see:
+> Run `uname -a` and `cat /etc/os-release`. Then `ls` the workspace,
+> `cat note.txt`, and `touch only-in-A.txt`. Show me the raw output.
 
-- `ls` output that includes `note.txt` and `run.sh` — proof the tarball
-  from your laptop was extracted into `/workspace` on the actor.
-- `run.sh` output showing:
-  - `running inside: Linux <version>` (from the Alpine actor)
-  - `pwd: /workspace`
-  - `note.txt says: hello from the laptop` (proving the *contents* of
-    files you created locally are what the sandbox saw, not just their
-    names)
+In **session B**, paste the same thing but with `only-in-B.txt`.
 
-If `ls` is empty, the tar upload failed silently — check that
-`$HOME/bin/substrate-sandbox-hook` is up to date, that the port-forwards
-to `svc/api` and `svc/atenet-router` are running, and that the pinned
-actor is in `ACTOR_STATE_RUNNING` (`kubectl ate get actors -a
-claude-sandbox`).
+You should see, in each session:
 
-## Concurrent sessions
+- The first attempt goes through the built-in Bash tool and is **denied**
+  by the `PreToolUse` hook. Claude re-issues via
+  `~/bin/substrate-sandbox-hook exec -- ...` — the permission prompt
+  literally shows that string, which is your visual proof.
+- `uname -a` returns `Linux ...` (not `Darwin`); `/etc/os-release` says
+  `NAME="Alpine Linux"`.
+- `ls` includes `note.txt` — proof the laptop tarball extracted into
+  `/workspace`. `cat note.txt` prints `hello from the laptop`.
 
-Two concurrent Claude sessions can share a scratch directory or use
-separate ones — either works. Each session gets its own actor (the actor
-name is derived from Claude's session ID), and the actor name reaches
-`exec` through `$CLAUDE_ENV_FILE`, which Claude Code isolates per session.
+Then, in **each session**, paste:
 
-Same scratch dir:
+> `ls` the workspace again.
 
-```bash
-# Terminal A
-cd ~/tmp/claude-sandbox-scratch && claude
+- Session A sees `only-in-A.txt` but **not** `only-in-B.txt`.
+- Session B sees `only-in-B.txt` but **not** `only-in-A.txt`.
+- Neither file exists on the laptop (`ls ~/tmp/claude-sandbox-scratch`).
 
-# Terminal B
-cd ~/tmp/claude-sandbox-scratch && claude
-```
+The last part is the demo's key state property: each `exec` re-uploads
+the laptop scratch dir over `/workspace`, but tar overwrites matching
+paths without deleting unmatched ones — so files a session created inside
+its own actor survive, and the other session's actor never sees them.
+Laptop-side edits are shared across sessions; sandbox-side writes are
+per-session.
 
-Both sessions share the workspace files but run against different actors.
-`kubectl ate get actors -a claude-sandbox` will show two `sess-*` actors.
-Note that both sessions upload the same workspace on each `exec` — if one
-session writes a file locally, the other will see it on its next command.
+**If any of this fails** (`Darwin` instead of `Linux`, empty `ls`, no
+permission prompt starting with `substrate-sandbox-hook exec --`): re-run
+`./setup.sh`, re-copy `settings.json.example` into
+`.claude/settings.json`, confirm the port-forwards are up, and restart
+Claude.
 
 ## Resume with warm state
 
@@ -265,48 +199,28 @@ near-instant.
 
 ## Lazy mode (alternate)
 
-The default wiring above is **eager**: `SessionStart` creates and resumes
-the actor immediately, and the actor stays Running for the whole session —
-holding a worker slot even during long stretches where you're reading code,
-not shelling out.
+Eager mode (the default) keeps the actor Running for the whole session,
+holding a worker slot even when you're just reading code. **Lazy mode**
+only holds a worker while a command is running — aimed at the workflow
+where you come back to a Claude session every ten minutes.
 
-**Lazy mode** trades that for holding a worker only when a command is
-actually running. It's aimed at the workflow where you come back to a
-Claude session every ten minutes to make a bit more progress:
+- `SessionStart` does no cluster work; it just publishes the actor name
+  and `SUBSTRATE_SANDBOX_LAZY=1`. Sessions that never shell out never
+  touch the cluster.
+- The actor is created on the first `exec`, then resumed before each
+  `exec` and suspended after. `/workspace` state persists across
+  suspends, so the second `npm install` is still near-instant.
 
-- `SessionStart` does no cluster work — it only publishes the actor name
-  and a `SUBSTRATE_SANDBOX_LAZY=1` flag to the Bash environment. Sessions
-  that never shell out never touch the cluster.
-- The actor is created lazily on the first `exec` call, then **resumed
-  before each `exec` call and suspended immediately after**. Between
-  calls it's Suspended, so it isn't holding a worker.
-- `/workspace` state — installed packages, build caches, generated files —
-  persists across suspends, so the second `npm install` is still near-
-  instant. The only per-call overhead is a `kubectl ate resume` +
-  `suspend` pair, which is quick on a local kind cluster.
-
-To use lazy mode, copy `settings.json.lazy.example` into your scratch dir
-instead of `settings.json.example`:
+To use it, copy `settings.json.lazy.example` in place of
+`settings.json.example`:
 
 ```bash
-mkdir -p ~/tmp/claude-sandbox-scratch/.claude/skills
 cp settings.json.lazy.example ~/tmp/claude-sandbox-scratch/.claude/settings.json
-cp -r skill ~/tmp/claude-sandbox-scratch/.claude/skills/substrate-sandbox
-cd ~/tmp/claude-sandbox-scratch
-claude
 ```
 
-The wiring differs from eager mode by which subcommands the hooks call:
-`session-start-lazy` and `session-end-lazy` in place of the eager
-equivalents. `PreToolUse` still points at plain `check-bash`. Both modes
-share the same `exec` path; lazy behavior is triggered by the
-`SUBSTRATE_SANDBOX_LAZY` env var that `session-start-lazy` writes to
-`$CLAUDE_ENV_FILE` alongside the actor name.
-
-You can verify it's working by watching `kubectl ate get actors -a
-claude-sandbox` while you interact with Claude: the actor should flip to
-`ACTOR_STATE_RUNNING` for the duration of each command and back to
-`ACTOR_STATE_SUSPENDED` a moment later.
+Verify by watching `kubectl ate get actors -a claude-sandbox` as you
+interact with Claude — the actor flips to `RUNNING` for each command and
+back to `SUSPENDED` a moment later.
 
 ## Cleanup
 
@@ -346,22 +260,11 @@ Check that `.claude/settings.json` in the scratch dir points at the built
 binary and that `$HOME/bin/substrate-sandbox-hook` exists. Restarting
 Claude re-runs `SessionStart`.
 
-**Confirming a command really ran in the sandbox.** See the "Verify the
-sandbox from inside Claude" section above — the sequence is a `uname -a`
-smoke test that should return Linux (not Darwin), plus a `run.sh` /
-`note.txt` round trip that proves your local workspace files land in
-`/workspace` on the actor. If either fails, the `PreToolUse` hook is
-probably not wired up: check that `.claude/settings.json` in the scratch
-dir includes the `check-bash` entry and that
-`$HOME/bin/substrate-sandbox-hook` is up-to-date (re-run `./setup.sh`).
-
-**A local Bash call was denied and I actually wanted it to run locally.** The
-`check-bash` hook denies every Bash call that isn't routed through the
-sandbox binary. If you have a specific command that genuinely needs to run
-on the laptop, the cleanest option is to edit the `check-bash` allow list
-in `hook/main.go` (see `isSandboxRouted`) to also accept your command's
-prefix, then rebuild. Modifying the hook is preferable to loosening the
-enforcement — the whole point of the demo is that shell commands
+**A local Bash call was denied and I actually wanted it to run locally.**
+The `check-bash` hook denies any Bash call not routed through the sandbox
+binary. To exempt a specific command, edit the allow list in
+`hook/main.go` (see `isSandboxRouted`) and rebuild — better than
+loosening the enforcement, since the whole point is that shell commands
 demonstrably reach the sandbox.
 
 ## Security note
