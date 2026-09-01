@@ -15,6 +15,12 @@
 //                   uploads it to the actor via POST /process with the
 //                   command composed in, prints stdout/stderr, exits with
 //                   the sandbox's exit code.
+//
+//   check-bash      Invoked by the PreToolUse hook on Bash. Reads the tool
+//                   input JSON from stdin; if the command is not routed
+//                   through `substrate-sandbox-hook exec --`, prints a
+//                   deny decision as JSON and exits nonzero so Claude sees
+//                   the block and re-issues through the sandbox.
 package main
 
 import (
@@ -58,7 +64,7 @@ var skipDirs = map[string]bool{
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: substrate-sandbox-hook {session-start|session-end|exec -- <cmd>}")
+		fatal("usage: substrate-sandbox-hook {session-start|session-end|exec -- <cmd>|check-bash}")
 	}
 	switch os.Args[1] {
 	case "session-start":
@@ -67,6 +73,8 @@ func main() {
 		sessionEnd()
 	case "exec":
 		execCmd(os.Args[2:])
+	case "check-bash":
+		checkBash()
 	default:
 		fatal("unknown subcommand: %s", os.Args[1])
 	}
@@ -245,6 +253,8 @@ func execCmd(args []string) {
 		fatal("POST /process: %v", err)
 	}
 
+	// Banner so it's visually unambiguous which side ran the command.
+	fmt.Printf("[sandbox %s alpine] $ %s\n", actor, userCmd)
 	if respPayload.Stdout != "" {
 		fmt.Print(respPayload.Stdout)
 	}
@@ -351,4 +361,112 @@ func tarWorkspace(root string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// --- check-bash ---
+//
+// PreToolUse hook for the Bash tool. Claude Code invokes this on every Bash
+// call with a JSON payload on stdin:
+//
+//   {"tool_name":"Bash","tool_input":{"command":"..."}, ...}
+//
+// If the command is not routed through the sandbox, we emit a permissionDecision
+// of "deny" with an explanatory reason. Claude sees the reason and re-issues
+// the command through `substrate-sandbox-hook exec --`.
+
+type bashHookInput struct {
+	ToolName  string `json:"tool_name"`
+	ToolInput struct {
+		Command string `json:"command"`
+	} `json:"tool_input"`
+}
+
+type hookOutput struct {
+	HookSpecificOutput hookSpecificOutput `json:"hookSpecificOutput"`
+}
+
+type hookSpecificOutput struct {
+	HookEventName            string `json:"hookEventName"`
+	PermissionDecision       string `json:"permissionDecision"`
+	PermissionDecisionReason string `json:"permissionDecisionReason"`
+}
+
+func checkBash() {
+	var in bashHookInput
+	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
+		// Fail closed: if we can't parse the input we can't verify the command,
+		// so deny with an explanation.
+		emitBashDeny("substrate-sandbox-hook check-bash: could not parse hook input: " + err.Error())
+		return
+	}
+	cmd := strings.TrimSpace(in.ToolInput.Command)
+	if isSandboxRouted(cmd) {
+		// Allow: no output is a passthrough, exit 0.
+		return
+	}
+	emitBashDeny(
+		"This session runs shell commands inside a remote Agent Substrate sandbox " +
+			"(Alpine Linux), NOT on the local laptop. The Bash command you attempted " +
+			"was blocked because it did not go through the sandbox binary.\n\n" +
+			"Re-issue the command as:\n\n" +
+			"    ~/bin/substrate-sandbox-hook exec -- <your command>\n\n" +
+			"Everything after `--` runs inside the sandbox actor with /workspace as CWD. " +
+			"See the substrate-sandbox skill for details. If you truly need to run " +
+			"something on the laptop, ask the user first — they can approve a specific " +
+			"local command by adding it to the allow list in .claude/settings.json.",
+	)
+}
+
+// isSandboxRouted returns true if the command's first token is the sandbox
+// binary. Accepts a few equivalent spellings of the path.
+func isSandboxRouted(cmd string) bool {
+	// Strip a leading `cd <dir> && ` that Claude Code sometimes prepends via
+	// its own tooling — anything before the first `&&` shouldn't matter for
+	// the guarantee we care about (that the payload runs in the sandbox).
+	trimmed := strings.TrimSpace(cmd)
+	if trimmed == "" {
+		return false
+	}
+	// Grab first whitespace-separated token.
+	firstTok := trimmed
+	for i, r := range trimmed {
+		if r == ' ' || r == '\t' {
+			firstTok = trimmed[:i]
+			break
+		}
+	}
+	// Accept these prefixes as "routed via sandbox".
+	home := os.Getenv("HOME")
+	acceptable := []string{
+		"~/bin/substrate-sandbox-hook",
+		"$HOME/bin/substrate-sandbox-hook",
+		"substrate-sandbox-hook",
+	}
+	if home != "" {
+		acceptable = append(acceptable, filepath.Join(home, "bin", "substrate-sandbox-hook"))
+	}
+	for _, p := range acceptable {
+		if firstTok == p {
+			return true
+		}
+	}
+	return false
+}
+
+func emitBashDeny(reason string) {
+	// Emit both signals for maximum robustness across Claude Code versions:
+	// 1. Structured JSON on stdout so the reason is shown as tool feedback.
+	// 2. The same reason on stderr as a fallback.
+	// 3. Exit code 2, which unconditionally blocks the tool call even if
+	//    JSON parsing fails on the reader side.
+	out := hookOutput{
+		HookSpecificOutput: hookSpecificOutput{
+			HookEventName:            "PreToolUse",
+			PermissionDecision:       "deny",
+			PermissionDecisionReason: reason,
+		},
+	}
+	_ = json.NewEncoder(os.Stdout).Encode(&out)
+	fmt.Fprintln(os.Stderr, reason)
+	os.Exit(2)
 }

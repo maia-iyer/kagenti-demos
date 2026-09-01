@@ -44,10 +44,27 @@ sees `&&`:
 
 ## When to use the local Bash tool instead
 
-Almost never. The only reason to fall back to the built-in Bash tool is if the
-user explicitly asks you to run something on their laptop (e.g., "check what
-version of git is installed locally", "read a file outside my workspace") — and
-even then, confirm before doing it.
+Never, by default. A PreToolUse hook (`substrate-sandbox-hook check-bash`)
+denies any Bash call whose command doesn't start with `substrate-sandbox-hook
+exec --`. If you try to run `uname` or `ls` directly through the built-in Bash
+tool, you'll get a deny with a reason telling you to re-issue through the
+sandbox binary. This is deliberate — it's how the demo guarantees that shell
+commands actually reach the sandbox actor.
+
+The only way to run something locally is for the user to explicitly permit
+that specific command in `.claude/settings.json` — do not try to work around
+the deny yourself. If a deny happens, re-issue the command through
+`~/bin/substrate-sandbox-hook exec --`.
+
+## How to prove you're in the sandbox
+
+Sandbox output is prefixed with a banner like:
+
+    [sandbox sess-abcd1234 alpine] $ <command>
+
+so you can see at a glance that the command reached the remote actor. To
+sanity-check, `~/bin/substrate-sandbox-hook exec -- uname -a` should print
+Linux (Alpine), not Darwin.
 
 ## Things to know
 

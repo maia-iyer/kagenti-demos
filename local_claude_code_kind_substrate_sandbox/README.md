@@ -20,7 +20,7 @@ same actor, so build caches and installed dependencies survive across days.
 
 ## How it works
 
-Two mechanisms cooperate:
+Three mechanisms cooperate:
 
 1. **Lifecycle hooks (`SessionStart`, `SessionEnd`).** These call
    `substrate-sandbox-hook` to create/resume the session's actor on start and
@@ -34,8 +34,17 @@ Two mechanisms cooperate:
 
    The binary reads the pin file to find the actor, tars up the workspace,
    POSTs to Substrate's `/process` endpoint with the workspace and command
-   composed together, and prints the sandbox's stdout/stderr locally. Exit
-   code is the sandbox command's exit code.
+   composed together, and prints the sandbox's stdout/stderr locally prefixed
+   with a `[sandbox <actor> alpine] $ ...` banner so it's visually obvious
+   the command ran remotely. Exit code is the sandbox command's exit code.
+
+3. **A `PreToolUse` hook on the Bash tool** (`substrate-sandbox-hook
+   check-bash`). This is the enforcement layer. If Claude tries to call the
+   built-in Bash tool with a command that isn't routed through
+   `substrate-sandbox-hook exec --`, the hook denies the call with a reason
+   telling Claude to re-issue through the sandbox binary. Without this hook
+   the skill is advisory — Claude can (and did) silently run commands on the
+   laptop, which is how you got a `Darwin` from `uname` in earlier runs.
 
 Read/Edit/Grep/Glob still operate on your laptop's local filesystem — only
 shell commands are redirected.
@@ -203,11 +212,26 @@ Or bump replicas: `kubectl -n ate-demo-sandbox scale workerpool/sandbox-workerpo
 `.claude/settings.json` in the scratch dir points at the built binary and
 that `$HOME/bin/substrate-sandbox-hook` exists.
 
-**Claude is running commands locally instead of through the skill.** The
-skill's description tells Claude when to use it, but Claude has discretion.
-If it's ignoring the skill, remind it in the prompt ("use the substrate-sandbox
-skill for all shell commands") — or, more robust, add a short note to
-`.claude/CLAUDE.md` in the scratch dir saying the same thing.
+**Confirming a command really ran in the sandbox.** Every sandbox invocation
+prints a banner as the first line of stdout:
+
+    [sandbox sess-abcd1234 alpine] $ <the command>
+
+If you don't see that banner, the command didn't reach the actor. As a
+smoke test, ask Claude to run `uname -a` — it should print a Linux/Alpine
+kernel string, not `Darwin`. If it prints Darwin, the `PreToolUse` hook is
+not wired up: check that `.claude/settings.json` in the scratch dir includes
+the `check-bash` entry and that `$HOME/bin/substrate-sandbox-hook` is
+up-to-date (re-run `./setup.sh`).
+
+**A local Bash call was denied and I actually wanted it to run locally.** The
+`check-bash` hook denies every Bash call that isn't routed through the
+sandbox binary. If you have a specific command that genuinely needs to run
+on the laptop, the cleanest option is to edit the `check-bash` allow list
+in `hook/main.go` (see `isSandboxRouted`) to also accept your command's
+prefix, then rebuild. Modifying the hook is preferable to loosening the
+enforcement — the whole point of the demo is that shell commands
+demonstrably reach the sandbox.
 
 **"another substrate-sandbox session is active in this scratch dir"** —
 You started a second Claude session in a scratch dir that already has an
