@@ -21,7 +21,7 @@ kubectl -n ate-demo-sandbox scale workerpool/sandbox-workerpool \
 
 echo "==> Waiting for workerpool pods to be Ready..."
 kubectl -n ate-demo-sandbox wait --for=condition=Ready pod \
-  -l workload=sandbox --timeout=120s
+  -l ate.dev/worker-pool=sandbox-workerpool --timeout=120s
 
 echo "==> Creating atespace ${ATESPACE} (idempotent)..."
 if ! kubectl ate create atespace "${ATESPACE}" 2>&1 | tee /tmp/ate-create.log; then
@@ -35,7 +35,7 @@ fi
 
 echo "==> Building substrate-sandbox-hook to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
-go build -o "${INSTALL_DIR}/substrate-sandbox-hook" "${SCRIPT_DIR}/hook"
+(cd "${SCRIPT_DIR}/hook" && go build -o "${INSTALL_DIR}/substrate-sandbox-hook" .)
 
 echo ""
 echo "Setup complete."
