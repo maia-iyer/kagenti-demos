@@ -48,12 +48,13 @@ import (
 )
 
 const (
-	atespace        = "claude-sandbox"
-	template        = "ate-demo-sandbox/sandbox-template"
-	dnsSuffix       = "actors.resources.substrate.ate.dev"
-	actorEnvVar     = "SUBSTRATE_ACTOR_NAME"
-	atenetAddr      = "localhost:8000"
-	execTimeout     = 5 * time.Minute
+	atespace     = "claude-sandbox"
+	template     = "ate-demo-sandbox/sandbox-template"
+	dnsSuffix    = "actors.resources.substrate.ate.dev"
+	actorEnvVar  = "SUBSTRATE_ACTOR_NAME"
+	lazyEnvVar   = "SUBSTRATE_SANDBOX_LAZY"
+	atenetAddr   = "localhost:8000"
+	execTimeout  = 5 * time.Minute
 )
 
 // skipDirs are workspace subdirectories not uploaded to the actor.
@@ -68,17 +69,21 @@ var skipDirs = map[string]bool{
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: substrate-sandbox-hook {session-start|session-end|exec -- <cmd>|check-bash}")
+		fatal("usage: substrate-sandbox-hook {session-start|session-end|session-end-lazy|exec -- <cmd>|check-bash|check-bash-lazy}")
 	}
 	switch os.Args[1] {
 	case "session-start":
 		sessionStart()
 	case "session-end":
 		sessionEnd()
+	case "session-end-lazy":
+		sessionEndLazy()
 	case "exec":
 		execCmd(os.Args[2:])
 	case "check-bash":
 		checkBash()
+	case "check-bash-lazy":
+		checkBashLazy()
 	default:
 		fatal("unknown subcommand: %s", os.Args[1])
 	}
@@ -176,6 +181,27 @@ func sessionEnd() {
 	}
 }
 
+// sessionEndLazy is the lazy-mode variant of sessionEnd. If the session
+// never ran a shell command, the actor was never created; we skip the
+// suspend rather than emit a spurious "not found" warning. If the actor
+// does exist, we suspend as a safety net in case a call was interrupted
+// mid-flight and left it running.
+func sessionEndLazy() {
+	sessionID := readSessionID()
+	name := actorName(sessionID)
+
+	if out, err := runKube("kubectl", "ate", "get", "actor", name, "-a", atespace); err != nil {
+		if strings.Contains(out, "NotFound") || strings.Contains(out, "not found") {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "substrate-sandbox-hook: get actor %s (lazy end) failed: %v\n%s\n", name, err, out)
+		return
+	}
+	if _, err := runKube("kubectl", "ate", "suspend", "actor", name, "-a", atespace); err != nil {
+		fmt.Fprintf(os.Stderr, "substrate-sandbox-hook: suspend actor %s (lazy end) failed: %v\n", name, err)
+	}
+}
+
 // runKube runs a kubectl-ate command and returns the combined output.
 func runKube(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
@@ -217,6 +243,18 @@ func execCmd(args []string) {
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
+	// Lazy mode: resume the actor for this call, suspend it after. This
+	// releases the worker slot between commands so a user who steps away
+	// for ten minutes isn't holding one. Create was done by check-bash-lazy;
+	// resume is idempotent on an already-running actor. Only reached when
+	// the SessionStart hook chose lazy mode by exporting SUBSTRATE_SANDBOX_LAZY.
+	lazy := os.Getenv(lazyEnvVar) == "1"
+	if lazy {
+		if out, err := runKube("kubectl", "ate", "resume", "actor", actor, "-a", atespace); err != nil {
+			fatal("resume actor %s (lazy): %v\n%s", actor, err, out)
+		}
+	}
+
 	// Tar+gzip the workspace.
 	root := projectDir()
 	tarball, err := tarWorkspace(root)
@@ -234,6 +272,8 @@ func execCmd(args []string) {
 	}
 	respPayload, err := postProcess(actor, body)
 	if err != nil {
+		// Hook-level failure (POST didn't return). Leave the actor running
+		// so the user can retry without paying resume latency again.
 		fatal("POST /process: %v", err)
 	}
 
@@ -246,6 +286,15 @@ func execCmd(args []string) {
 	if respPayload.Error != "" {
 		fmt.Fprintf(os.Stderr, "\n(sandbox reported error: %s)\n", respPayload.Error)
 	}
+
+	// Lazy mode: suspend after a successful POST regardless of the user
+	// command's exit code — a nonzero test run is expected, not a hook error.
+	if lazy {
+		if out, err := runKube("kubectl", "ate", "suspend", "actor", actor, "-a", atespace); err != nil {
+			fmt.Fprintf(os.Stderr, "substrate-sandbox-hook: suspend actor %s (lazy) failed: %v\n%s\n", actor, err, out)
+		}
+	}
+
 	os.Exit(respPayload.ExitCode)
 }
 
@@ -357,6 +406,7 @@ func tarWorkspace(root string) ([]byte, error) {
 // the command through `substrate-sandbox-hook exec --`.
 
 type bashHookInput struct {
+	SessionID string `json:"session_id"`
 	ToolName  string `json:"tool_name"`
 	ToolInput struct {
 		Command string `json:"command"`
@@ -374,13 +424,7 @@ type hookSpecificOutput struct {
 }
 
 func checkBash() {
-	var in bashHookInput
-	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
-		// Fail closed: if we can't parse the input we can't verify the command,
-		// so deny with an explanation.
-		emitBashDeny("substrate-sandbox-hook check-bash: could not parse hook input: " + err.Error())
-		return
-	}
+	in := parseBashHookInput()
 	cmd := strings.TrimSpace(in.ToolInput.Command)
 	if isSandboxRouted(cmd) {
 		// Allow: no output is a passthrough, exit 0.
@@ -397,6 +441,75 @@ func checkBash() {
 			"something on the laptop, ask the user first — they can approve a specific " +
 			"local command by adding it to the allow list in .claude/settings.json.",
 	)
+}
+
+// checkBashLazy is the lazy-mode variant of checkBash. Same enforcement
+// (deny non-sandbox-routed Bash), plus: if this is the first sandbox-routed
+// call in the session, create the actor and publish its name to
+// $CLAUDE_ENV_FILE so `exec` (running as a subprocess of this same Bash
+// call, after Claude sources the env-file into its preamble) picks it up.
+// Actor is created but left suspended; `exec` resumes and re-suspends
+// around each POST /process.
+func checkBashLazy() {
+	in := parseBashHookInput()
+	cmd := strings.TrimSpace(in.ToolInput.Command)
+	if !isSandboxRouted(cmd) {
+		emitBashDeny(
+			"This session runs shell commands inside a remote Agent Substrate sandbox " +
+				"(Alpine Linux), NOT on the local laptop. The Bash command you attempted " +
+				"was blocked because it did not go through the sandbox binary.\n\n" +
+				"Re-issue the command as:\n\n" +
+				"    ~/bin/substrate-sandbox-hook exec -- <your command>\n\n" +
+				"Everything after `--` runs inside the sandbox actor with /workspace as CWD. " +
+				"See the substrate-sandbox skill for details.",
+		)
+		return
+	}
+
+	// Sandbox-routed call. Attach the actor if we haven't yet in this session.
+	// We can't check the current env of `exec` from here, but $CLAUDE_ENV_FILE
+	// is a fresh empty path per hook invocation, so instead we check: did the
+	// prior hook run already write the export line? If so, skip the create.
+	// The simpler alternative — always call create — is idempotent, so we go
+	// with that: it's one `kubectl ate create` per Bash call in the worst case,
+	// but kubectl-ate returns AlreadyExists fast and we don't wait on resume
+	// (exec does that).
+	if in.SessionID == "" {
+		emitBashDeny("substrate-sandbox-hook check-bash-lazy: hook input missing session_id")
+		return
+	}
+	name := actorName(in.SessionID)
+	if out, err := runKube("kubectl", "ate", "create", "actor", name, "-a", atespace, "--template", template); err != nil {
+		if !strings.Contains(out, "AlreadyExists") && !strings.Contains(out, "already exists") {
+			emitBashDeny(fmt.Sprintf("substrate-sandbox-hook check-bash-lazy: create actor %s: %v\n%s", name, err, out))
+			return
+		}
+	}
+
+	// Publish the actor name AND the lazy-mode flag to $CLAUDE_ENV_FILE.
+	// Claude Code sources this before running the Bash command, so `exec`
+	// (invoked by that command) sees both in its environment.
+	envFile := os.Getenv("CLAUDE_ENV_FILE")
+	if envFile == "" {
+		emitBashDeny("substrate-sandbox-hook check-bash-lazy: CLAUDE_ENV_FILE not set")
+		return
+	}
+	content := fmt.Sprintf("export %s=%s\nexport %s=1\n", actorEnvVar, name, lazyEnvVar)
+	if err := os.WriteFile(envFile, []byte(content), 0o644); err != nil {
+		emitBashDeny(fmt.Sprintf("substrate-sandbox-hook check-bash-lazy: write CLAUDE_ENV_FILE: %v", err))
+		return
+	}
+	// Allow: passthrough exit 0.
+}
+
+// parseBashHookInput decodes the PreToolUse Bash hook JSON. Fails closed
+// via emitBashDeny if the input can't be parsed.
+func parseBashHookInput() bashHookInput {
+	var in bashHookInput
+	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
+		emitBashDeny("substrate-sandbox-hook: could not parse hook input: " + err.Error())
+	}
+	return in
 }
 
 // isSandboxRouted returns true if the command's first token is the sandbox
