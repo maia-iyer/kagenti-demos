@@ -40,6 +40,35 @@ There are two flavors:
 
 For the full design, see [PLAN.md](PLAN.md).
 
+## When to run on substrate vs. locally (vs. a git worktree)
+
+Substrate execution is worth the overhead when you need something a laptop
+can't cheaply provide:
+
+- **Untrusted or risky code** — LLM-generated shell, third-party tools, or
+  anything you don't want touching your real filesystem, keychain, or
+  network.
+- **Reproducible environments** — the task needs a specific OS, kernel, or
+  package set. Every actor here starts from the same Alpine image.
+- **Long-running or resumable work** — jobs that should outlive your
+  terminal or survive laptop sleep. `--resume` re-attaches to the same
+  warm actor.
+- **Parallel fan-out** — many concurrent sessions without them fighting
+  over the same working tree, ports, or caches.
+- **Resource limits** — memory, CPU, or disk that you don't want tied up
+  locally.
+
+Stay local when the task is fast, trusted, and benefits from your
+dotfiles, credentials, or direct access to your working tree.
+
+**Git worktree is not a substitute.** Worktree solves exactly one thing
+on that list — filesystem isolation between parallel branches on the same
+machine — and even that only partially, since worktrees still share your
+kernel, user, network, and credentials. It does nothing for untrusted
+code, environment reproducibility, resource limits, or detached
+long-running jobs. Worktree and substrate compose: an agent can work in
+its own worktree *and* execute risky commands in its own sandbox actor.
+
 ## Prerequisites
 
 You need a kind cluster with Substrate installed and both the counter demo
