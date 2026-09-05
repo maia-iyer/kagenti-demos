@@ -4,3 +4,10 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# bd init also drops these — keep them local, out of the repo
+.agents/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
