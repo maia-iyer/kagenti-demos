@@ -314,12 +314,35 @@ kubectl -n ate-demo-autoscaled-workerpool get workerpool counter
 
 ## Teardown
 
+Two modes, controlled by `FULL_TEARDOWN`:
+
 ```bash
-./teardown.sh
+./teardown.sh                    # default: demo-specific state only
+FULL_TEARDOWN=1 ./teardown.sh    # also delete atespace + autoscaled-workerpool
 ```
 
-Removes the 300 actors, restores the HPA to its upstream bounds (min=1,
-max=10), and strips any `crank.sh` patch off the router deployment. Does not
-delete the `burst` atespace or the upstream `autoscaled-workerpool` demo —
-those may be shared. The teardown script prints the commands to remove them
-if you want to.
+**Default (`FULL_TEARDOWN=0`)** — removes the 300 `b*` actors and any
+`req-*` actors left behind by a Ctrl+C'd create run, restores the HPA to
+its upstream bounds (min=1, max=10), deletes the `counter-fast`
+ActorTemplate, and strips any `crank.sh` patch off the router deployment.
+Leaves the `burst` atespace and the `autoscaled-workerpool` namespace in
+place because other demos may share them.
+
+**Full (`FULL_TEARDOWN=1`)** — does everything above, then also deletes the
+`burst` atespace and the `autoscaled-workerpool` namespace (HPA, workerpool,
+templates, prometheus-adapter bits). Leaves you with a clean Substrate
+install (`ate-system` untouched) on the kind cluster. Use this when this
+demo owns the whole substrate setup.
+
+To reset Substrate itself as well, from your `substrate/` checkout:
+
+```bash
+./hack/install-ate-kind.sh --delete-ate-system
+```
+
+To delete the kind cluster entirely (nukes everything — cluster, registry,
+all state):
+
+```bash
+kind delete cluster
+```
