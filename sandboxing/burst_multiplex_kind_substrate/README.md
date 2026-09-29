@@ -72,7 +72,7 @@ actor snapshots.
      │  --parked-request-budget=5s          ▼
      │                                  rustfs (in-cluster S3, snapshots)
      ▼
-  /statusz?format=json → live parking gauge on :9090
+  /statusz?format=json → live parking gauge on :4040
 ```
 
 ## Setup
