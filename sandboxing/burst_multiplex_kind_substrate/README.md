@@ -131,11 +131,28 @@ kubectl port-forward -n ate-system svc/atenet-router 4041:4040
 ./load.sh
 ```
 
-`load.sh` defaults to 3000 requests at concurrency 300 — takes a minute or two
-on a warm cluster in `fast` mode, much longer in `durable` mode. Each
-iteration issues one HTTP request and then calls `kubectl ate suspend` on
-that actor, so the worker rotates onto whichever actor the router next
-resumes.
+`load.sh` defaults to `REQUESTS=NUM_ACTORS` (one per actor, on average) at
+concurrency 300. In `fast` mode that finishes in a few seconds; in `durable`
+mode it takes minutes.
+
+### Load mode
+
+`LOAD_MODE` (default `reuse`) picks what each request does:
+
+- `reuse` — sample one of the pre-spawned actors, hit it, then
+  `kubectl ate suspend` to free its worker. Exercises the **resume + parking**
+  path: 300 actors sharing 3 workers, router parks bursts while substrate
+  rotates workers.
+- `create` — create a fresh actor from the template, hit it once, delete it.
+  Exercises the **actor-create + golden-snapshot materialization + cold-start**
+  path on every request. Much heavier; the `%{time_total}` you see includes
+  a full actor lifecycle, not just resume. Best paired with a low `REQUESTS`
+  value on a laptop.
+
+```bash
+LOAD_MODE=reuse  ./load.sh                              # (default)
+LOAD_MODE=create REQUESTS=30 ./load.sh                  # cold-start burst
+```
 
 ### Configuration
 
@@ -147,8 +164,9 @@ All scripts honor the same env vars, with sane defaults:
 | `NUM_ACTORS`        | `300`       | setup, load, teardown         |
 | `POOL_REPLICAS`     | `3`         | setup                         |
 | `CONCURRENCY`       | `300`       | load                          |
-| `TEMPLATE_MODE`     | `fast`      | setup (`fast` or `durable`)   |
-| `REQUESTS`          | `3000`      | load                          |
+| `TEMPLATE_MODE`     | `fast`      | setup + load (`fast`/`durable`) |
+| `LOAD_MODE`         | `reuse`     | load (`reuse` or `create`)    |
+| `REQUESTS`          | `${NUM_ACTORS}` | load                      |
 | `ENDPOINT`          | `http://localhost:8000` | load              |
 | `CREATE_PARALLELISM`| `20`        | setup                         |
 
