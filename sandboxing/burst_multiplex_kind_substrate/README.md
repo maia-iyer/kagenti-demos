@@ -33,15 +33,24 @@ Substrate work and are not part of this demo.
 From your `substrate/` checkout:
 
 ```bash
-# One-time: kind cluster + Substrate + counter workerpool with HPA
-./hack/install-ate-kind.sh --deploy-ate-system --deploy-demo-autoscaled-workerpool
+# 1. Kind cluster + local registry.
+./hack/create-kind-cluster.sh
+
+# 2. Substrate itself.
+./hack/install-ate-kind.sh --deploy-ate-system
+
+# 3. Autoscaled-workerpool demo — deploys the `counter` WorkerPool,
+#    ActorTemplate, HPA, and prometheus-adapter that this demo pins and
+#    drives load against.
+./hack/install-ate-kind.sh --deploy-demo-autoscaled-workerpool
 ```
 
-Also required on your PATH:
+You also need:
 
-- `kubectl` and the `kubectl ate` plugin (`go install ./cmd/kubectl-ate` from
-  the substrate checkout).
-- `curl`, `xargs`, `jq` — standard on most systems.
+- Go 1.22+
+- `kubectl` and the `kubectl-ate` plugin (`go install ./cmd/kubectl-ate`
+  from `substrate/`)
+- `curl`, `xargs`, `jq` — standard on most systems
 
 No Anthropic API key, no Docker registry, no cloud storage bucket. The
 underlying kind install uses an in-cluster `rustfs` (S3-compatible) for
@@ -66,25 +75,38 @@ actor snapshots.
   /statusz?format=json → live parking gauge on :9090
 ```
 
+## Setup
+
+From this directory:
+
+```bash
+./setup.sh
+```
+
+This pins the `counter` HPA to `min=max=POOL_REPLICAS` (default 3), scales the
+`counter` workerpool to match, creates the `burst` atespace, and spawns
+`NUM_ACTORS` (default 300) counter actors in parallel. Takes ~30–60s.
+
+Then, in two separate terminals, start the port-forwards:
+
+```bash
+# Terminal A — data plane (curl target for ./load.sh)
+kubectl port-forward -n ate-system svc/atenet-router 8000:80
+
+# Terminal B — control/metrics (parking gauge for ./watch.sh)
+kubectl port-forward -n ate-system svc/atenet-router 9091:9090
+```
+
 ## Run
 
 ```bash
-# 1. In two separate terminals, port-forward the atenet router
-#    (data plane on :80, control/metrics on :9090):
-kubectl port-forward -n ate-system svc/atenet-router 8000:80
-kubectl port-forward -n ate-system svc/atenet-router 9091:9090
-
-# 2. Pin the pool to 3 replicas and spawn 300 counter actors:
-./setup.sh
-
-# 3. In three or four more terminals, paste the commands ./watch.sh prints:
+# In three or four more terminals, paste the commands ./watch.sh prints:
 ./watch.sh
 
-# 4. Drive the burst:
+# Drive the burst:
 ./load.sh
 ```
 
-`setup.sh` takes ~30–60s to spawn 300 actors (parallelized across 20 workers).
 `load.sh` defaults to 3000 requests at concurrency 50 — takes a minute or two
 on a warm cluster.
 
