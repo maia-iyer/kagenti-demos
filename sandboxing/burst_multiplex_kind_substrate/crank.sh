@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-BUDGET="${BUDGET:-30s}"
+BUDGET="${BUDGET:-5m}"
 NS="ate-system"
 DEP="atenet-router"
 CONTAINER="atenet-router"

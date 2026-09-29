@@ -185,11 +185,113 @@ still a valid demo — parking has a budget on purpose — but if you want a
 clean 100% `200` run:
 
 ```bash
-BUDGET=30s ./crank.sh
+./crank.sh          # defaults to BUDGET=5m
+BUDGET=30s ./crank.sh   # or override
 ```
 
 `crank.sh` patches the `atenet-router` deployment to raise
-`--parked-request-budget`. `teardown.sh` strips the patch back out.
+`--parked-request-budget` (default `5m`, generous enough that even the
+durable/create path — 300 fresh actors from a snapshot-heavy template
+against 3 workers — doesn't shed requests on a laptop). `teardown.sh`
+strips the patch back out.
+
+## Comparing all four modes at once
+
+`compare.sh` runs the full 2×2 — `TEMPLATE_MODE ∈ {fast, durable}` ×
+`LOAD_MODE ∈ {reuse, create}` — back-to-back, times each run, and prints
+per-run stats plus a summary table. It handles its own port-forwards and
+runs `teardown.sh` on exit, Ctrl+C, or error, so a stuck run won't leave the
+cluster with pinned HPA bounds or the crank patch attached.
+
+```bash
+./compare.sh
+```
+
+What it does, for each of the four combinations:
+
+1. `TEMPLATE_MODE=<mode> ./setup.sh` — spawns actors from the right template.
+2. `BUDGET=<budget> ./crank.sh` — bumps the parking budget so measurements
+   reflect parking cost rather than truncation by the 5s default.
+3. Starts port-forwards on `:8000` (data) and `:4041` (status), waits for
+   them to accept connections.
+4. Runs `load.sh` under `time`, captures the status-code tally and latency
+   percentiles.
+5. `./teardown.sh` between runs, so the next template is applied cleanly.
+
+At the end you get a table like:
+
+```
+run              | wall       | p50      | p95      | p99      | max      | 200s/total
+------------------------------------------------------------------------------------------
+fast-reuse       | 0m8.4s     | 0.09s    | 0.71s    | 1.20s    | 1.32s    | 300/300
+fast-create      | 1m12s      | 2.10s    | 6.80s    | 9.50s    | 11.4s    | 60/60
+durable-reuse    | 2m41s      | 1.05s    | 24.10s   | 58.20s   | 92.4s    | 300/300
+durable-create   | 3m30s      | 6.20s    | 44.80s   | 78.10s   | 108s     | 60/60
+```
+
+(Numbers are illustrative — laptop-dependent.)
+
+### Configuration
+
+All defaults are safe for a laptop-scale run; override any env var:
+
+| Var                  | Default        | Purpose                              |
+| -------------------- | -------------- | ------------------------------------ |
+| `NUM_ACTORS`         | `300`          | Pre-spawned actor pool (reuse runs)  |
+| `POOL_REPLICAS`      | `3`            | Worker pods pinned by `setup.sh`     |
+| `CONCURRENCY`        | `300`          | Concurrency for reuse runs           |
+| `REUSE_REQUESTS`     | `${NUM_ACTORS}`| Requests fired in reuse runs         |
+| `CREATE_REQUESTS`    | `300`          | Requests fired in create runs        |
+| `CREATE_CONCURRENCY` | `300`          | Concurrency for create runs          |
+| `BUDGET`             | `5m`           | `--parked-request-budget` via `crank.sh` |
+| `SKIP`               | *(empty)*      | Comma list, e.g. `SKIP=durable-create` |
+| `RESULTS_DIR`        | `./compare-results-<ts>` | Where per-run logs land      |
+
+Examples:
+
+```bash
+# Skip the slowest run:
+SKIP=durable-create ./compare.sh
+
+# Lighter run for a slower machine (the default 300/300 create burst can
+# swamp kubectl/API-server on a laptop):
+NUM_ACTORS=100 CREATE_REQUESTS=60 CREATE_CONCURRENCY=60 ./compare.sh
+
+# Tighter budget — expect some 503s in the durable runs:
+BUDGET=30s ./compare.sh
+```
+
+### Reading the 2×2
+
+The four runs isolate two independent axes of substrate cost:
+
+|              | reuse (resume path)                | create (full lifecycle)              |
+| ------------ | ---------------------------------- | ------------------------------------ |
+| **fast**     | Baseline: resume + parking         | + actor-create + golden snapshot + cold start |
+| **durable**  | + full-memory snapshot + volume commit | Both durability tax and lifecycle tax stacked |
+
+Useful deltas:
+
+- **`fast-create` − `fast-reuse`** ≈ actor-lifecycle cost (create + cold
+  start + delete), independent of durable state.
+- **`durable-reuse` − `fast-reuse`** ≈ durability tax on the resume path
+  (full-memory snapshot + durable-volume commit per request).
+- **`durable-create` − `durable-reuse`** ≈ lifecycle cost with the durable
+  template — usually superlinear vs. the fast version because the parking
+  queue fills.
+
+### Cleanup
+
+`compare.sh` traps `EXIT`, `INT`, and `TERM`. Cleanup runs exactly once and:
+
+1. Kills the port-forwards it started, then `pkill`s any orphaned
+   `kubectl port-forward` for the atenet-router (that's the state Ctrl+C
+   tends to leave behind mid-run).
+2. Runs `./teardown.sh` best-effort — deletes actors, restores HPA bounds,
+   removes the crank patch, deletes the fast template.
+
+Ctrl+C is safe. If cleanup itself fails (e.g. cluster unreachable), the
+error surfaces but the trap does not re-fire.
 
 ## Verification
 
