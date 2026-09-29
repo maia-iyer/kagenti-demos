@@ -14,22 +14,12 @@ POOL_NS="ate-demo-autoscaled-workerpool"
 POOL="counter"
 
 cat <<EOF
-# Pane 1 — worker pool and pods (should stay at 3 replicas):
+# Pane 1 — worker states (multiplexing: 3 workers cycle FREE <-> ASSIGNED as
+#          substrate rotates actors through them):
 
-watch -n2 'kubectl -n ${POOL_NS} get workerpool,pods'
+watch -n1 'kubectl ate get workers -n ${POOL_NS}'
 
-# Pane 2 — actor states (multiplexing: substrate cycles Running <-> Suspended
-#          so 300 actors fit through 3 workers). Head to keep the pane short:
-
-watch -n2 'kubectl ate get actors -a ${ATESPACE} | head -30'
-
-# Pane 3 — assigned-workers gauge (multiplex proof: stays near POOL_REPLICAS,
-#          not NUM_ACTORS). Reads the external metric served by
-#          prometheus-adapter from the upstream demo:
-
-watch -n2 "kubectl get --raw '/apis/external.metrics.k8s.io/v1beta1/namespaces/${POOL_NS}/ate_workerpool_workers?labelSelector=ate_worker_state%3Dassigned,ate_workerpool_namespace%3D${POOL_NS},ate_workerpool_name%3D${POOL}' | jq -r '.items[0].value'"
-
-# Pane 4 — parking gauge (parking proof: spikes during a burst, drains after).
+# Pane 2 — parking gauge (parking proof: spikes during a burst, drains after).
 #          Reads the atenet-router's live /statusz snapshot on the status port.
 #          Fields: enabled, active (currently parked), max_parked, max_wait.
 

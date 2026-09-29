@@ -10,22 +10,14 @@ visible in the output:
   `load.sh` calls `kubectl ate suspend` on the actor it just hit, freeing
   that worker for the next actor waiting in line. (Substrate does not yet
   auto-suspend idle actors — the upstream parking demo uses this same
-  request→suspend pattern to stand in for that.) The `assigned` worker
-  gauge stays near 3, not 300.
+  request→suspend pattern to stand in for that.) `kubectl ate get workers`
+  shows the 3 workers churning between `FREE` and `ASSIGNED`, not 300 workers
+  standing up.
 - **Request parking.** When more actors need to run than there are workers
   free, the atenet router *holds* inbound requests for up to
   `--parked-request-budget` (default 5s) while substrate resumes actors,
   instead of returning `503`. Under the burst, `parking.active` spikes to
   double digits and drains after.
-
-## What you'll see
-
-- Status-code tally is near-100% `200`, with rare or zero `503`.
-- Response-latency `p95` is well above `p50` — the tail is parked requests.
-- `assigned` workers stays near `POOL_REPLICAS` (default 3) for the whole run,
-  even though 300 actors are registered.
-- `kubectl ate get actors -a burst` shows actors cycling between `Running`
-  and `Suspended` as the load driver rotates through them.
 
 ## Prerequisites
 
@@ -64,8 +56,8 @@ actor snapshots.
 ```
                                           burst atespace
   ./load.sh                             ┌─ b001 ─┐
-     │  50 concurrent                   │  ...   │ 300 actors
-     │  curl requests +                 │        │  (counter template)
+     │  300 concurrent                  │  ...   │ 300 actors
+     │  curl requests +                 │        │  (counter-fast or counter)
      │  kubectl ate suspend             └─ b300 ─┘
      ▼                                      │
   localhost:8000                            │ assigns / suspends / resumes
@@ -73,8 +65,8 @@ actor snapshots.
      ▼                          counter WorkerPool (pinned to 3 replicas)
   atenet-router  ─────────►          │
      │  parks bursts up to                  ▼
-     │  --parked-request-budget=5s      rustfs (in-cluster S3, snapshots)
-     ▼
+     │  --parked-request-budget          rustfs (in-cluster S3, snapshots)
+     ▼   (5s default, 5m via ./crank.sh)
   /statusz?format=json → live parking gauge on :4040
 ```
 
@@ -88,28 +80,9 @@ From this directory:
 
 This pins the `counter` HPA to `min=max=POOL_REPLICAS` (default 3), scales the
 `counter` workerpool to match, applies a stripped `counter-fast` ActorTemplate
-(cheap suspend/resume — see below), creates the `burst` atespace, and spawns
-`NUM_ACTORS` (default 300) actors in parallel. Takes ~30–60s.
-
-### Template mode
-
-`TEMPLATE_MODE` (default `fast`) picks which ActorTemplate the actors use:
-
-- `fast` — minimal `snapshotsConfig` (no durable volume, no readyz, no
-  `onPause: Full` / `onCommit: Data`). Suspend/resume is cheap, so a burst
-  rotates 300 actors across 3 workers in seconds. Best for showing off the
-  multiplex + parking story cleanly.
-- `durable` — reuses the upstream `autoscaled-workerpool/counter` template
-  as-is: full memory snapshot on suspend, durable volume committed on every
-  request. Suspend/resume is much slower (one round-trip ≈ 1s+), so a burst
-  looks *ugly*: `p50` seconds, `p99` tens of seconds, some `503`s past the
-  parking budget. That's what the durable-state path costs — real workload,
-  real snapshots. Useful for showing the price of durability.
-
-```bash
-TEMPLATE_MODE=durable ./setup.sh   # slow but honest
-TEMPLATE_MODE=fast    ./setup.sh   # (default) clean multiplex demo
-```
+(cheap suspend/resume — see [template mode](#template-mode--load-mode) below),
+creates the `burst` atespace, and spawns `NUM_ACTORS` (default 300) actors in
+parallel. Takes ~30–60s.
 
 Then, in two separate terminals, start the port-forwards:
 
@@ -121,42 +94,53 @@ kubectl port-forward -n ate-system svc/atenet-router 8000:80
 kubectl port-forward -n ate-system svc/atenet-router 4041:4040
 ```
 
-## Run
+The rest of the demo has two shapes: **[Mode A](#mode-a-drive-one-burst-manually)**
+runs one burst so you can watch it live, and
+**[Mode B](#mode-b-compare-all-four-runs)** sweeps the full 2×2 and prints a
+table.
+
+## Mode A: drive one burst manually
 
 ```bash
-# In three or four more terminals, paste the commands ./watch.sh prints:
-./watch.sh
-
-# Drive the burst:
-./load.sh
+./watch.sh   # prints two paste-ready `watch` commands (worker states + parking)
+./load.sh    # fires the burst
 ```
 
 `load.sh` defaults to `REQUESTS=NUM_ACTORS` (one per actor, on average) at
-concurrency 300. In `fast` mode that finishes in a few seconds; in `durable`
+concurrency 300. In `fast` mode it finishes in a few seconds; in `durable`
 mode it takes minutes.
 
-### Load mode
-
-`LOAD_MODE` (default `reuse`) picks what each request does:
-
-- `reuse` — sample one of the pre-spawned actors, hit it, then
-  `kubectl ate suspend` to free its worker. Exercises the **resume + parking**
-  path: 300 actors sharing 3 workers, router parks bursts while substrate
-  rotates workers.
-- `create` — create a fresh actor from the template, hit it once, delete it.
-  Exercises the **actor-create + golden-snapshot materialization + cold-start**
-  path on every request. Much heavier; the `%{time_total}` you see includes
-  a full actor lifecycle, not just resume. Best paired with a low `REQUESTS`
-  value on a laptop.
+The router defaults to a 5s parking budget, which a slow laptop can outrun
+under the durable/create combo. `./crank.sh` bumps it to 5m for a clean run;
+`./teardown.sh` strips the patch back out.
 
 ```bash
-LOAD_MODE=reuse  ./load.sh                              # (default)
-LOAD_MODE=create REQUESTS=30 ./load.sh                  # cold-start burst
+./crank.sh              # BUDGET=5m (default)
+BUDGET=30s ./crank.sh   # tighter — expect some 503s
+```
+
+### Template mode × load mode
+
+Pick one of each. Template mode is set at `setup.sh`; load mode at `load.sh`.
+
+- `TEMPLATE_MODE=fast` (default) — minimal `snapshotsConfig` (no durable
+  volume, no readyz). Cheap suspend/resume, clean multiplex demo.
+- `TEMPLATE_MODE=durable` — reuses the upstream `counter` template: full
+  memory snapshot on suspend, durable-volume commit per request. Suspend/resume
+  takes ~1s+; the burst looks *ugly* (p50 seconds, p99 tens of seconds).
+  That's the price of durable state.
+- `LOAD_MODE=reuse` (default) — sample a pre-spawned actor, hit it, then
+  `kubectl ate suspend` to free its worker. Exercises **resume + parking**.
+- `LOAD_MODE=create` — create → hit → delete on every request. Exercises
+  **actor-create + golden-snapshot materialization + cold start**. Much
+  heavier; pair with a low `REQUESTS` on a laptop.
+
+```bash
+TEMPLATE_MODE=durable ./setup.sh
+LOAD_MODE=create REQUESTS=30 ./load.sh
 ```
 
 ### Configuration
-
-All scripts honor the same env vars, with sane defaults:
 
 | Var                 | Default     | Where it matters              |
 | ------------------- | ----------- | ----------------------------- |
@@ -169,33 +153,16 @@ All scripts honor the same env vars, with sane defaults:
 | `REQUESTS`          | `${NUM_ACTORS}` | load                      |
 | `ENDPOINT`          | `http://localhost:8000` | load              |
 | `CREATE_PARALLELISM`| `20`        | setup                         |
+| `BUDGET`            | `5m`        | crank                         |
 
-Example: quick smoke test on a slow laptop —
+Smoke test on a slow laptop:
 
 ```bash
 NUM_ACTORS=50 POOL_REPLICAS=2 ./setup.sh
 CONCURRENCY=20 REQUESTS=500 NUM_ACTORS=50 ./load.sh
 ```
 
-### Cranking harder
-
-At 300 actors on 3 workers with the default 5s parking budget, a slow laptop
-may shed some requests (`503`) if the resume queue backs up beyond 5s. That's
-still a valid demo — parking has a budget on purpose — but if you want a
-clean 100% `200` run:
-
-```bash
-./crank.sh          # defaults to BUDGET=5m
-BUDGET=30s ./crank.sh   # or override
-```
-
-`crank.sh` patches the `atenet-router` deployment to raise
-`--parked-request-budget` (default `5m`, generous enough that even the
-durable/create path — 300 fresh actors from a snapshot-heavy template
-against 3 workers — doesn't shed requests on a laptop). `teardown.sh`
-strips the patch back out.
-
-## Comparing all four modes at once
+## Mode B: compare all four runs
 
 `compare.sh` runs the full 2×2 — `TEMPLATE_MODE ∈ {fast, durable}` ×
 `LOAD_MODE ∈ {reuse, create}` — back-to-back, times each run, and prints
@@ -292,25 +259,6 @@ Useful deltas:
 
 Ctrl+C is safe. If cleanup itself fails (e.g. cluster unreachable), the
 error surfaces but the trap does not re-fire.
-
-## Verification
-
-Under load, multiplexing and parking are both real when:
-
-```bash
-# assigned-workers stays near POOL_REPLICAS, not NUM_ACTORS
-kubectl get --raw \
-  '/apis/external.metrics.k8s.io/v1beta1/namespaces/ate-demo-autoscaled-workerpool/ate_workerpool_workers?labelSelector=ate_worker_state%3Dassigned,ate_workerpool_namespace%3Date-demo-autoscaled-workerpool,ate_workerpool_name%3Dcounter' \
-  | jq '.items[0].value'
-
-# parking.active > 0 during the burst, 0 at rest
-curl -s 'http://localhost:4041/statusz?format=json' | jq .parking.active
-
-# pool held at POOL_REPLICAS
-kubectl -n ate-demo-autoscaled-workerpool get workerpool counter
-
-# load.sh output: near-100% 200s, p95 latency >> p50
-```
 
 ## Teardown
 
