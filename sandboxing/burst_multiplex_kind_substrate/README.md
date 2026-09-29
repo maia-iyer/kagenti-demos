@@ -6,9 +6,12 @@ worker pool pinned to 3 pods, then fire a burst of concurrent HTTP requests
 through the atenet router. Two substrate mechanisms fire at once and are both
 visible in the output:
 
-- **Actor multiplexing.** Substrate suspends idle actors and resumes busy
-  ones so 300 actors share 3 worker pods. The `assigned` worker gauge stays
-  near 3, not 300.
+- **Actor multiplexing.** 300 actors share 3 worker pods. After each request
+  `load.sh` calls `kubectl ate suspend` on the actor it just hit, freeing
+  that worker for the next actor waiting in line. (Substrate does not yet
+  auto-suspend idle actors — the upstream parking demo uses this same
+  request→suspend pattern to stand in for that.) The `assigned` worker
+  gauge stays near 3, not 300.
 - **Request parking.** When more actors need to run than there are workers
   free, the atenet router *holds* inbound requests for up to
   `--parked-request-budget` (default 5s) while substrate resumes actors,
@@ -22,7 +25,7 @@ visible in the output:
 - `assigned` workers stays near `POOL_REPLICAS` (default 3) for the whole run,
   even though 300 actors are registered.
 - `kubectl ate get actors -a burst` shows actors cycling between `Running`
-  and `Suspended` as the pool rotates through them.
+  and `Suspended` as the load driver rotates through them.
 
 ## Prerequisites
 
@@ -62,15 +65,15 @@ actor snapshots.
                                           burst atespace
   ./load.sh                             ┌─ b001 ─┐
      │  50 concurrent                   │  ...   │ 300 actors
-     │  curl requests                   │        │  (counter template)
-     ▼                                  └─ b300 ─┘
-  localhost:8000                            │
-     │ (port-forward)                       │ assigns / suspends / resumes
-     ▼                                      ▼
-  atenet-router  ─────────►  counter WorkerPool (pinned to 3 replicas)
-     │  parks bursts up to                  │
-     │  --parked-request-budget=5s          ▼
-     │                                  rustfs (in-cluster S3, snapshots)
+     │  curl requests +                 │        │  (counter template)
+     │  kubectl ate suspend             └─ b300 ─┘
+     ▼                                      │
+  localhost:8000                            │ assigns / suspends / resumes
+     │ (port-forward)                       ▼
+     ▼                          counter WorkerPool (pinned to 3 replicas)
+  atenet-router  ─────────►          │
+     │  parks bursts up to                  ▼
+     │  --parked-request-budget=5s      rustfs (in-cluster S3, snapshots)
      ▼
   /statusz?format=json → live parking gauge on :4040
 ```
@@ -84,8 +87,29 @@ From this directory:
 ```
 
 This pins the `counter` HPA to `min=max=POOL_REPLICAS` (default 3), scales the
-`counter` workerpool to match, creates the `burst` atespace, and spawns
-`NUM_ACTORS` (default 300) counter actors in parallel. Takes ~30–60s.
+`counter` workerpool to match, applies a stripped `counter-fast` ActorTemplate
+(cheap suspend/resume — see below), creates the `burst` atespace, and spawns
+`NUM_ACTORS` (default 300) actors in parallel. Takes ~30–60s.
+
+### Template mode
+
+`TEMPLATE_MODE` (default `fast`) picks which ActorTemplate the actors use:
+
+- `fast` — minimal `snapshotsConfig` (no durable volume, no readyz, no
+  `onPause: Full` / `onCommit: Data`). Suspend/resume is cheap, so a burst
+  rotates 300 actors across 3 workers in seconds. Best for showing off the
+  multiplex + parking story cleanly.
+- `durable` — reuses the upstream `autoscaled-workerpool/counter` template
+  as-is: full memory snapshot on suspend, durable volume committed on every
+  request. Suspend/resume is much slower (one round-trip ≈ 1s+), so a burst
+  looks *ugly*: `p50` seconds, `p99` tens of seconds, some `503`s past the
+  parking budget. That's what the durable-state path costs — real workload,
+  real snapshots. Useful for showing the price of durability.
+
+```bash
+TEMPLATE_MODE=durable ./setup.sh   # slow but honest
+TEMPLATE_MODE=fast    ./setup.sh   # (default) clean multiplex demo
+```
 
 Then, in two separate terminals, start the port-forwards:
 
@@ -107,8 +131,11 @@ kubectl port-forward -n ate-system svc/atenet-router 4041:4040
 ./load.sh
 ```
 
-`load.sh` defaults to 3000 requests at concurrency 50 — takes a minute or two
-on a warm cluster.
+`load.sh` defaults to 3000 requests at concurrency 300 — takes a minute or two
+on a warm cluster in `fast` mode, much longer in `durable` mode. Each
+iteration issues one HTTP request and then calls `kubectl ate suspend` on
+that actor, so the worker rotates onto whichever actor the router next
+resumes.
 
 ### Configuration
 
@@ -119,7 +146,8 @@ All scripts honor the same env vars, with sane defaults:
 | `ATESPACE`          | `burst`     | setup, load, watch, teardown  |
 | `NUM_ACTORS`        | `300`       | setup, load, teardown         |
 | `POOL_REPLICAS`     | `3`         | setup                         |
-| `CONCURRENCY`       | `50`        | load                          |
+| `CONCURRENCY`       | `300`       | load                          |
+| `TEMPLATE_MODE`     | `fast`      | setup (`fast` or `durable`)   |
 | `REQUESTS`          | `3000`      | load                          |
 | `ENDPOINT`          | `http://localhost:8000` | load              |
 | `CREATE_PARALLELISM`| `20`        | setup                         |

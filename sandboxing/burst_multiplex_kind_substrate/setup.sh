@@ -14,8 +14,24 @@ NUM_ACTORS="${NUM_ACTORS:-300}"
 POOL_REPLICAS="${POOL_REPLICAS:-3}"
 POOL_NS="ate-demo-autoscaled-workerpool"
 POOL="counter"
-TEMPLATE="${POOL_NS}/counter"
 CREATE_PARALLELISM="${CREATE_PARALLELISM:-20}"
+
+# TEMPLATE_MODE=durable  → reuse the upstream counter template
+#   (Full memory snapshot on suspend, durable volume commit on request).
+#   Slow suspend/resume, but shows the durable-state story.
+# TEMPLATE_MODE=fast     → apply a stripped ActorTemplate (no durable volume,
+#   no readyz, no explicit snapshot policies). Cheap suspend/resume; use this
+#   flavor to show clean multiplex + parking under a burst.
+TEMPLATE_MODE="${TEMPLATE_MODE:-fast}"
+FAST_TEMPLATE_NAME="counter-fast"
+FAST_TEMPLATE_NS="${POOL_NS}"
+
+case "${TEMPLATE_MODE}" in
+  durable) TEMPLATE="${POOL_NS}/counter" ;;
+  fast)    TEMPLATE="${FAST_TEMPLATE_NS}/${FAST_TEMPLATE_NAME}" ;;
+  *) echo "TEMPLATE_MODE must be 'fast' or 'durable' (got: ${TEMPLATE_MODE})" >&2; exit 2 ;;
+esac
+echo "==> Template mode: ${TEMPLATE_MODE} (${TEMPLATE})"
 
 echo "==> Preflight: workerpool ${POOL_NS}/${POOL} must exist..."
 if ! kubectl -n "${POOL_NS}" get workerpool "${POOL}" >/dev/null 2>&1; then
@@ -41,26 +57,68 @@ echo "==> Waiting for workerpool to settle at ${POOL_REPLICAS} ready replicas...
 # Wait on the workerpool's own status rather than `kubectl wait pod ...` — the
 # latter races with scale-down: it snapshots the pod list at start and then
 # errors "pod not found" if any pod in that snapshot gets deleted mid-wait.
+ready=0
+total=0
 for _ in $(seq 1 60); do
-  read -r ready total < <(kubectl -n "${POOL_NS}" get workerpool "${POOL}" \
-    -o jsonpath='{.status.readyReplicas} {.status.replicas}' 2>/dev/null || echo "0 0")
+  status="$(kubectl -n "${POOL_NS}" get workerpool "${POOL}" \
+    -o jsonpath='{.status.readyReplicas} {.status.replicas}' 2>/dev/null || true)"
+  ready="${status% *}"
+  total="${status#* }"
+  ready="${ready:-0}"
+  total="${total:-0}"
   if [[ "${ready}" == "${POOL_REPLICAS}" && "${total}" == "${POOL_REPLICAS}" ]]; then
     echo "    ${ready}/${POOL_REPLICAS} ready"
     break
   fi
   sleep 2
 done
-if [[ "${ready:-0}" != "${POOL_REPLICAS}" ]]; then
+if [[ "${ready}" != "${POOL_REPLICAS}" ]]; then
   echo "    workerpool did not settle at ${POOL_REPLICAS} within 120s (got ${ready}/${total})" >&2
   exit 1
 fi
 
+if [[ "${TEMPLATE_MODE}" == "fast" ]]; then
+  echo "==> Applying stripped ActorTemplate ${FAST_TEMPLATE_NS}/${FAST_TEMPLATE_NAME}..."
+  # Reuses the upstream counter image + worker selector, but drops the durable
+  # volume, readyz, and Full/Data snapshot policies. Result: suspend/resume
+  # goes through gvisor with a minimal snapshot, so a burst can rotate 300
+  # actors across 3 workers in seconds instead of minutes.
+  UPSTREAM_IMAGE=$(kubectl -n "${POOL_NS}" get actortemplate counter \
+    -o jsonpath='{.spec.containers[?(@.name=="counter")].image}')
+  if [[ -z "${UPSTREAM_IMAGE}" ]]; then
+    echo "    could not read counter image from upstream template" >&2
+    exit 1
+  fi
+  kubectl apply -f - <<EOF
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: ${FAST_TEMPLATE_NAME}
+  namespace: ${FAST_TEMPLATE_NS}
+spec:
+  containers:
+  - name: counter
+    image: ${UPSTREAM_IMAGE}
+    command: ["/ko-app/counter"]
+  workerSelector:
+    matchLabels:
+      workload: counter-autoscaled
+  snapshotsConfig:
+    location: gs://ate-snapshots/${FAST_TEMPLATE_NAME}/
+EOF
+fi
+
 echo "==> Creating atespace ${ATESPACE} (idempotent)..."
-if ! kubectl ate create atespace "${ATESPACE}" 2>&1 | tee /tmp/ate-create.log; then
-  if grep -q -i "already exists\|AlreadyExists" /tmp/ate-create.log; then
+# Capture the command's own exit status (not tee's — a `... | tee` pipeline's
+# exit is tee's, which is always 0 without pipefail, so failures were masked).
+if out=$(kubectl ate create atespace "${ATESPACE}" 2>&1); then
+  echo "${out}"
+else
+  echo "${out}"
+  if echo "${out}" | grep -q -i "already exists\|AlreadyExists"; then
     echo "    (atespace already exists — that's fine)"
   else
-    echo "    atespace create failed; see /tmp/ate-create.log" >&2
+    echo "    atespace create failed" >&2
     exit 1
   fi
 fi

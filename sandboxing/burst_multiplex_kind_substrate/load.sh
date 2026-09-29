@@ -3,7 +3,10 @@
 #
 # Fires REQUESTS concurrent HTTP requests (CONCURRENCY at a time) uniformly
 # distributed across NUM_ACTORS actor hostnames, through the port-forwarded
-# atenet-router. Prints per-status tally, latency percentiles, and per-actor
+# atenet-router. After each request the actor is explicitly suspended
+# (`kubectl ate suspend`) to free its worker for a parked competitor — the
+# same pattern the upstream parking demo uses, standing in for auto-suspend-
+# on-idle. Prints per-status tally, latency percentiles, and per-actor
 # request counts so multiplexing (actors share workers) and parking (requests
 # wait during the resume gap) are both visible in the output.
 
@@ -11,7 +14,7 @@ set -euo pipefail
 
 ATESPACE="${ATESPACE:-burst}"
 NUM_ACTORS="${NUM_ACTORS:-300}"
-CONCURRENCY="${CONCURRENCY:-50}"
+CONCURRENCY="${CONCURRENCY:-300}"
 REQUESTS="${REQUESTS:-3000}"
 ENDPOINT="${ENDPOINT:-http://localhost:8000}"
 
@@ -20,7 +23,7 @@ TALLY="$(mktemp)"
 trap 'rm -f "${HOSTS_FILE}" "${TALLY}"' EXIT
 
 for i in $(seq -w 1 "${NUM_ACTORS}"); do
-  echo "b${i}.${ATESPACE}.actors.resources.substrate.ate.dev"
+  echo "b${i}"
 done > "${HOSTS_FILE}"
 
 echo "==> Firing ${REQUESTS} requests at ${ENDPOINT}"
@@ -28,14 +31,17 @@ echo "    across ${NUM_ACTORS} actors in atespace ${ATESPACE}"
 echo "    with concurrency ${CONCURRENCY}..."
 echo ""
 
-# Positional args ($1/$2/$3) sidestep the bash-array-across-bash-c scoping trap.
-# `sort -R` is available on both macOS and Linux.
+# Positional args ($1..$4) sidestep the bash-array-across-bash-c scoping trap.
+# `sort -R` is available on both macOS and Linux. Each iteration: hit the
+# actor, then suspend it so its worker frees up for a parked request.
 seq 1 "${REQUESTS}" | xargs -n1 -P"${CONCURRENCY}" -I{} bash -c '
-  h=$(sort -R "$1" | head -n1)
+  actor=$(sort -R "$1" | head -n1)
+  host="${actor}.$4.actors.resources.substrate.ate.dev"
   read code t < <(curl -s -o /dev/null -w "%{http_code} %{time_total}\n" \
-                  -H "Host: $h" "$2")
-  printf "%s %s %s\n" "$h" "$code" "$t" >> "$3"
-' _ "${HOSTS_FILE}" "${ENDPOINT}" "${TALLY}"
+                  -H "Host: $host" "$2")
+  printf "%s %s %s\n" "$host" "$code" "$t" >> "$3"
+  kubectl ate suspend actor "$actor" --atespace "$4" >/dev/null 2>&1 || true
+' _ "${HOSTS_FILE}" "${ENDPOINT}" "${TALLY}" "${ATESPACE}"
 
 echo "==> Status-code tally (expect near-100% 200 under parking):"
 awk '{print $2}' "${TALLY}" | sort | uniq -c | sort -rn

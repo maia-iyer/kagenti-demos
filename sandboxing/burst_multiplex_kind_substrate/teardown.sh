@@ -20,6 +20,9 @@ seq -w 1 "${NUM_ACTORS}" | xargs -n1 -P"${DELETE_PARALLELISM}" -I{} bash -c '
   kubectl ate delete actor "$name" -a "$2" >/dev/null 2>&1 || true
 ' _ {} "${ATESPACE}"
 
+echo "==> Deleting fast ActorTemplate ${POOL_NS}/counter-fast (if present)..."
+kubectl -n "${POOL_NS}" delete actortemplate counter-fast --ignore-not-found
+
 echo "==> Restoring HPA counter bounds to min=${HPA_MIN_RESTORE}, max=${HPA_MAX_RESTORE}..."
 kubectl -n "${POOL_NS}" patch hpa "${POOL}" --type=merge \
   -p "{\"spec\":{\"minReplicas\":${HPA_MIN_RESTORE},\"maxReplicas\":${HPA_MAX_RESTORE}}}" \
