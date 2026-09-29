@@ -80,6 +80,9 @@ case "${LOAD_MODE}" in
       read code t < <(curl -s -o /dev/null -w "%{http_code} %{time_total}\n" \
                       -H "Host: $host" "$2")
       printf "%s %s %s\n" "$host" "$code" "$t" >> "$3"
+      # Suspend before delete: delete without a prior suspend can leave the
+      # worker binding assigned, which stalls subsequent parked requests.
+      kubectl ate suspend actor "$name" --atespace "$4" >/dev/null 2>&1 || true
       kubectl ate delete actor "$name" -a "$4" >/dev/null 2>&1 || true
     ' _ "${TEMPLATE}" "${ENDPOINT}" "${TALLY}" "${ATESPACE}" {}
     ;;
