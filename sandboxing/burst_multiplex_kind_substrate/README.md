@@ -93,8 +93,8 @@ Then, in two separate terminals, start the port-forwards:
 # Terminal A — data plane (curl target for ./load.sh)
 kubectl port-forward -n ate-system svc/atenet-router 8000:80
 
-# Terminal B — control/metrics (parking gauge for ./watch.sh)
-kubectl port-forward -n ate-system svc/atenet-router 9091:9090
+# Terminal B — status port (parking gauge for ./watch.sh)
+kubectl port-forward -n ate-system svc/atenet-router 4041:4040
 ```
 
 ## Run
@@ -156,7 +156,7 @@ kubectl get --raw \
   | jq '.items[0].value'
 
 # parking.active > 0 during the burst, 0 at rest
-curl -s localhost:9091/statusz?format=json | jq .parking.active
+curl -s 'http://localhost:4041/statusz?format=json' | jq .parking.active
 
 # pool held at POOL_REPLICAS
 kubectl -n ate-demo-autoscaled-workerpool get workerpool counter

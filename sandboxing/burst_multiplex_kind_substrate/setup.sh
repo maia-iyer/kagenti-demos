@@ -37,9 +37,23 @@ kubectl -n "${POOL_NS}" patch hpa "${POOL}" --type=merge \
 echo "==> Scaling workerpool/${POOL} to ${POOL_REPLICAS} replicas..."
 kubectl -n "${POOL_NS}" scale workerpool/"${POOL}" --replicas="${POOL_REPLICAS}"
 
-echo "==> Waiting for workerpool pods to be Ready..."
-kubectl -n "${POOL_NS}" wait --for=condition=Ready pod \
-  -l ate.dev/worker-pool="${POOL}" --timeout=180s
+echo "==> Waiting for workerpool to settle at ${POOL_REPLICAS} ready replicas..."
+# Wait on the workerpool's own status rather than `kubectl wait pod ...` — the
+# latter races with scale-down: it snapshots the pod list at start and then
+# errors "pod not found" if any pod in that snapshot gets deleted mid-wait.
+for _ in $(seq 1 60); do
+  read -r ready total < <(kubectl -n "${POOL_NS}" get workerpool "${POOL}" \
+    -o jsonpath='{.status.readyReplicas} {.status.replicas}' 2>/dev/null || echo "0 0")
+  if [[ "${ready}" == "${POOL_REPLICAS}" && "${total}" == "${POOL_REPLICAS}" ]]; then
+    echo "    ${ready}/${POOL_REPLICAS} ready"
+    break
+  fi
+  sleep 2
+done
+if [[ "${ready:-0}" != "${POOL_REPLICAS}" ]]; then
+  echo "    workerpool did not settle at ${POOL_REPLICAS} within 120s (got ${ready}/${total})" >&2
+  exit 1
+fi
 
 echo "==> Creating atespace ${ATESPACE} (idempotent)..."
 if ! kubectl ate create atespace "${ATESPACE}" 2>&1 | tee /tmp/ate-create.log; then
