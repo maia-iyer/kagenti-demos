@@ -16,3 +16,4 @@ Two arrangements are in scope:
 | Directory | Arrangement | What it demonstrates |
 | --- | --- | --- |
 | [`local_claude_code_kind_substrate_sandbox/`](local_claude_code_kind_substrate_sandbox/) | Separate | Claude Code on the laptop with every shell command redirected into a per-session [Agent Substrate](https://github.com/agent-substrate/substrate) actor on a local kind cluster. Includes an eager mode (actor stays Running for the whole session) and a lazy mode (actor is resumed/suspended per command). |
+| [`burst_multiplex_kind_substrate/`](burst_multiplex_kind_substrate/) | Shared pool | 300 counter actors on a pool pinned to 3 workers, hit with a burst of concurrent HTTP requests. Exercises both actor multiplexing (substrate rotates actors through the few workers) and request parking (the atenet router queues inbound requests during the resume gap instead of returning 503s). Fully local — no API keys, no docker build, no cloud storage. |
