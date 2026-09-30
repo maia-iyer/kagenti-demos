@@ -181,22 +181,35 @@ What it does, for each of the four combinations:
    reflect parking cost rather than truncation by the 5s default.
 3. Starts port-forwards on `:8000` (data) and `:4041` (status), waits for
    them to accept connections.
-4. Runs `load.sh` under `time`, captures the status-code tally and latency
+4. Waits for the crank-rolled router to be actually ready via `/statusz`:
+   dataplane `LIVE`, k8s + ate API healthy, `parked-request-budget` reports
+   the crank value (proving the *new* pod is answering, not the draining
+   one), and the current `ActorTemplate` is registered — for
+   `READY_STABLE_POLLS` consecutive polls. For reuse runs it also runs a
+   short sequential data-path shakeout to catch xDS route bindings that are
+   still propagating after `/statusz` has gone green; a shakeout 5xx re-arms
+   the gate. Replaces the earlier fixed-count warmup, which under-warmed the
+   fast-template rollout and let fast-reuse leak ~4% 502s.
+5. Runs `load.sh` under `time`, captures the status-code tally and latency
    percentiles.
-5. `./teardown.sh` between runs, so the next template is applied cleanly.
+6. `./teardown.sh` between runs, so the next template is applied cleanly.
 
 At the end you get a table like:
 
 ```
 run              | wall       | p50      | p95      | p99      | max      | 200s/total
 ------------------------------------------------------------------------------------------
-fast-reuse       | 0m8.4s     | 0.09s    | 0.71s    | 1.20s    | 1.32s    | 300/300
-fast-create      | 1m12s      | 2.10s    | 6.80s    | 9.50s    | 11.4s    | 60/60
-durable-reuse    | 2m41s      | 1.05s    | 24.10s   | 58.20s   | 92.4s    | 300/300
-durable-create   | 3m30s      | 6.20s    | 44.80s   | 78.10s   | 108s     | 60/60
+fast-reuse       | ~0m45s     | ~19s     | ~43s     | ~52s     | ~53s     | 300/300
+fast-create      | ~3m00s     | ~39s     | ~148s    | ~163s    | ~164s    | 300/300
+durable-reuse    | ~1m00s     | ~21s     | ~43s     | ~52s     | ~53s     | 300/300
+durable-create   | ~3m00s     | ~36s     | ~135s    | ~149s    | ~150s    | 300/300
 ```
 
-(Numbers are illustrative — laptop-dependent.)
+Numbers are illustrative — laptop-dependent, from a recent
+`NUM_ACTORS=300 CONCURRENCY=300 BUDGET=5m` run. All four should report
+`300/300` 200 responses; if `fast-reuse` shows any 502s, the readiness gate
+timed out and the run started against a not-yet-settled router (check
+`compare-results-*/fast-reuse.ready.log`).
 
 ### Configuration
 
@@ -211,6 +224,10 @@ All defaults are safe for a laptop-scale run; override any env var:
 | `CREATE_REQUESTS`    | `300`          | Requests fired in create runs        |
 | `CREATE_CONCURRENCY` | `300`          | Concurrency for create runs          |
 | `BUDGET`             | `5m`           | `--parked-request-budget` via `crank.sh` |
+| `READY_TIMEOUT`      | `120`          | Seconds to wait for the crank-rolled router to be ready |
+| `READY_STABLE_POLLS` | `3`            | Consecutive good `/statusz` polls required |
+| `SHAKEOUT_REQUESTS`  | `5`            | Sequential data-path probes after readiness (reuse only; 0 disables) |
+| `SHAKEOUT_RETRIES`   | `2`            | Max readiness+shakeout retries per run |
 | `SKIP`               | *(empty)*      | Comma list, e.g. `SKIP=durable-create` |
 | `RESULTS_DIR`        | `./compare-results-<ts>` | Where per-run logs land      |
 
