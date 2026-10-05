@@ -4,8 +4,8 @@
       "Task"
     ],
     "allow": [
-      "Bash(curl -sS -X POST http://localhost:8080/runs*)",
-      "Bash(curl -sS http://localhost:8080/runs/status*)",
+      "Bash(curl -sS -H \"Host: serverless-harness.default.example.com\" -X POST http://localhost:8080/runs*)",
+      "Bash(curl -sS -H \"Host: serverless-harness.default.example.com\" http://localhost:8080/runs/status*)",
       "Bash(jq*)"
     ]
   }

@@ -119,26 +119,35 @@ reading that directory.
 
 ## Prerequisites
 
-- A kind (or any) cluster with
-  [MOCA](https://github.com/rossoctl/serverless-harness) deployed. Follow
-  MOCA's own `setup-kind.sh` or equivalent.
+- A kind cluster with [MOCA](https://github.com/rossoctl/moca) deployed via
+  its [quick-start](https://github.com/rossoctl/moca#quick-start). That
+  flow installs the harness in the `default` namespace behind Kourier and
+  brings up `sandbox-0`.
+- The KEDA ScaledJob for leaf workers applied once from the MOCA repo:
+
+  ```bash
+  kubectl apply -f deploy/knative/leaf-scaledjob.yaml
+  ```
+
+  Without it, `POST /runs` is accepted but no worker pod ever starts and
+  `GET /runs/status` hangs forever. The ScaledJob does not survive a
+  `kind delete`, so re-apply on a fresh cluster.
 - `kubectl` configured for that cluster.
 - `curl` and `jq` on your `PATH`.
 - Claude Code CLI.
 
-Context Service / `contextctl` is **not** required — `setup.sh` provisions
-the workspace PVC directly via `kubectl` through `lib/ctx.sh`. See the
-note on the shim under "How it works" above.
-
-MOCA's HTTP service must be reachable from your laptop. In another
-terminal:
+MOCA is reached through Kourier. In another terminal, port-forward the
+Kourier gateway and export the Host / Base env vars:
 
 ```bash
-kubectl -n moca-system port-forward svc/<harness-svc> 8080:<port>
+kubectl port-forward -n kourier-system svc/kourier 8080:80
+
+export HOST="serverless-harness.default.example.com"
+export BASE="http://localhost:8080"
 ```
 
-The service name and port depend on your MOCA install — check
-`kubectl -n moca-system get svc`.
+Every call to MOCA must send `-H "Host: $HOST"` — Kourier routes by Host.
+`setup.sh` and the dispatch skill both do this automatically.
 
 ## Setup
 
