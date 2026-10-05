@@ -1,0 +1,13 @@
+{
+  "name": "moca-chained-subagents-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture repo for the moca_chained_subagents demo. Intentionally broken: src/index.js calls a renamed API on the vendored lib.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/index.test.js"
+  },
+  "dependencies": {
+    "lib": "file:node_modules/lib"
+  }
+}

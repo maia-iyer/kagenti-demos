@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "deny": [
+      "Task"
+    ],
+    "allow": [
+      "Bash(curl -sS -X POST http://localhost:8080/runs*)",
+      "Bash(jq*)"
+    ]
+  }
+}
