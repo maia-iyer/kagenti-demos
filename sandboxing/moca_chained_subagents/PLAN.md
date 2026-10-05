@@ -63,17 +63,27 @@ indefinitely — no dependency on upstream API history.
 
 The fix B applies is a one-line rename in `src/index.js`. Tests pass.
 
-### Skill as the whole interaction contract
+### Skill is mechanism, not flow
 
 A single `SKILL.md` tells Claude:
 
 - `Task` is denied; the only subagent path is this skill.
-- Workloads are already provisioned by setup; do not call `/workloads`
-  or `contextctl`.
-- Dispatch is one `curl` per leaf; response body is the result.
-- Chain is strictly A → B, no parallelism, no fan-out.
-- Prompt templates for A and B are given verbatim so the model doesn't
-  improvise the isolation posture.
+- Workloads are already provisioned by setup; do not call `/workloads`.
+- How to shape one `/runs` call: envelope, `sessionId` convention,
+  `workload` selection, `.text` extraction.
+- Which workloads exist in this scratch dir and their mount posture.
+- Prompt-authoring guidance for leaves (state the mount posture, pass
+  forward context from earlier leaves, describe the deliverable).
+- How to sequence leaves if the operator asks for a chain.
+
+The skill does **not** prescribe how many leaves to run, in what
+order, or with what prompts. That orchestration lives in the
+operator's requests and the parent's judgment. The two-prompt
+"diagnose, then fix" flow this demo illustrates is operator-driven;
+`moca-dispatch` would work the same way for a one-leaf review, a
+three-leaf fan-out, or anything else the operator asks for. The
+README's "Run a session" section carries example operator prompts as
+illustration, not as part of the skill contract.
 
 ### Settings deny `Task`, allow only the `/runs` curl
 

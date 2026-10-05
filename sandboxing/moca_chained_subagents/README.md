@@ -1,19 +1,27 @@
 # Local Claude Code driving chained MOCA subagents
 
 Claude Code runs on your laptop. It has **no built-in subagent tool** —
-`Task` is denied in `.claude/settings.json`. To delegate, it uses a skill
-that dispatches two sequential leaves on
-[MOCA](https://github.com/rossoctl/serverless-harness) over HTTP:
+`Task` is denied in `.claude/settings.json`. To delegate, it uses a
+skill that knows how to dispatch an isolated leaf to
+[MOCA](https://github.com/rossoctl/serverless-harness) over HTTP.
 
-1. **Researcher (A)** — reads a fixture repo and vendored docs,
-   diagnoses a deprecated-API bug, returns its finding as text.
-2. **Fixer (B)** — takes A's finding, edits the fixture, runs the tests,
-   returns the diff and test outcome.
+The orchestration shape is the **operator's**, not the skill's. For
+this demo the operator issues two prompts in sequence:
 
-The parent Claude session orchestrates the chain: it awaits A's sync
-response, embeds A's text in B's prompt, and dispatches B. MOCA does
-not know about the chain; from its perspective each leaf is an
-independent `/runs` call that scales to zero when it's done.
+1. First prompt: *"Diagnose the failing test in `example_repo`."* The
+   parent dispatches a leaf against the read-only workload; the leaf
+   reads the fixture and reports a diagnosis. The parent surfaces that
+   diagnosis to the operator and stops.
+2. Second prompt: *"Apply that fix."* The parent dispatches a second
+   leaf against the read-write workload with the diagnosis from step
+   1 embedded in its prompt; the leaf edits the fixture, runs the
+   tests, and reports the diff and outcome.
+
+MOCA does not know about the chain; from its perspective each leaf is
+an independent `/runs` call that scales to zero when it's done. The
+skill does not know about the chain either — it describes how to
+dispatch one leaf, and the model composes multi-leaf flows from the
+operator's requests.
 
 For the full design, see [PLAN.md](PLAN.md).
 
@@ -21,9 +29,11 @@ For the full design, see [PLAN.md](PLAN.md).
 
 Three pieces cooperate:
 
-1. **A skill (`moca-dispatch`)** — the whole interaction contract.
-   Tells Claude how to shape the `/runs` HTTP call, which workload to
-   target per leaf, and the verbatim prompt templates for A and B.
+1. **A skill (`moca-dispatch`)** — the mechanism contract. Tells
+   Claude how to shape the `/runs` HTTP call, which workloads exist in
+   this scratch dir and their mount posture, and how to extract
+   `.text` from the response. Does **not** prescribe how many leaves
+   to run or in what order — that comes from the operator's prompts.
 2. **A denied `Task` tool** — `.claude/settings.json` denies the
    built-in subagent tool, so the model has to route through the skill
    instead of forking in-process. The permission prompt on each `curl`
@@ -56,22 +66,22 @@ answer. No polling, no `kubectl exec`, no PVC read-back.
   verify this directly: while an A leaf is live,
   `kubectl exec` in and `touch /workspace/x` → `Read-only file system`.
 
-- **A's "no exec / no network" is prompt-only.** MOCA today gives every
-  leaf the same seven tools (`read, write, edit, ls, find, bash, grep`)
-  and has no web-fetch tool at all. There is no per-leaf `tools`
-  allowlist on `LeafEnvelope`. A's prompt says "do not run shell
-  commands"; a non-compliant A could. Honest substrate-enforced
-  capability splits would need an upstream `tools` field, which is
-  out of scope for this demo.
+- **The researcher's "no exec / no network" is prompt-only.** MOCA
+  today gives every leaf the same seven tools (`read, write, edit,
+  ls, find, bash, grep`) and has no web-fetch tool at all. There is
+  no per-leaf `tools` allowlist on `LeafEnvelope`. The operator's
+  diagnosis prompt says "do not run shell commands"; a non-compliant
+  leaf could. Honest substrate-enforced capability splits would need
+  an upstream `tools` field, which is out of scope for this demo.
 
-- **B needs a writable workspace.** `workload-b` mounts the same PVC
-  read-write so B can apply the fix and run the tests. Both leaves see
-  the same `example_repo/` tree.
+- **The fixer needs a writable workspace.** `workload-b` mounts the
+  same PVC read-write so a fixer leaf can apply the fix and run the
+  tests. Both workloads see the same `example_repo/` tree.
 
 - **Chaining is parent-side.** MOCA has no "on complete, trigger X"
-  primitive; the parent Claude session does the sequencing. This matches
-  what we want: the chain is a property of the operator's request, not
-  of the serverless harness.
+  primitive; the parent Claude session does the sequencing between
+  the operator's two prompts. The skill does not encode the chain
+  either — the operator's two prompts and the parent's judgment do.
 
 ## Prerequisites
 
@@ -134,26 +144,42 @@ Environment overrides (set before running):
 cd ~/tmp/moca-chained-scratch && claude
 ```
 
-Paste a starter prompt like:
+The demo flow is **two operator prompts, in sequence**. The skill does
+not know about the two steps; the operator drives them.
 
-> The Node.js fixture in `example_repo` (published to MOCA as
-> `workload-a` / `workload-b`) has a failing test suite. Use the
-> `moca-dispatch` skill to run a researcher leaf followed by a fixer
-> leaf and report the diff and test outcome.
+**Prompt 1 — diagnose.** Paste something like:
+
+> There's a Node.js project in `example_repo` on MOCA. Dispatch a
+> subagent against the read-only workload to diagnose why its tests
+> are failing. Report the subagent's diagnosis back to me — don't fix
+> anything yet.
 
 Claude should:
 
 1. Read the `moca-dispatch` skill.
-2. **Not** invoke `Task` — if it tries, the deny fires and it re-routes
-   through the skill.
-3. Issue one `curl` to `/runs` targeting `workload-a` with the
-   researcher prompt. The permission prompt literally shows the curl
-   command — this is your visual proof that the leaf is being
-   dispatched to MOCA, not run in-process.
-4. Receive A's diagnosis as `.text` on the response body.
-5. Issue a second `curl` to `/runs` targeting `workload-b` with A's
-   finding embedded in B's prompt.
-6. Receive B's diff and test outcome, and report both to you.
+2. **Not** invoke `Task` — if it tries, the deny fires and it
+   re-routes through the skill.
+3. Issue one `curl` to `/runs` targeting `workload-a` with a diagnosis
+   prompt the model composes from your request. The permission prompt
+   literally shows the curl command — this is your visual proof the
+   leaf is being dispatched to MOCA, not run in-process.
+4. Receive the leaf's diagnosis as `.text` on the response body and
+   report it to you.
+
+**Prompt 2 — fix.** After reviewing the diagnosis, paste something
+like:
+
+> Good. Now dispatch another subagent against the read-write workload
+> to apply that fix, run the tests, and report the diff and outcome.
+
+Claude should dispatch a second `curl` to `/runs` targeting
+`workload-b`, embedding the diagnosis from the previous turn in the
+new leaf's prompt, and report the diff and test outcome.
+
+If you'd rather issue a single-prompt variant ("diagnose and fix"),
+that also works — Claude will dispatch two leaves in sequence within
+one turn. The two-prompt split is what shows the chain visibly to the
+operator, which is the point of the demo.
 
 While the leaves run, in another terminal:
 
@@ -166,7 +192,8 @@ to zero. That's the MOCA-value visual.
 
 ## Verify substrate-enforced isolation
 
-While an A leaf is still live (or spin one up with a trivial prompt):
+While a `workload-a` leaf is still live (or spin one up with a trivial
+prompt):
 
 ```bash
 POD=$(kubectl -n moca-system get pods -l workload=workload-a \
@@ -184,10 +211,9 @@ the mount, not the prompt.
 ./teardown.sh
 ```
 
-This deletes `workload-a`, `workload-b`, the Context Service contexts,
-and the scratch directory. It does **not** touch MOCA, Context Service,
-or your cluster. If a `kubectl port-forward` is still running, `Ctrl-C`
-it.
+This deletes `workload-a`, `workload-b`, the workspace PVC, and the
+scratch directory. It does **not** touch MOCA or your cluster. If a
+`kubectl port-forward` is still running, `Ctrl-C` it.
 
 ## Troubleshooting
 
@@ -203,10 +229,12 @@ it.
   isn't in the MOCA namespace (sync didn't complete, or MOCA watches
   a different namespace). Verify `kubectl -n moca-system get pvc`
   and re-run `./setup.sh`.
-- **B reports "Read-only file system" when writing.** `workload-b` was
-  somehow created with `readOnly: true`. Run `./teardown.sh` and
-  `./setup.sh` to recreate it.
-- **A's response reads a stale version of the fixture.** The PVC
+- **A fixer leaf reports "Read-only file system" when writing.**
+  Either `workload-b` was somehow created with `readOnly: true`, or
+  the model dispatched the fixer leaf to `workload-a` by mistake.
+  Check which workload was in the curl permission prompt. If the
+  workload spec is wrong, run `./teardown.sh && ./setup.sh`.
+- **A diagnosis leaf reads a stale version of the fixture.** The PVC
   wasn't re-synced after you edited `example_repo/`. Run
   `./teardown.sh && ./setup.sh` — the shim wipes the PVC contents on
   each `ctx_sync_push`, so re-running setup re-publishes.
