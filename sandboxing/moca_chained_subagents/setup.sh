@@ -94,6 +94,7 @@ create_workload "${WORKLOAD_B}" false
 echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
 
 mkdir -p "${SCRATCH_DIR}/.claude/skills"
+mkdir -p "${SCRATCH_DIR}/.moca-runs"
 cp "${SCRIPT_DIR}/settings.json.example" \
    "${SCRATCH_DIR}/.claude/settings.json"
 cp -r "${SCRIPT_DIR}/skill" \
@@ -109,8 +110,13 @@ cat > "${SCRATCH_DIR}/WORKLOADS.md" <<EOF
 
 MOCA base URL: ${MOCA_URL}
 
-Session-id scheme in /runs calls: "<demo-run-id>/A" and "<demo-run-id>/B".
-Pick <demo-run-id> fresh per operator request.
+Dispatch is async: POST /runs starts a leaf and returns a handle;
+GET /runs/status?sessionId=<id> returns the result when done. Run
+records live in .moca-runs/ — see the moca-dispatch skill.
+
+Session-id scheme: "<run-id>/<leaf-label>" (e.g. "x7f2/a", "x7f2/b").
+Pick <run-id> fresh per operator request; <leaf-label> is a short
+operator-meaningful identifier within the run.
 EOF
 
 echo ""
@@ -124,18 +130,24 @@ echo "  2. Start Claude from the scratch dir:"
 echo ""
 echo "       cd ${SCRATCH_DIR} && claude"
 echo ""
-echo "  3. The demo flow is two operator prompts. First:"
+echo "  3. The demo flow is operator prompts; dispatch is async."
+echo "     Suggested first prompt:"
 echo ""
 echo "       There's a Node.js project in example_repo on MOCA."
 echo "       Dispatch a subagent against the read-only workload to"
-echo "       diagnose why its tests are failing. Report the diagnosis"
-echo "       back to me — don't fix anything yet."
+echo "       diagnose why its tests are failing."
+echo ""
+echo "     Claude will start the leaf and return control immediately."
+echo "     You can Ctrl-C and come back later. When you're ready to"
+echo "     collect the diagnosis, say:"
+echo ""
+echo "       Check on that subagent and report the diagnosis."
 echo ""
 echo "     Then, after reviewing the diagnosis:"
 echo ""
-echo "       Good. Now dispatch another subagent against the read-write"
+echo "       Good. Dispatch another subagent against the read-write"
 echo "       workload to apply that fix, run the tests, and report the"
-echo "       diff and outcome."
+echo "       diff and outcome. Check on it when it's done."
 echo ""
 echo "  4. Watch leaf pods cold-start in the MOCA namespace:"
 echo ""

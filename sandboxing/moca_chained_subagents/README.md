@@ -5,23 +5,31 @@ Claude Code runs on your laptop. It has **no built-in subagent tool** —
 skill that knows how to dispatch an isolated leaf to
 [MOCA](https://github.com/rossoctl/serverless-harness) over HTTP.
 
-The orchestration shape is the **operator's**, not the skill's. For
-this demo the operator issues two prompts in sequence:
+Dispatch is **asynchronous**. The parent `POST`s to `/runs` and MOCA
+returns a run handle immediately; the leaf keeps running on the
+cluster. Collection is a separate `GET /runs/status` call on a later
+turn. In between, **you can quit Claude Code and come back later** —
+the leaf doesn't care, the result is held cluster-side, and a resumed
+Claude session picks up pending runs from `.moca-runs/` in the scratch
+dir.
 
-1. First prompt: *"Diagnose the failing test in `example_repo`."* The
-   parent dispatches a leaf against the read-only workload; the leaf
-   reads the fixture and reports a diagnosis. The parent surfaces that
-   diagnosis to the operator and stops.
-2. Second prompt: *"Apply that fix."* The parent dispatches a second
-   leaf against the read-write workload with the diagnosis from step
-   1 embedded in its prompt; the leaf edits the fixture, runs the
-   tests, and reports the diff and outcome.
+The orchestration shape is the **operator's**, not the skill's. For
+this demo the operator issues prompts in sequence:
+
+1. *"Dispatch a subagent to diagnose the failing test."* The parent
+   starts a leaf against the read-only workload and returns the run
+   handle. Operator can walk away.
+2. Later: *"Check on that subagent and report the diagnosis."* The
+   parent polls `/runs/status`, writes the result, surfaces the
+   diagnosis.
+3. *"Dispatch a fixer against the read-write workload with that
+   diagnosis."* Repeat the pattern.
 
 MOCA does not know about the chain; from its perspective each leaf is
 an independent `/runs` call that scales to zero when it's done. The
 skill does not know about the chain either — it describes how to
-dispatch one leaf, and the model composes multi-leaf flows from the
-operator's requests.
+start and collect one leaf, and the model composes multi-leaf flows
+from the operator's requests.
 
 For the full design, see [PLAN.md](PLAN.md).
 
@@ -30,10 +38,12 @@ For the full design, see [PLAN.md](PLAN.md).
 Three pieces cooperate:
 
 1. **A skill (`moca-dispatch`)** — the mechanism contract. Tells
-   Claude how to shape the `/runs` HTTP call, which workloads exist in
-   this scratch dir and their mount posture, and how to extract
-   `.text` from the response. Does **not** prescribe how many leaves
-   to run or in what order — that comes from the operator's prompts.
+   Claude how to shape the `POST /runs` and `GET /runs/status` calls,
+   which workloads exist in this scratch dir and their mount posture,
+   how to write and read run records in `.moca-runs/`, and how to
+   extract `.text` from a completed result. Does **not** prescribe
+   how many leaves to run or in what order — that comes from the
+   operator's prompts.
 2. **A denied `Task` tool** — `.claude/settings.json` denies the
    built-in subagent tool, so the model has to route through the skill
    instead of forking in-process. The permission prompt on each `curl`
@@ -55,8 +65,32 @@ Three pieces cooperate:
    in `lib/ctx.sh` for `contextctl` invocations — the call sites in
    `setup.sh` / `teardown.sh` do not change.
 
-Each `/runs` call is synchronous — the response body contains the leaf's
-answer. No polling, no `kubectl exec`, no PVC read-back.
+`POST /runs` returns a run handle immediately; the leaf's answer is
+collected via `GET /runs/status?sessionId=…` on a later turn. Run
+records live in `.moca-runs/` in the scratch dir — one JSON file per
+dispatched leaf. A resumed Claude session finds in-flight work by
+reading that directory.
+
+## How state flows
+
+- **Setup time.** `setup.sh` provisions a PVC in the MOCA namespace,
+  copies `example_repo/` into it via a short-lived loader pod, then
+  `POST`s to `/workloads` to register `workload-a` (read-only) and
+  `workload-b` (read-write) against that PVC. The fixture is
+  cluster-side before Claude ever starts.
+- **Dispatch.** The only state going from the laptop to MOCA at
+  dispatch time is the prompt text (plus the sessionId and workload
+  name). The parent embeds any output from prior leaves into the next
+  leaf's prompt as plain text; there is no shared memory between
+  leaves.
+- **Execution.** MOCA cold-starts a leaf pod in the chosen workload.
+  The pod mounts the PVC at `/workspace` with the workload's
+  `readOnly` setting. Any files the leaf writes land on the PVC (if
+  the mount allows) and stay there.
+- **Return.** The leaf's answer comes back as the `.text` field of
+  the `/runs/status` response. Files on the PVC do **not** come back
+  to the laptop. If the operator wants to see a diff or a test log,
+  the leaf's prompt must ask for it as text in the response.
 
 ## What's honest and what isn't
 
@@ -144,44 +178,53 @@ Environment overrides (set before running):
 cd ~/tmp/moca-chained-scratch && claude
 ```
 
-The demo flow is **two operator prompts, in sequence**. The skill does
-not know about the two steps; the operator drives them.
+The demo flow is **operator prompts, in sequence**. The skill does
+not encode the flow; you drive it.
 
-**Prompt 1 — diagnose.** Paste something like:
+**Prompt 1 — start the diagnosis.** Paste something like:
 
 > There's a Node.js project in `example_repo` on MOCA. Dispatch a
 > subagent against the read-only workload to diagnose why its tests
-> are failing. Report the subagent's diagnosis back to me — don't fix
-> anything yet.
+> are failing.
 
 Claude should:
 
 1. Read the `moca-dispatch` skill.
 2. **Not** invoke `Task` — if it tries, the deny fires and it
    re-routes through the skill.
-3. Issue one `curl` to `/runs` targeting `workload-a` with a diagnosis
-   prompt the model composes from your request. The permission prompt
-   literally shows the curl command — this is your visual proof the
-   leaf is being dispatched to MOCA, not run in-process.
-4. Receive the leaf's diagnosis as `.text` on the response body and
-   report it to you.
+3. Issue one `curl` to `POST /runs` targeting `workload-a` with a
+   diagnosis prompt the model composes from your request. The
+   permission prompt literally shows the curl command — this is your
+   visual proof the leaf is being dispatched to MOCA, not run
+   in-process.
+4. Write a record file at `.moca-runs/<run-id>-<leaf-label>.json` and
+   return control to you with the sessionId. The leaf is now running
+   on the cluster; this turn is over.
 
-**Prompt 2 — fix.** After reviewing the diagnosis, paste something
-like:
+**Prompt 2 — collect the diagnosis.** When you're ready (seconds to
+minutes later, same session or a resumed one):
 
-> Good. Now dispatch another subagent against the read-write workload
-> to apply that fix, run the tests, and report the diff and outcome.
+> Check on that subagent and report the diagnosis.
 
-Claude should dispatch a second `curl` to `/runs` targeting
-`workload-b`, embedding the diagnosis from the previous turn in the
-new leaf's prompt, and report the diff and test outcome.
+Claude polls `GET /runs/status?sessionId=…`, writes the completed
+result alongside the record, and surfaces `.text` to you.
 
-If you'd rather issue a single-prompt variant ("diagnose and fix"),
-that also works — Claude will dispatch two leaves in sequence within
-one turn. The two-prompt split is what shows the chain visibly to the
-operator, which is the point of the demo.
+**Prompt 3 — start the fix.** After reviewing the diagnosis:
 
-While the leaves run, in another terminal:
+> Good. Dispatch another subagent against the read-write workload to
+> apply that fix, run the tests, and report the diff and outcome.
+
+Claude dispatches a second leaf against `workload-b`, embedding the
+diagnosis from Prompt 2 in the new leaf's prompt. Record is written.
+Control returns to you.
+
+**Prompt 4 — collect the fix result.**
+
+> Check on it.
+
+Claude polls, surfaces the diff and test outcome.
+
+While leaves run, in another terminal:
 
 ```bash
 kubectl -n moca-system get pods -w
@@ -189,6 +232,40 @@ kubectl -n moca-system get pods -w
 
 You should see leaf pods from both workloads cold-start, run, and drop
 to zero. That's the MOCA-value visual.
+
+## Pause and resume
+
+Because dispatch is async, you can quit Claude any time after a
+dispatch has written its record file in `.moca-runs/`. The leaf keeps
+running on the cluster.
+
+To resume: just start Claude again from the scratch dir
+(`cd ~/tmp/moca-chained-scratch && claude`). On the next turn, ask
+Claude to check for pending runs:
+
+> Any subagents still pending from an earlier session?
+
+Claude reads `.moca-runs/`, finds records with `status: "pending"`,
+and polls `/runs/status` for each. Completed results get written
+alongside; still-pending ones stay pending.
+
+The scratch dir **is** the resumable state. Everything needed to pick
+up a dropped session — settings, skill, pending run records,
+completed results — is in it. Nothing lives in `$HOME` or in the
+Claude Code session identifier.
+
+**Caveats.**
+
+- MOCA has its own idea of how long to retain a completed run before
+  the result goes away. If you quit for long enough that the leaf's
+  result ages out of MOCA, a later poll will come back 404 and the
+  skill will mark the record `failed`. The exact TTL depends on your
+  MOCA install.
+- Async is only available on **unauthenticated** MOCA deployments. If
+  your install has auth on, `POST /runs` will return 401/403 and the
+  skill will stop and tell you. There is no graceful fallback to sync
+  in this demo — if your deployment is sync-only, dispatching
+  effectively blocks the turn and Ctrl-C discards the result.
 
 ## Verify substrate-enforced isolation
 
@@ -219,8 +296,19 @@ scratch directory. It does **not** touch MOCA or your cluster. If a
 
 - **`curl: (7)` / connection refused.** The MOCA port-forward is not
   running. Start it in another terminal.
+- **`401` / `403` from `POST /runs`.** Your MOCA deployment has auth
+  enabled; async dispatch is not available. See the "async only on
+  unauthenticated deployments" caveat under Pause and resume.
 - **`503 Retry-After` from `/runs`.** MOCA's sandbox pool is saturated.
   Wait or scale.
+- **`GET /runs/status` returns 404 for a pending record.** The leaf's
+  result aged out of MOCA (or MOCA was restarted). The skill marks
+  the record `failed`. Re-dispatch if you still want the work done.
+- **`.moca-runs/` has records that never seem to complete.** Check
+  `kubectl -n moca-system get pods` — if there's no leaf pod for the
+  sessionId, MOCA may have never scheduled it, or it crashed before
+  reporting. Delete the stale record file after confirming no leaf
+  is running.
 - **Claude tries `Task` and gets denied, then stops.** The skill
   wasn't found. Confirm
   `~/tmp/moca-chained-scratch/.claude/skills/moca-dispatch/SKILL.md`
@@ -252,9 +340,20 @@ local cluster.
 PLAN.md                    Design doc (trimmed)
 README.md                  This file
 skill/SKILL.md             Skill Claude reads to dispatch leaves to MOCA
-settings.json.example      Permission policy: denies Task, allows the /runs curl
-setup.sh                   Publishes fixture, creates workloads, stages scratch
-teardown.sh                Deletes workloads, contexts, scratch
+settings.json.example      Permission policy: denies Task, allows POST /runs and GET /runs/status
+setup.sh                   Publishes fixture, creates workloads, stages scratch (incl. .moca-runs/)
+teardown.sh                Deletes workloads, PVC, scratch
 lib/ctx.sh                 kubectl-only shim that mirrors contextctl verbs
 example_repo/              Vendored fixture — Node.js project with a renamed-API bug
+```
+
+In the scratch dir after `setup.sh`:
+
+```
+~/tmp/moca-chained-scratch/
+├── .claude/
+│   ├── settings.json              Copied from settings.json.example
+│   └── skills/moca-dispatch/      Copied from skill/
+├── .moca-runs/                    Run records; one JSON per dispatched leaf
+└── WORKLOADS.md                   Names and mount posture of provisioned workloads
 ```

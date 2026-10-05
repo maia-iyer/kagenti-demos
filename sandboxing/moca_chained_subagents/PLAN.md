@@ -19,13 +19,31 @@ exercises subagents on serverless.
 ### Parent orchestrates the chain, not MOCA
 
 MOCA has no "on complete, trigger X" primitive. The parent Claude
-session is the orchestrator: it dispatches A, awaits A's sync response,
-embeds A's `.text` in B's prompt, dispatches B, reports B's `.text`. One
-`curl` per leaf, no polling, no PVC read-back from the laptop.
+session is the orchestrator: it starts leaves, polls their status
+later, embeds completed outputs into subsequent leaves' prompts, and
+surfaces final results to the operator.
 
-Sync dispatch (`POST /runs`) is sufficient for a two-step chain. Async
-exists in MOCA but requires polling and is only available on
-unauthenticated deployments — no benefit here.
+### Async dispatch, not sync
+
+Dispatch uses `POST /runs` + `GET /runs/status?sessionId=…` rather
+than a blocking sync `/runs` call. Reasons:
+
+- The operator can quit Claude between dispatch and collection. The
+  leaf runs to completion on the cluster regardless, and a resumed
+  Claude session reconstructs state from disk.
+- Long-running leaves don't tie up the Claude session.
+- The handle-and-poll shape is honest about what's happening: work
+  lives cluster-side, not inside the HTTP connection.
+
+Trade-off: async is only available on unauthenticated MOCA
+deployments. If the install has auth on, the skill surfaces 401/403
+and stops rather than papering over it with a sync fallback.
+
+Run state is held in `.moca-runs/<run-id>-<leaf-label>.json` inside
+the scratch dir. One record per dispatched leaf; completed results
+land in a sibling `.result.json` file. The scratch dir **is** the
+resumable state — no `$HOME` lookups, no Claude Code session-id
+tricks.
 
 ### Fixture lives in-repo, mounted via a PVC
 
@@ -69,30 +87,35 @@ A single `SKILL.md` tells Claude:
 
 - `Task` is denied; the only subagent path is this skill.
 - Workloads are already provisioned by setup; do not call `/workloads`.
-- How to shape one `/runs` call: envelope, `sessionId` convention,
-  `workload` selection, `.text` extraction.
+- Three procedures: **start a leaf** (`POST /runs` + write record),
+  **check a leaf** (`GET /runs/status` + write result + update
+  record), **list pending runs** (read `.moca-runs/`).
 - Which workloads exist in this scratch dir and their mount posture.
 - Prompt-authoring guidance for leaves (state the mount posture, pass
-  forward context from earlier leaves, describe the deliverable).
+  forward context from earlier leaves verbatim, describe the
+  deliverable).
 - How to sequence leaves if the operator asks for a chain.
 
 The skill does **not** prescribe how many leaves to run, in what
 order, or with what prompts. That orchestration lives in the
-operator's requests and the parent's judgment. The two-prompt
+operator's requests and the parent's judgment. The multi-prompt
 "diagnose, then fix" flow this demo illustrates is operator-driven;
 `moca-dispatch` would work the same way for a one-leaf review, a
 three-leaf fan-out, or anything else the operator asks for. The
 README's "Run a session" section carries example operator prompts as
 illustration, not as part of the skill contract.
 
-### Settings deny `Task`, allow only the `/runs` curl
+### Settings deny `Task`, allow only `/runs` curls
 
 `settings.json.example`:
 
 - `permissions.deny`: `Task` — forces the skill path.
-- `permissions.allow`: a prefix-matched `curl` to `/runs` on
-  `localhost:8080`, plus `jq` for parsing. Scoped as tightly as the
-  Claude Code allow-rule schema supports.
+- `permissions.allow`: prefix-matched `curl` to `POST /runs` and
+  `GET /runs/status` on `localhost:8080`, plus `jq` for parsing.
+  Scoped as tightly as the Claude Code allow-rule schema supports.
+
+Local file ops on `.moca-runs/` go through Claude's Read/Write/Edit
+tools and don't need extra permissions.
 
 No hooks. No custom binary. The whole substrate on the operator side
 is: skill + settings + a running port-forward.
@@ -112,22 +135,30 @@ is: skill + settings + a running port-forward.
 
 ## Verification arc (what the README walks through)
 
-1. MOCA + Context Service up on kind; port-forward live.
-2. `./setup.sh` publishes the fixture, creates workloads A and B,
-   stages scratch.
-3. Operator runs Claude from scratch, pastes the starter prompt.
+1. MOCA up on kind; port-forward live.
+2. `./setup.sh` provisions the PVC, pushes `example_repo/`, creates
+   workloads A and B, stages scratch (including `.moca-runs/`).
+3. Operator runs Claude from scratch, pastes the "dispatch a
+   diagnosis subagent" prompt.
 4. Claude reads the skill, does **not** invoke `Task` (deny fires if
    it tries).
-5. Permission prompt shows the full `curl` to `/runs` targeting
+5. Permission prompt shows the full `POST /runs` curl targeting
    `workload-a` — visual proof the leaf is being dispatched to MOCA.
-6. A's `.text` returns inline.
-7. Second `curl` for B targeting `workload-b` with A's finding
-   embedded.
-8. B's `.text` returns with diff and passing tests.
-9. Operator sees cold-start-and-drop-to-zero leaf pods in
-   `kubectl get pods -n moca-system`.
-10. Side check: `kubectl exec` into an A leaf, `touch /workspace/x`
-    → read-only filesystem error.
+6. Claude writes a record to `.moca-runs/` and returns control. The
+   leaf is now running on the cluster.
+7. **Operator Ctrl-C's Claude** (optional but worth demonstrating).
+   `kubectl get pods -n moca-system` shows the leaf still running.
+8. Operator restarts Claude from the scratch dir, says "check on
+   that subagent". Claude polls `/runs/status`, writes the result,
+   surfaces the diagnosis.
+9. Operator pastes "dispatch a fixer against the read-write workload"
+   prompt. Second leaf starts.
+10. Operator asks for the result; Claude polls and surfaces the diff
+    and test outcome.
+11. Operator sees cold-start-and-drop-to-zero leaf pods in
+    `kubectl get pods -n moca-system`.
+12. Side check: `kubectl exec` into a workload-a leaf while it's
+    live, `touch /workspace/x` → read-only filesystem error.
 
 ## Out of scope
 
@@ -135,5 +166,7 @@ is: skill + settings + a running port-forward.
   README.
 - Per-leaf tool allowlists on `LeafEnvelope` — upstream MOCA change.
 - Web-fetch tool for the researcher — upstream MOCA change.
-- Async dispatch or `/runs/status` polling — sync is sufficient here.
 - Fan-out beyond A → B — single-chain is the whole demo.
+- Graceful fallback from async to sync when MOCA has auth enabled —
+  the skill surfaces 401/403 and stops. Supporting both modes would
+  roughly double the skill and bury the main thread.
