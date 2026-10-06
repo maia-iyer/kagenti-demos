@@ -19,13 +19,12 @@ The orchestration shape is the **operator's**, not the skill's. For
 this demo the operator issues prompts in sequence:
 
 1. *"Dispatch a subagent to diagnose the failing test."* The parent
-   starts a leaf against the read-only workload and returns the run
-   handle. Operator can walk away.
+   starts a leaf, writes a run record, and returns the handle.
+   Operator can walk away.
 2. Later: *"Check on that subagent and report the diagnosis."* The
    parent polls `/runs/status`, writes the result, surfaces the
    diagnosis.
-3. *"Dispatch a fixer against the read-write workload with that
-   diagnosis."* Repeat the pattern.
+3. *"Dispatch a fixer with that diagnosis."* Repeat the pattern.
 
 MOCA does not know about the chain; from its perspective each leaf is
 an independent `/runs` call that scales to zero when it's done. The
@@ -57,21 +56,12 @@ Three pieces cooperate:
    instead of forking in-process. The permission prompt on each
    `moca start …` is the operator's visual confirmation that the leaf
    is being dispatched to MOCA, not run locally.
-4. **Pre-provisioned MOCA workloads** — `setup.sh` creates a PVC in
-   the MOCA namespace, copies `example_repo/` into it via a
-   short-lived loader pod, then creates two MOCA workloads bound to
-   that PVC: `workload-a` (read-only) for the researcher, `workload-b`
-   (read-write) for the fixer. The skill only dispatches runs; it
-   never touches the PVC or `/workloads` at runtime.
-
-   The workspace-publishing step is factored through
-   [`lib/ctx.sh`](lib/ctx.sh) — a thin `kubectl`-only shim whose
-   functions mirror the subset of `contextctl` verbs this demo would
-   otherwise use (`ctx create`, `ctx artifact publish`,
-   `ctx sync push`, `ctx get`, `ctx delete`). If you later get
-   `contextctl` working in your environment, swap the function bodies
-   in `lib/ctx.sh` for `contextctl` invocations — the call sites in
-   `setup.sh` / `teardown.sh` do not change.
+4. **A seeded sandbox pool** — `setup.sh` copies `example_repo/`
+   into every pool-labeled sandbox pod at
+   `/workspace/<run-id>/repo` via `kubectl cp`. The KEDA ScaledJob
+   leases any pool pod per leaf, so every one needs the fixture.
+   The skill only dispatches runs; it never touches `/workspace` at
+   runtime.
 
 `POST /runs` returns a run handle immediately; the leaf's answer is
 collected via `GET /runs/status?sessionId=…` on a later turn. Run
@@ -81,44 +71,38 @@ reading that directory.
 
 ## How state flows
 
-- **Setup time.** `setup.sh` provisions a PVC in the MOCA namespace,
-  copies `example_repo/` into it via a short-lived loader pod, then
-  `POST`s to `/workloads` to register `workload-a` (read-only) and
-  `workload-b` (read-write) against that PVC. The fixture is
-  cluster-side before Claude ever starts.
+- **Setup time.** `setup.sh` copies `example_repo/` into every
+  pool-labeled sandbox pod at `/workspace/<run-id>/repo` via
+  `kubectl cp`. The fixture is cluster-side before Claude ever starts.
 - **Dispatch.** The only state going from the laptop to MOCA at
-  dispatch time is the prompt text (plus the sessionId and workload
-  name). The parent embeds any output from prior leaves into the next
-  leaf's prompt as plain text; there is no shared memory between
-  leaves.
-- **Execution.** MOCA cold-starts a leaf pod in the chosen workload.
-  The pod mounts the PVC at `/workspace` with the workload's
-  `readOnly` setting. Any files the leaf writes land on the PVC (if
-  the mount allows) and stay there.
+  dispatch time is the prompt text and the sessionId. The parent
+  embeds any output from prior leaves into the next leaf's prompt as
+  plain text; there is no shared memory between leaves.
+- **Execution.** MOCA cold-starts a leaf-worker that leases one of
+  the pool pods and runs the agent against `/workspace/<run-id>/repo`
+  on that pod.
 - **Return.** The leaf's answer comes back as the `.text` field of
-  the `/runs/status` response. Files on the PVC do **not** come back
-  to the laptop. If the operator wants to see a diff or a test log,
-  the leaf's prompt must ask for it as text in the response.
+  the `/runs/status` response. Files the leaf wrote stay on the
+  sandbox pod and do **not** come back to the laptop. If the operator
+  wants to see a diff or a test log, the leaf's prompt must ask for it
+  as text in the response.
 
 ## What's honest and what isn't
 
-- **A's read-only workspace is substrate-enforced.** The Context Service
-  PVC is mounted with `readOnly: true` on `workload-a`, so A physically
-  cannot modify `/workspace` — writes fail at the filesystem. You can
-  verify this directly: while an A leaf is live,
-  `kubectl exec` in and `touch /workspace/x` → `Read-only file system`.
+- **Isolation here is prompt-only, not substrate-enforced.** This
+  MOCA install exposes a shared pool of sandbox pods and no per-run
+  mount-posture controls — `moca start` sends `kind:"prompt"`, and
+  there is no `workload` field, no per-run `readOnly` flag, and no
+  `/workloads` endpoint to pre-register posture-specific workloads.
+  The researcher-vs-fixer split lives in the prompts you write
+  ("do not modify files" vs "apply this fix"); a non-compliant leaf
+  could ignore it. A later version of this demo may bring back
+  substrate-enforced read-only mounts if MOCA grows that surface.
 
-- **The researcher's "no exec / no network" is prompt-only.** MOCA
-  today gives every leaf the same seven tools (`read, write, edit,
-  ls, find, bash, grep`) and has no web-fetch tool at all. There is
-  no per-leaf `tools` allowlist on `LeafEnvelope`. The operator's
-  diagnosis prompt says "do not run shell commands"; a non-compliant
-  leaf could. Honest substrate-enforced capability splits would need
-  an upstream `tools` field, which is out of scope for this demo.
-
-- **The fixer needs a writable workspace.** `workload-b` mounts the
-  same PVC read-write so a fixer leaf can apply the fix and run the
-  tests. Both workloads see the same `example_repo/` tree.
+- **Every leaf gets the same tools.** MOCA gives every leaf the same
+  seven (`read, write, edit, ls, find, bash, grep`) with no web-fetch
+  tool and no per-leaf `tools` allowlist on `LeafEnvelope`. Honest
+  capability splits would need an upstream `tools` field.
 
 - **Chaining is parent-side.** MOCA has no "on complete, trigger X"
   primitive; the parent Claude session does the sequencing between
@@ -169,25 +153,24 @@ This:
 
 1. Verifies `kubectl`, `curl`, `jq` are on `PATH` and that MOCA is
    reachable at `http://localhost:8080`.
-2. Creates a PVC in the MOCA namespace and copies `example_repo/`
-   into it via a short-lived loader pod.
-3. Creates `workload-a` (read-only) and `workload-b` (read-write)
-   bound to that PVC.
-4. Stages `.claude/settings.json` and `.claude/skills/moca-dispatch/`
-   into `~/tmp/moca-chained-scratch/`.
-5. Writes `WORKLOADS.md` into the scratch dir so the skill has a
-   handy reference to the names.
+2. Copies `example_repo/` into every pool-labeled sandbox pod at
+   `/workspace/<run-id>/repo` via `kubectl cp`.
+3. Stages `.claude/settings.json`, `.claude/skills/moca-dispatch/`,
+   and `bin/moca` into `~/tmp/moca-chained-scratch/`, and patches
+   `settings.json` so the scratch `bin/` is on `$PATH` for the
+   Bash tool.
+4. Writes `MOCA.md` into the scratch dir with the base URL, host
+   header, run id, and workspace path.
 
 Environment overrides (set before running):
 
-- `MOCA_NS` — MOCA namespace (default `moca-system`).
+- `MOCA_NS` — MOCA namespace (default `default`).
 - `MOCA_PORT` — local port the port-forward uses (default `8080`).
-- `WORKLOAD_A` / `WORKLOAD_B` — workload names.
+- `SANDBOX_POOL_SELECTOR` — label selector for pool pods
+  (default `sh.kagenti.io/sandbox-pool=default`).
+- `SCALEDJOB_NAME` — KEDA ScaledJob name (default `leaf-worker`).
+- `RUN_ID` / `WORKSPACE_REF` — run id and workspace path to seed.
 - `SCRATCH_DIR` — scratch dir path.
-- `LOADER_IMAGE` — image for the short-lived PVC loader pod
-  (default `busybox:1.36`).
-- `CTX_STORAGE_CLASS` — PVC storage class (default: cluster default).
-- `CTX_PVC_SIZE` — PVC size (default `128Mi`).
 
 ## Run a session
 
@@ -200,9 +183,10 @@ not encode the flow; you drive it.
 
 **Prompt 1 — start the diagnosis.** Paste something like:
 
-> There's a Node.js project in `example_repo` on MOCA. Dispatch a
-> subagent against the read-only workload to diagnose why its tests
-> are failing.
+> There's a Node.js project seeded at `/workspace/<run-id>/repo` on
+> MOCA (the exact path is in `MOCA.md`). Dispatch a subagent to
+> diagnose why its tests are failing. Tell the leaf to read-only —
+> do not modify files, do not run shell commands beyond `npm test`.
 
 Claude should:
 
@@ -229,12 +213,18 @@ writes the completed body to `.result.json`, and prints the leaf's
 
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
-> Good. Dispatch another subagent against the read-write workload to
-> apply that fix, run the tests, and report the diff and outcome.
+> Good. Dispatch another subagent to apply that fix, run the tests,
+> and report the diff and outcome.
 
-Claude dispatches a second leaf against `workload-b`, embedding the
-diagnosis from Prompt 2 in the new leaf's prompt. Record is written.
+Claude dispatches a second leaf, embedding the diagnosis from
+Prompt 2 verbatim in the new leaf's prompt. Record is written.
 Control returns to you.
+
+> **Note on isolation.** On this MOCA install there is no per-run
+> read-only mount — both the researcher and the fixer leaves get
+> the same substrate posture. The researcher's "don't modify files"
+> contract lives in its prompt, not in the mount. See "What's honest
+> and what isn't" above.
 
 **Prompt 4 — collect the fix result.**
 
@@ -245,11 +235,11 @@ Claude polls, surfaces the diff and test outcome.
 While leaves run, in another terminal:
 
 ```bash
-kubectl -n moca-system get pods -w
+kubectl -n default get pods -w
 ```
 
-You should see leaf pods from both workloads cold-start, run, and drop
-to zero. That's the MOCA-value visual.
+You should see `leaf-worker-*` pods cold-start, run, and drop to
+`Completed`. That's the MOCA-value visual.
 
 ## Pause and resume
 
@@ -285,30 +275,15 @@ Claude Code session identifier.
   in this demo — if your deployment is sync-only, dispatching
   effectively blocks the turn and Ctrl-C discards the result.
 
-## Verify substrate-enforced isolation
-
-While a `workload-a` leaf is still live (or spin one up with a trivial
-prompt):
-
-```bash
-POD=$(kubectl -n moca-system get pods -l workload=workload-a \
-       -o jsonpath='{.items[0].metadata.name}')
-kubectl -n moca-system exec "$POD" -- touch /workspace/x
-#   touch: cannot touch '/workspace/x': Read-only file system
-```
-
-Same command against a `workload-b` pod succeeds. The isolation is in
-the mount, not the prompt.
-
 ## Teardown
 
 ```bash
 ./teardown.sh
 ```
 
-This deletes `workload-a`, `workload-b`, the workspace PVC, and the
-scratch directory. It does **not** touch MOCA or your cluster. If a
-`kubectl port-forward` is still running, `Ctrl-C` it.
+This removes the seeded fixture from the sandbox pool pods and
+deletes the scratch directory. It does **not** touch MOCA or your
+cluster. If a `kubectl port-forward` is still running, `Ctrl-C` it.
 
 ## Troubleshooting
 
@@ -323,27 +298,24 @@ scratch directory. It does **not** touch MOCA or your cluster. If a
   result aged out of MOCA (or MOCA was restarted). The skill marks
   the record `failed`. Re-dispatch if you still want the work done.
 - **`.moca-runs/` has records that never seem to complete.** Check
-  `kubectl -n moca-system get pods` — if there's no leaf pod for the
-  sessionId, MOCA may have never scheduled it, or it crashed before
-  reporting. Delete the stale record file after confirming no leaf
-  is running.
+  `kubectl -n default get pods` — if there's no `leaf-worker-*` pod
+  for the sessionId, MOCA may have never scheduled it, or it crashed
+  before reporting. Delete the stale record file after confirming no
+  leaf is running.
 - **Claude tries `Task` and gets denied, then stops.** The skill
   wasn't found. Confirm
   `~/tmp/moca-chained-scratch/.claude/skills/moca-dispatch/SKILL.md`
   exists; re-run `./setup.sh` if it doesn't.
-- **`POST /workloads` fails with `claimName not found`.** The PVC
-  isn't in the MOCA namespace (sync didn't complete, or MOCA watches
-  a different namespace). Verify `kubectl -n moca-system get pvc`
-  and re-run `./setup.sh`.
-- **A fixer leaf reports "Read-only file system" when writing.**
-  Either `workload-b` was somehow created with `readOnly: true`, or
-  the model dispatched the fixer leaf to `workload-a` by mistake.
-  Check which workload was in the curl permission prompt. If the
-  workload spec is wrong, run `./teardown.sh && ./setup.sh`.
-- **A diagnosis leaf reads a stale version of the fixture.** The PVC
-  wasn't re-synced after you edited `example_repo/`. Run
-  `./teardown.sh && ./setup.sh` — the shim wipes the PVC contents on
-  each `ctx_sync_push`, so re-running setup re-publishes.
+- **Claude asks "which workload is read-only?" or similar.** The
+  operator prompt said "read-only workload" / "read-write workload",
+  but this MOCA install exposes no workload catalog and the CLI
+  takes no workload argument. Rephrase the prompt without those
+  terms — the researcher-vs-fixer split is prompt-only here (see
+  "What's honest and what isn't").
+- **A diagnosis leaf reads a stale version of the fixture.** The
+  sandbox pods weren't re-seeded after you edited `example_repo/`.
+  Run `./teardown.sh && ./setup.sh` — setup wipes the per-run
+  directory on each pool pod and re-copies.
 
 ## Security note
 
@@ -362,9 +334,12 @@ bin/moca                   Small CLI the skill shells out to (start / check / li
 settings.json.example      Permission policy: denies Task, allows moca start/check/list
 setup.sh                   Seeds fixture into sandbox pods, stages scratch (incl. .moca-runs/ and bin/moca)
 teardown.sh                Removes seeded fixture and the scratch dir
-lib/ctx.sh                 kubectl-only shim that mirrors contextctl verbs
 example_repo/              Vendored fixture — Node.js project with a renamed-API bug
 ```
+
+> `lib/ctx.sh` is a leftover from an earlier design that used a
+> Context Service PVC + per-posture workloads. The current setup
+> seeds the sandbox pool directly and does not source it.
 
 In the scratch dir after `setup.sh`:
 

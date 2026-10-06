@@ -26,6 +26,17 @@ request. If the operator asks for one leaf, run one. If they ask for a
 chain, start them in sequence and feed outputs forward as they
 describe.
 
+## No workload catalog on this install
+
+This MOCA install exposes **no workload selector**. `moca start` sends
+`kind:"prompt"` only — there is no `workload`, `workspaceRef`, or
+`readOnly` field in the envelope. If the operator says "dispatch to
+the read-only workload" or "use the read-write workload", that
+phrasing is historical: just dispatch, and encode any
+posture/behavior rules (e.g. "do not modify files") inside the leaf
+prompt text itself. Do **not** stop to ask which workload to target —
+there is only one path.
+
 ## The CLI
 
 The scratch dir contains `MOCA.md` (base URL, host header, run-id,
