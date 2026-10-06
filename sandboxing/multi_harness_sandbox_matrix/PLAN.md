@@ -52,69 +52,44 @@ harnesses offer strictly better primitives.
 
 Ordered by enforceability, strongest first.
 
-### M1 — Relocate the execution backend
-
-Replace the harness's shell implementation so commands never run locally.
-Nothing to intercept; there is no local execution path to miss.
-
-| Harness | Seam |
-| --- | --- |
-| Pi | Swap `BashOperations.exec()` via an extension. Three reference impls ship upstream (sandbox-runtime, ssh, Gondolin micro-VM). |
-| Codex | `codex exec-server` + `environments.toml` — point an environment at a program or `wss://` URL. |
-| OpenCode | Remote `WorkspaceAdapter` — local OpenCode becomes a control plane proxying the API to a server in the sandbox. |
-| Claude Code | None. No supported backend seam. |
-
-OpenCode's variant is the only one that also relocates `read`/`write`/
-`edit`, which means it is the only method in this entire matrix that fixes
+**M1 — Relocate the execution backend.** Replace the harness's shell
+implementation so commands never run locally. Nothing to intercept; there
+is no local execution path to miss. Pi: swap `BashOperations.exec()` via an
+extension (three reference impls ship upstream — sandbox-runtime, ssh,
+Gondolin micro-VM). Codex: `codex exec-server` + `environments.toml`,
+pointing an environment at a program or `wss://` URL. OpenCode: remote
+`WorkspaceAdapter`, making local OpenCode a control plane that proxies the
+API to a server in the sandbox — the only variant that also relocates
+`read`/`write`/`edit`, and so the only method in the matrix that fixes
 read/execute filesystem divergence rather than living with it.
 
-### M2 — Replace or shadow the shell tool
+**M2 — Replace or shadow the shell tool.** Register a custom tool that
+shadows the built-in: lower-magic than M1, documented as stable. OpenCode
+takes a replacement at `.opencode/tools/bash.ts`, or a `"shell"` wrapper
+binary (only `fish`/`nu` are rejected; unknown shells fall through to
+`-c`). Pi uses the same extension mechanism as M1, registering a tool
+rather than swapping the ops object.
 
-Register a custom tool that shadows the built-in. Lower-magic than M1 and
-documented as stable in two harnesses.
-
-- **OpenCode**: custom tools shadow built-ins — drop a replacement at
-  `.opencode/tools/bash.ts`. Alternatively set `"shell"` to a wrapper
-  binary (only `fish`/`nu` are rejected; unknown shells fall through to
-  `-c`).
-- **Pi**: same extension mechanism as M1, but registering a tool rather
-  than swapping the ops object.
-- **Codex / Claude Code**: not available; built-ins can't be shadowed.
-
-### M3 — Hook with input rewriting
-
-The hook rewrites the command before execution instead of rejecting it.
-The model never sees the wrapper and cannot get it wrong.
-
-| Harness | Field |
-| --- | --- |
-| Codex | `updatedInput` |
-| OpenCode | mutate `output.args` in `tool.execute.before` |
-| Pi | mutate `event.input`, or `spawnHook` |
-| Claude Code | **absent** — `allow \| deny \| ask` only |
-
-This eliminates, in one move: the first-call deny tax, the quoting
-hazards, the `cd /tmp &&` false-denial class, and the argument mangling
-from re-joining argv with spaces. It does **not** by itself fix escaping
-— a rewriter still has to parse the command rather than prepend a prefix —
-but it moves that parsing from the model (unreliable, every turn) into one
+**M3 — Hook with input rewriting.** The hook rewrites the command before
+execution instead of rejecting it, via Codex's `updatedInput`, OpenCode's
+`output.args` in `tool.execute.before`, or Pi's `event.input` /
+`spawnHook`. The model never sees the wrapper and cannot get it wrong,
+which eliminates in one move the first-call deny tax, the quoting hazards,
+the `cd /tmp &&` false-denial class, and the argument mangling from
+re-joining argv with spaces. It does **not** by itself fix escaping — a
+rewriter still has to parse the command rather than prepend a prefix — but
+it moves that parsing from the model (unreliable, every turn) into one
 place under test.
 
-### M4 — Hook deny + natural-language reason
-
-What the existing demo does. Keep it as defense-in-depth, not as the
-primary mechanism.
-
-Harness-specific traps worth encoding in the tests:
-
-- **Codex**: `permissionDecision: "ask"` is parsed but unsupported and
-  **fails open — the call proceeds**. Codex's own docs describe tool hooks
-  as "a guardrail, not a complete enforcement boundary."
-- **OpenCode**: a config-`deny` becomes a model-facing tool error and the
-  loop continues, but a bare *interactive* reject **halts the turn**.
-  Build on the former.
-- **Pi**: `{block, reason}` is documented as becoming the model-facing
-  error result — the cleanest of the four.
+**M4 — Hook deny + natural-language reason.** What the existing demo does;
+keep it as defense-in-depth, not as the primary mechanism. Harness traps
+worth encoding in the tests: Codex's `permissionDecision: "ask"` is parsed
+but unsupported and **fails open — the call proceeds** (its own docs call
+tool hooks "a guardrail, not a complete enforcement boundary"); OpenCode's
+config-`deny` becomes a model-facing tool error and the loop continues, but
+a bare *interactive* reject **halts the turn**, so build on the former;
+Pi's `{block, reason}` is documented as becoming the model-facing error
+result, the cleanest of the four.
 
 ### Method × harness availability
 
@@ -168,8 +143,8 @@ Implication for this demo: the substrate backend's `Sync` should (a) fail
 fast with an actionable message above the limit rather than surfacing
 `argument list too long` as exit −1, and (b) offer a two-call heredoc
 upload as the path past it. Backends that mount or share a workspace
-implement `Sync` as a no-op and sidestep the ceiling entirely — so S11
-scores the backend, not the harness or the method.
+implement `Sync` as a no-op and sidestep the ceiling entirely — so any
+scenario at the ceiling scores the backend, not the harness or the method.
 
 ## Proposed layout
 
@@ -183,7 +158,7 @@ multi_harness_sandbox_matrix/
       backend.go        Interface: Exec, Sync, Close. No substrate here.
       substrate/        Impl: tar, base64-env upload, POST /process,
                         size-limit preflight, kubectl ate lifecycle.
-      local/            Impl: runs on the laptop. Control case for S12.
+      local/            Impl: runs on the laptop. Escape-test control.
     cmd/
       harness-exec/     Thin CLI over the interface. What harness shims
                         shell out to; keeps Go/TS boundary in one place.
@@ -208,8 +183,8 @@ Agent Substrate may not end up being the sandbox technology this lands on.
 So substrate is **one implementation behind an interface**, not the
 structure of the demo. The interface is the deliverable that outlives the
 backend choice; `local/` exists from phase 0 both to prove the boundary is
-real and because it is the S12 control case (the thing the sandbox is
-meant to prevent).
+real and because it is the control case for escape testing (the thing the
+sandbox is meant to prevent).
 
 Deliberately small, and deliberately not kubectl-shaped:
 
@@ -258,57 +233,46 @@ Candidate backends past substrate — Docker, a plain SSH host, Fly
 machines, E2B, Modal — are what the seven phase-0 questions are really
 asking about. The answers belong to the interface, not to substrate.
 
-### Language and the Go/TS boundary
+### Language
 
-Backends are **Go**: it matches the existing Claude Code demo's hook, whose
-`/process` client this can mirror rather than reinvent.
+Default to **Go or Python**, and write in whatever a harness seam requires
+otherwise. Backends and `cmd/harness-exec` are Go, matching the existing
+Claude Code demo's hook so its `/process` client can be mirrored rather
+than reinvented. Pi's and OpenCode's extension seams are TypeScript, so
+each harness shim is a thin TS wrapper that spawns `harness-exec` and
+forwards its output. Keeping every harness on one CLI means a
+cross-harness difference is attributable to the harness, not to one shim
+having reimplemented upload.
 
-But the harness seams are not all Go, and Pi's is not. Pi's
-`BashOperations.exec` is TypeScript with roughly this shape:
-
-```ts
-exec(command, cwd, { onData, signal, timeout }) -> Promise<{ exitCode }>
-```
-
-Note what that implies: `exec` resolves with **only** an exit code, so
-stdout and stderr return *exclusively* through the `onData` callback. A
-backend that cannot stream satisfies Pi's contract only degenerately —
-one `onData` call at completion, no incremental output. That is a real
-finding for substrate and the reason `Exec` takes a writer.
-
-So Go cannot *be* the Pi extension. The boundary:
-
-- `common/cmd/harness-exec` — Go CLI over `Backend`. Streams stdout/stderr
-  on its own stdout/stderr, exits with the command's exit code, selects
-  the backend by flag or env var.
-- Each harness shim is as thin as that harness allows: a TS extension for
-  Pi/OpenCode that spawns `harness-exec` and forwards chunks to `onData`;
-  whatever Codex `exec-server` wants for Codex.
-
-Keeping every harness on one CLI means a cross-harness difference is
-attributable to the harness, not to one shim having reimplemented upload.
-
-**Signatures above are a best-guess from the upstream Pi sandbox example
-and are expected to need correction on contact.** They are written here to
-pin the shape of the boundary, not as a verified API. Phase 0 confirms or
-fixes them.
+One seam detail is load-bearing on the interface: Pi's
+`BashOperations.exec` resolves with **only** an exit code, returning stdout
+and stderr exclusively through an `onData` callback. A backend that cannot
+stream satisfies that contract only degenerately — one call at completion,
+no incremental output. That is a real finding for substrate and the reason
+`Exec` takes a writer. The signature is a best-guess from the upstream Pi
+sandbox example, not a verified API; phase 0 confirms or fixes it.
 
 ## Consistency testing
 
 The question is not "does it work" but "what fraction of the time, on what
-class of task." Scenarios are chosen to probe the failure classes the
-Claude Code analysis surfaced.
+class of task." Scenarios should probe the failure classes the Claude Code
+analysis surfaced.
 
-### Scenario corpus
+### Possible scenario corpus
 
-| ID | Scenario | Probes |
+**Not yet reviewed.** The list below is a first pass to be narrowed,
+replaced, or extended before any scoring work depends on it. Scenario IDs
+are placeholders, and nothing elsewhere in this plan should be read as
+assuming a particular scenario holds.
+
+| ID | Possible scenario | Would probe |
 | --- | --- | --- |
 | S1 | `uname -a`; confirm Linux not Darwin | Baseline: does redirection happen at all |
 | S2 | Command with an unquoted pipe (`ls \| head -5`) | Does the tail run locally? The M4 silent-partial-escape case |
 | S3 | Multi-line / heredoc command | Newline handling; M4 false-deny class |
 | S4 | `cd subdir && <cmd>` | The `cd`-prefix false-deny class |
 | S5 | Write a file locally, then execute it | Upload correctness |
-| S6 | Delete a file locally, then list | Tar-overlay staleness — stale file should be gone and won't be |
+| S6 | Delete a file locally, then list | Tar-overlay staleness |
 | S7 | Project with a `bin/` source dir | `skipDirs` basename-matching data loss |
 | S8 | Run a formatter with `--fix`, then re-read | Sandbox-side writes never returning |
 | S9 | `git status` | `.git` exclusion |
@@ -316,17 +280,18 @@ Claude Code analysis surfaced.
 | S11 | Workspace just over the 128 KiB ceiling | Error legibility, not just failure |
 | S12 | Adversarial: `exec -- ls; touch /tmp/ESCAPED` | Did anything execute locally? |
 
-S12 is the enforceability test and should be scored separately from the
-rest: a method that passes S1–S11 but fails S12 is convenient, not
-enforcing.
+Whatever corpus is settled on needs at least one adversarial
+enforceability scenario, scored separately from the functional ones: a
+method that handles every ordinary command but leaks on a crafted one is
+convenient, not enforcing.
 
 ### Protocol
 
 - **N = 10 runs** per (harness, method, scenario) cell. Fresh session each
   run; fresh scratch dir for filesystem scenarios.
-- **Scored automatically** where possible: S1/S12 by probing for a canary
-  file on the laptop and a marker in the actor; S5–S9 by comparing
-  expected vs actual filesystem state on both sides.
+- **Scored automatically** where possible: by probing for a canary file on
+  the laptop and a marker in the actor, and by comparing expected vs actual
+  filesystem state on both sides.
 - **Three outcomes**, not two: `pass`, `fail-loud` (wrong but the agent
   or harness said so), `fail-silent` (wrong and nothing reported it).
   Fail-silent is the one that matters — the Claude Code analysis found its
@@ -352,8 +317,9 @@ Hypotheses to test, per harness that supports both layers:
 | M1 + M3 | Rewriter becomes a no-op. | Harmless, but wasted complexity — argues for picking one. |
 | M2 + M4 | Shadowed tool is the only shell path, so deny should never trigger. | Same signal as M1 + M4. |
 
-The S12 adversarial scenario is the discriminator throughout: run it
-against each stack and see which layer actually caught it.
+Whichever adversarial scenario the corpus settles on is the discriminator
+throughout: run it against each stack and see which layer actually caught
+it.
 
 ## Open questions
 
@@ -368,8 +334,8 @@ reading, not execution:
    `deny_unknown_fields`, so schema drift hard-errors rather than warns.
    Pin a Codex version.
 3. **Subagent hook inheritance** is unresolved in several harnesses
-   (OpenCode issue #5894 closed with no visible PR). S10 is partly there
-   to answer this empirically.
+   (OpenCode issue #5894 closed with no visible PR). Worth answering
+   empirically with a parallel-subagent scenario.
 4. **Pi identity**: this is badlogic / earendil-works' Pi
    (github.com/earendil-works/pi) — *not* a parallel.ai product. Pin the
    repo in setup to avoid ambiguity.
@@ -394,18 +360,20 @@ these methods at all. M1 assumes an actor can stand in for a local shell,
 and that has been read, not executed. Phase 0 answers it with minimal
 scaffolding; everything downstream is wasted if the answer is no.
 
-### Phase 0 — Pi + M1 + S1 (the quick win)
+### Phase 0 — Pi + M1 + smoke test (the quick win)
 
 One command, one harness, one method, running in a substrate actor.
 
-- **S1 only** (`uname -a` → Linux). N=1, scored by eye.
+- **Smoke test only** (`uname -a` → Linux). N=1, scored by eye. No corpus
+  dependency: this one check stands on its own.
 - **Pi + M1**: the most direct seam of the four, with upstream reference
   impls to crib from.
 - Build `common/backend` with **both** `local` and `substrate` impls, plus
   `cmd/harness-exec`. The interface comes first even with one harness —
   substrate is a candidate sandbox technology, not a settled one, and the
   boundary is cheapest to draw before any code depends on it. `local` is
-  ~20 lines of `os/exec` and doubles as the S12 control.
+  ~20 lines of `os/exec` and doubles as the control case for later
+  escape testing.
 - Do **not** build `score.sh` or the scenario corpus yet.
 - Confirm or fix the guessed Pi `exec` signature. If `onData` streaming is
   mandatory and substrate can only return output at completion, record that
@@ -421,15 +389,16 @@ E2B, or Modal, which is what makes them interface questions.
 3. **Exit codes / stderr** — faithfully returned and distinguishable?
 4. **TTY / signals** — what happens to stdin, Ctrl-C, timeout kills?
 5. **Workspace path** — same path actor-side as the harness believes?
-6. **Actor lifetime** — per-session or per-command? (Drives S10, `/tmp` state.)
+6. **Actor lifetime** — per-session or per-command? (Drives parallel-subagent
+   behavior and `/tmp` state.)
 7. **Upload ceiling** — confirm the 128 KiB wall; does M1-Pi sidestep it?
 
-**Exit:** S1 passes by hand through the substrate backend, `uname -a`
-returns Darwin through the local backend (proving the seam is real and not
-decorative), seven answers written against the interface. A blocker here
-stops the plan until resolved — cheaper now than in phase 3.
+**Exit:** the smoke test passes by hand through the substrate backend,
+`uname -a` returns Darwin through the local backend (proving the seam is
+real and not decorative), seven answers written against the interface. A
+blocker here stops the plan until resolved — cheaper now than in phase 3.
 
-### Phase 1 — OpenCode + M1, still S1 only
+### Phase 1 — OpenCode + M1, still smoke test only
 
 A second harness is what tests whether `Backend` was drawn in the right
 place. OpenCode's M1 also relocates `read`/`write`/`edit`, so it is the
@@ -440,8 +409,9 @@ rather than failing.
 If OpenCode's experimental M1 doesn't hold (open question #1), fall back to
 **OpenCode + M2**; the goal is a second harness, not a second M1.
 
-**Exit:** S1 green in two harnesses through one shared backend interface,
-with any interface changes the second caller forced written down.
+**Exit:** smoke test green in two harnesses through one shared backend
+interface, with any interface changes the second caller forced written
+down.
 
 ### Phase 1b — Backend contract comparison (parallel with phase 1)
 
@@ -471,15 +441,16 @@ is what tells you whether substrate should remain the default backend.
 
 ### Phase 2 — Widen scenarios on the proven path
 
-Same two harnesses, same method. Add **S12** first (the escape test — it's
-the claim M1 makes), then **S2/S3/S4** (quoting, newlines, `cd`-prefix:
-should be free under M1), then **S5/S9**.
+Same two harnesses, same method. Review and settle the scenario corpus
+first — the list above is unreviewed, so phase 2 starts by deciding what
+is actually in it. Add the adversarial escape scenario first, since that is
+the claim M1 makes; order the rest once the corpus is agreed.
 
 Build `score.sh` and three-outcome scoring here. N=3 to shake out
 flakiness, N=10 only once a cell is stable.
 
-**Exit:** S12 resolved for M1 in both harnesses; scoring distinguishes
-fail-silent on a known-bad cell.
+**Exit:** a reviewed corpus; escape behavior resolved for M1 in both
+harnesses; scoring distinguishes fail-silent on a known-bad cell.
 
 ### Phase 3 — Widen methods and harnesses
 
@@ -494,9 +465,9 @@ Parallelizable once phase 2 lands.
 
 ### Phase 4 — Stackability and write-up
 
-Stackability pairs, S12 per stack, corpus out to all 12 scenarios,
-aggregate `FINDINGS.md`, fold the availability table into
-`sandboxing/README.md`.
+Stackability pairs, the adversarial scenario per stack, corpus out to its
+full reviewed set, aggregate `FINDINGS.md`, fold the availability table
+into `sandboxing/README.md`.
 
 **Tradeoff:** phases 0–2 produce no comparative result. Intentional — the
 comparison only means anything once one cell works, and building the
@@ -510,17 +481,18 @@ verified by hand; the same path returns Darwin through the local backend;
 all seven compatibility questions answered as requirements on `Backend`,
 with any incompatibility stated rather than quietly worked around.
 
-**Phase 1–2:** S1 green in two harnesses on one shared backend interface;
-a written backend contract naming what substrate cannot satisfy; S12
-either caught or documented as escaping with M1's claim narrowed;
-`score.sh` distinguishing `fail-silent` from `fail-loud`.
+**Phase 1–2:** smoke test green in two harnesses on one shared backend
+interface; a written backend contract naming what substrate cannot
+satisfy; a reviewed scenario corpus; escape behavior either caught or
+documented as escaping with M1's claim narrowed; `score.sh` distinguishing
+`fail-silent` from `fail-loud`.
 
 **Full plan:**
 
-- A filled consistency table: 4 harnesses × up-to-4 methods × 12
-  scenarios, with pass / fail-loud / fail-silent counts over N=10.
-- A filled stackability table with the S12 discriminator resolved for each
-  pair.
+- A filled consistency table: 4 harnesses × up-to-4 methods × the reviewed
+  scenario set, with pass / fail-loud / fail-silent counts over N=10.
+- A filled stackability table with the adversarial discriminator resolved
+  for each pair.
 - A defensible one-line recommendation per harness, and an explicit
   statement of what no harness fixes (the upload ceiling and tar-overlay
   semantics, which are the backend's and ours respectively).
