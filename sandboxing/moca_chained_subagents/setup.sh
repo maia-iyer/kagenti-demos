@@ -19,7 +19,7 @@ MOCA_NS="${MOCA_NS:-default}"
 MOCA_PORT="${MOCA_PORT:-8080}"
 MOCA_BASE="${MOCA_BASE:-http://localhost:${MOCA_PORT}}"
 MOCA_HOST="${MOCA_HOST:-serverless-harness.default.example.com}"
-SANDBOX_POD="${SANDBOX_POD:-sandbox-0}"
+SANDBOX_POOL_SELECTOR="${SANDBOX_POOL_SELECTOR:-sh.kagenti.io/sandbox-pool=default}"
 SCALEDJOB_NAME="${SCALEDJOB_NAME:-leaf-worker}"
 RUN_ID="${RUN_ID:-review-$(date +%s)}"
 WORKSPACE_REF="${WORKSPACE_REF:-/workspace/${RUN_ID}/repo}"
@@ -41,8 +41,13 @@ if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! kubectl -n "${MOCA_NS}" get pod "${SANDBOX_POD}" >/dev/null 2>&1; then
-  echo "    sandbox pod '${SANDBOX_POD}' not found in '${MOCA_NS}'." >&2
+SANDBOX_PODS="$(kubectl -n "${MOCA_NS}" get pods \
+  -l "${SANDBOX_POOL_SELECTOR}" \
+  --field-selector=status.phase=Running \
+  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+if [ -z "${SANDBOX_PODS}" ]; then
+  echo "    no Running sandbox pods matched selector '${SANDBOX_POOL_SELECTOR}' in '${MOCA_NS}'." >&2
+  echo "    Leaf workers lease any pool-labeled pod, so every one needs the fixture." >&2
   echo "    Did the MOCA quick-start finish? See:" >&2
   echo "      https://github.com/rossoctl/moca#quick-start" >&2
   exit 1
@@ -58,7 +63,7 @@ fi
 
 echo "    ok: kubectl, curl, jq on PATH"
 echo "    ok: namespace ${MOCA_NS} exists"
-echo "    ok: pod ${SANDBOX_POD} present in ${MOCA_NS}"
+echo "    ok: sandbox pool pods: ${SANDBOX_PODS}"
 echo "    ok: ScaledJob ${SCALEDJOB_NAME} present"
 
 echo "==> Checking MOCA is reachable at ${MOCA_BASE} (Host: ${MOCA_HOST})..."
@@ -72,24 +77,49 @@ if ! echo "${HTTP_CODE}" | grep -qE '^(200|204|404)$'; then
 fi
 echo "    ok: MOCA reachable (HTTP ${HTTP_CODE})"
 
-echo "==> Waiting for ${SANDBOX_POD} to be Ready..."
-kubectl -n "${MOCA_NS}" wait --for=condition=Ready "pod/${SANDBOX_POD}" --timeout=90s >/dev/null
+echo "==> Waiting for sandbox pool pods to be Ready..."
+for pod in ${SANDBOX_PODS}; do
+  kubectl -n "${MOCA_NS}" wait --for=condition=Ready "pod/${pod}" --timeout=90s >/dev/null
+done
 echo "    ok"
 
-echo "==> Seeding example_repo/ into ${SANDBOX_POD}:${WORKSPACE_REF}..."
-kubectl -n "${MOCA_NS}" exec "${SANDBOX_POD}" -- sh -c "mkdir -p '${WORKSPACE_REF}'"
-kubectl -n "${MOCA_NS}" exec "${SANDBOX_POD}" -- sh -c "rm -rf '${WORKSPACE_REF}'/* '${WORKSPACE_REF}'/.[!.]* 2>/dev/null; true"
-kubectl -n "${MOCA_NS}" cp "${SCRIPT_DIR}/example_repo/." "${SANDBOX_POD}:${WORKSPACE_REF}"
+echo "==> Seeding example_repo/ into every pool-labeled sandbox at ${WORKSPACE_REF}..."
+# Every pool-labeled sandbox needs the fixture because the leaf-worker leases
+# any one of them for a given run — if the lease lands on an unseeded pod, the
+# agent cannot find the repo path and the leaf fails with reason "error".
+for pod in ${SANDBOX_PODS}; do
+  echo "    - ${pod}"
+  kubectl -n "${MOCA_NS}" exec "${pod}" -- sh -c "mkdir -p '${WORKSPACE_REF}'"
+  kubectl -n "${MOCA_NS}" exec "${pod}" -- sh -c "rm -rf '${WORKSPACE_REF}'/* '${WORKSPACE_REF}'/.[!.]* 2>/dev/null; true"
+  kubectl -n "${MOCA_NS}" cp "${SCRIPT_DIR}/example_repo/." "${pod}:${WORKSPACE_REF}"
+done
 echo "    ok"
 
 echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
 
 mkdir -p "${SCRATCH_DIR}/.claude/skills"
 mkdir -p "${SCRATCH_DIR}/.moca-runs"
+mkdir -p "${SCRATCH_DIR}/bin"
 cp "${SCRIPT_DIR}/settings.json.example" \
    "${SCRATCH_DIR}/.claude/settings.json"
 cp -r "${SCRIPT_DIR}/skill" \
       "${SCRATCH_DIR}/.claude/skills/moca-dispatch"
+install -m 0755 "${SCRIPT_DIR}/bin/moca" "${SCRATCH_DIR}/bin/moca"
+
+# Rewrite .claude/settings.json so the moca CLI is on PATH for Bash tool
+# invocations. The example file ships without an env block; inject one
+# that prepends the scratch dir's bin/ to $PATH.
+python3 - "${SCRATCH_DIR}/.claude/settings.json" "${SCRATCH_DIR}/bin" <<'PY'
+import json, sys, os
+settings_path, bin_dir = sys.argv[1], sys.argv[2]
+with open(settings_path) as f:
+    s = json.load(f)
+env = s.setdefault("env", {})
+env["PATH"] = f"{bin_dir}:" + os.environ.get("PATH", "/usr/bin:/bin")
+with open(settings_path, "w") as f:
+    json.dump(s, f, indent=2)
+    f.write("\n")
+PY
 
 cat > "${SCRATCH_DIR}/MOCA.md" <<EOF
 # MOCA settings for this scratch session
@@ -99,7 +129,8 @@ Host header:   ${MOCA_HOST}
 workspaceRef:  ${WORKSPACE_REF}
 Run id:        ${RUN_ID}
 
-The fixture (example_repo/) has been seeded into ${SANDBOX_POD}:${WORKSPACE_REF}
+The fixture (example_repo/) has been seeded into every pool-labeled sandbox
+(selector '${SANDBOX_POOL_SELECTOR}') at ${WORKSPACE_REF}
 in namespace ${MOCA_NS}. Every curl to MOCA must send:
 
   -H "Host: ${MOCA_HOST}"

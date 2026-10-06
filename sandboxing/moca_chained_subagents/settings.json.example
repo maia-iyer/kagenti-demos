@@ -4,8 +4,9 @@
       "Task"
     ],
     "allow": [
-      "Bash(curl -sS -H \"Host: serverless-harness.default.example.com\" -X POST http://localhost:8080/runs*)",
-      "Bash(curl -sS -H \"Host: serverless-harness.default.example.com\" http://localhost:8080/runs/status*)",
+      "Bash(moca start*)",
+      "Bash(moca check*)",
+      "Bash(moca list*)",
       "Bash(jq*)"
     ]
   }

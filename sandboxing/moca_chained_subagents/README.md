@@ -3,7 +3,9 @@
 Claude Code runs on your laptop. It has **no built-in subagent tool** —
 `Task` is denied in `.claude/settings.json`. To delegate, it uses a
 skill that knows how to dispatch an isolated leaf to
-[MOCA](https://github.com/rossoctl/serverless-harness) over HTTP.
+[MOCA](https://github.com/rossoctl/serverless-harness) by shelling out
+to a small `moca` CLI (installed into the scratch dir by `setup.sh`
+and put on `$PATH` via the staged settings).
 
 Dispatch is **asynchronous**. The parent `POST`s to `/runs` and MOCA
 returns a run handle immediately; the leaf keeps running on the
@@ -38,18 +40,24 @@ For the full design, see [PLAN.md](PLAN.md).
 Three pieces cooperate:
 
 1. **A skill (`moca-dispatch`)** — the mechanism contract. Tells
-   Claude how to shape the `POST /runs` and `GET /runs/status` calls,
-   which workloads exist in this scratch dir and their mount posture,
-   how to write and read run records in `.moca-runs/`, and how to
-   extract `.text` from a completed result. Does **not** prescribe
-   how many leaves to run or in what order — that comes from the
-   operator's prompts.
-2. **A denied `Task` tool** — `.claude/settings.json` denies the
+   Claude how to invoke the `moca` CLI (`start`, `check`, `list`),
+   how to compose leaf prompts (workspace path, forward-passed
+   context, deliverable shape), and how to sequence a chain. Does
+   **not** prescribe how many leaves to run or in what order — that
+   comes from the operator's prompts.
+2. **A `moca` CLI** — a small shell script staged at
+   `<scratch>/bin/moca` by setup. Wraps `POST /runs` /
+   `GET /runs/status` with the host header, parses MOCA's responses,
+   and writes/updates run records in `.moca-runs/` so the shape on
+   disk is always what the skill expects. Keeps the permission prompt
+   short (`moca start r1/diagnose r1-diagnose.prompt.txt`) instead of
+   a long curl line.
+3. **A denied `Task` tool** — `.claude/settings.json` denies the
    built-in subagent tool, so the model has to route through the skill
-   instead of forking in-process. The permission prompt on each `curl`
-   is the operator's visual confirmation that the leaf is being
-   dispatched to MOCA, not run locally.
-3. **Pre-provisioned MOCA workloads** — `setup.sh` creates a PVC in
+   instead of forking in-process. The permission prompt on each
+   `moca start …` is the operator's visual confirmation that the leaf
+   is being dispatched to MOCA, not run locally.
+4. **Pre-provisioned MOCA workloads** — `setup.sh` creates a PVC in
    the MOCA namespace, copies `example_repo/` into it via a
    short-lived loader pod, then creates two MOCA workloads bound to
    that PVC: `workload-a` (read-only) for the researcher, `workload-b`
@@ -201,22 +209,23 @@ Claude should:
 1. Read the `moca-dispatch` skill.
 2. **Not** invoke `Task` — if it tries, the deny fires and it
    re-routes through the skill.
-3. Issue one `curl` to `POST /runs` targeting `workload-a` with a
-   diagnosis prompt the model composes from your request. The
-   permission prompt literally shows the curl command — this is your
-   visual proof the leaf is being dispatched to MOCA, not run
-   in-process.
-4. Write a record file at `.moca-runs/<run-id>-<leaf-label>.json` and
-   return control to you with the sessionId. The leaf is now running
-   on the cluster; this turn is over.
+3. Write the leaf's prompt to a file in `.moca-runs/` and run
+   `moca start <run-id>/diagnose <that file>`. The permission prompt
+   shows the `moca start …` command — short, legible, and clearly
+   not a local shell execution.
+4. The CLI writes a record file at
+   `.moca-runs/<run-id>-<leaf-label>.json` and returns control to you
+   with the sessionId. The leaf is now running on the cluster; this
+   turn is over.
 
 **Prompt 2 — collect the diagnosis.** When you're ready (seconds to
 minutes later, same session or a resumed one):
 
 > Check on that subagent and report the diagnosis.
 
-Claude polls `GET /runs/status?sessionId=…`, writes the completed
-result alongside the record, and surfaces `.text` to you.
+Claude runs `moca check <session-id>`, which polls `/runs/status`,
+writes the completed body to `.result.json`, and prints the leaf's
+`.text` to stdout for Claude to surface to you.
 
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
@@ -349,9 +358,10 @@ local cluster.
 PLAN.md                    Design doc (trimmed)
 README.md                  This file
 skill/SKILL.md             Skill Claude reads to dispatch leaves to MOCA
-settings.json.example      Permission policy: denies Task, allows POST /runs and GET /runs/status
-setup.sh                   Publishes fixture, creates workloads, stages scratch (incl. .moca-runs/)
-teardown.sh                Deletes workloads, PVC, scratch
+bin/moca                   Small CLI the skill shells out to (start / check / list)
+settings.json.example      Permission policy: denies Task, allows moca start/check/list
+setup.sh                   Seeds fixture into sandbox pods, stages scratch (incl. .moca-runs/ and bin/moca)
+teardown.sh                Removes seeded fixture and the scratch dir
 lib/ctx.sh                 kubectl-only shim that mirrors contextctl verbs
 example_repo/              Vendored fixture — Node.js project with a renamed-API bug
 ```
@@ -361,8 +371,10 @@ In the scratch dir after `setup.sh`:
 ```
 ~/tmp/moca-chained-scratch/
 ├── .claude/
-│   ├── settings.json              Copied from settings.json.example
+│   ├── settings.json              Allow-list for moca CLI + PATH env pointing at bin/
 │   └── skills/moca-dispatch/      Copied from skill/
-├── .moca-runs/                    Run records; one JSON per dispatched leaf
-└── WORKLOADS.md                   Names and mount posture of provisioned workloads
+├── bin/
+│   └── moca                       CLI the skill invokes; wraps POST /runs and GET /runs/status
+├── .moca-runs/                    Run records (and *.prompt.txt / *.result.json siblings)
+└── MOCA.md                        Base URL, host header, run-id, workspace path for this session
 ```

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# moca — thin CLI wrapper around the MOCA serverless-harness HTTP API.
+#
+# Three subcommands:
+#   moca start <session-id> <prompt-file>   dispatch a leaf, write a run record
+#   moca check <session-id>                 poll a leaf, write result when done
+#   moca list                               show pending run records
+#
+# Reads base URL, host header, and the run-records dir from MOCA.md in the
+# current directory (written by setup.sh). Writes/reads run records in
+# .moca-runs/.
+#
+# Exit codes:
+#   0  success (dispatch accepted; or check reports current state)
+#   1  usage error / missing deps
+#   2  MOCA not reachable or returned an error (details on stderr)
+#   3  run record not found (for check)
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<EOF
+usage:
+  moca start <session-id> <prompt-file>
+  moca check <session-id>
+  moca list
+
+<session-id> is of the form "<run-id>/<leaf-label>" (e.g. "r1/diagnose").
+<prompt-file> is a path to a file containing the leaf prompt text.
+
+Reads base URL / host header from ./MOCA.md. Writes run records to ./.moca-runs/.
+EOF
+  exit 1
+}
+
+die() { echo "moca: $*" >&2; exit 2; }
+
+for bin in curl jq; do
+  command -v "${bin}" >/dev/null 2>&1 || { echo "moca: missing required binary: ${bin}" >&2; exit 1; }
+done
+
+read_moca_md() {
+  local key="$1"
+  local file="${MOCA_MD:-MOCA.md}"
+  [ -f "${file}" ] || die "cannot find ${file} in $(pwd). Run from the scratch dir."
+  # Lines look like "Base URL:      http://localhost:8080"
+  grep -E "^${key}:[[:space:]]" "${file}" | sed -E "s/^${key}:[[:space:]]+//" | head -1
+}
+
+BASE_URL="${MOCA_BASE:-$(read_moca_md 'Base URL' || true)}"
+HOST_HEADER="${MOCA_HOST:-$(read_moca_md 'Host header' || true)}"
+RUNS_DIR="${MOCA_RUNS_DIR:-.moca-runs}"
+
+[ -n "${BASE_URL}" ]    || die "could not resolve base URL (set MOCA_BASE or add 'Base URL:' to MOCA.md)"
+[ -n "${HOST_HEADER}" ] || die "could not resolve host header (set MOCA_HOST or add 'Host header:' to MOCA.md)"
+
+record_path() {
+  local session_id="$1"
+  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').json"
+}
+
+result_path() {
+  local session_id="$1"
+  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').result.json"
+}
+
+cmd_start() {
+  [ $# -eq 2 ] || usage
+  local session_id="$1"
+  local prompt_file="$2"
+  [ -f "${prompt_file}" ] || die "prompt file not found: ${prompt_file}"
+
+  mkdir -p "${RUNS_DIR}"
+  local record="$(record_path "${session_id}")"
+  if [ -f "${record}" ]; then
+    local existing_status
+    existing_status="$(jq -r '.status' <"${record}" 2>/dev/null || echo "unknown")"
+    die "record already exists for ${session_id} (status=${existing_status}): ${record}"
+  fi
+
+  local body
+  body="$(jq -n --arg sid "${session_id}" --rawfile p "${prompt_file}" \
+    '{sessionId:$sid, kind:"prompt", prompt:$p, async:true}')"
+
+  local response http_code
+  response="$(curl -sS -w '\n%{http_code}' \
+    -H "Host: ${HOST_HEADER}" \
+    -H 'content-type: application/json' \
+    -X POST "${BASE_URL}/runs" \
+    -d "${body}")" || die "curl failed talking to ${BASE_URL}/runs"
+  http_code="$(printf '%s' "${response}" | tail -1)"
+  body="$(printf '%s' "${response}" | sed '$d')"
+
+  case "${http_code}" in
+    202|200) ;;
+    401|403) die "dispatch rejected (HTTP ${http_code}); MOCA likely has auth enabled, async unavailable. body=${body}" ;;
+    503) die "MOCA sandbox pool saturated (HTTP 503). body=${body}" ;;
+    *) die "dispatch failed (HTTP ${http_code}). body=${body}" ;;
+  esac
+
+  local status
+  status="$(printf '%s' "${body}" | jq -r '.status // empty')"
+  if [ "${status}" != "accepted" ]; then
+    die "dispatch did not return an async handle. Server replied: ${body}"
+  fi
+
+  local resultp
+  resultp="$(result_path "${session_id}")"
+  jq -n --arg sid "${session_id}" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg rp "${resultp}" \
+        '{sessionId:$sid, dispatchedAt:$at, status:"pending", resultPath:$rp}' \
+    >"${record}"
+
+  echo "dispatched ${session_id}"
+  echo "record: ${record}"
+}
+
+cmd_check() {
+  [ $# -eq 1 ] || usage
+  local session_id="$1"
+  local record
+  record="$(record_path "${session_id}")"
+  [ -f "${record}" ] || { echo "moca: no record for ${session_id} at ${record}" >&2; exit 3; }
+
+  local response http_code
+  response="$(curl -sS -w '\n%{http_code}' \
+    -H "Host: ${HOST_HEADER}" \
+    "${BASE_URL}/runs/status?sessionId=${session_id}")" \
+    || die "curl failed talking to ${BASE_URL}/runs/status"
+  http_code="$(printf '%s' "${response}" | tail -1)"
+  local body
+  body="$(printf '%s' "${response}" | sed '$d')"
+
+  if [ "${http_code}" = "404" ]; then
+    # Leaf lost
+    local resultp
+    resultp="$(jq -r '.resultPath' <"${record}")"
+    printf '%s' "${body}" >"${resultp}"
+    jq '.status = "failed"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+    echo "status=failed (HTTP 404; result aged out or never scheduled)"
+    exit 0
+  fi
+
+  if [ "${http_code}" != "200" ]; then
+    die "status check failed (HTTP ${http_code}). body=${body}"
+  fi
+
+  local status
+  status="$(printf '%s' "${body}" | jq -r '.status // "unknown"')"
+
+  case "${status}" in
+    responded|done|solved)
+      local resultp
+      resultp="$(jq -r '.resultPath' <"${record}")"
+      printf '%s' "${body}" >"${resultp}"
+      jq '.status = "done"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+      echo "status=done"
+      echo "result: ${resultp}"
+      # Print the leaf's text answer to stdout for the caller to consume.
+      printf '%s' "${body}" | jq -r '.text // .verdict // ""'
+      ;;
+    failed|aborted|paused)
+      local resultp
+      resultp="$(jq -r '.resultPath' <"${record}")"
+      printf '%s' "${body}" >"${resultp}"
+      jq '.status = "failed"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+      echo "status=${status}"
+      echo "reason: $(printf '%s' "${body}" | jq -r '.reason // "unknown"')"
+      ;;
+    *)
+      # pending / running / unknown — leave record as-is
+      echo "status=${status} (still running; try again later)"
+      ;;
+  esac
+}
+
+cmd_list() {
+  [ -d "${RUNS_DIR}" ] || { echo "(no ${RUNS_DIR} yet)"; return 0; }
+  local any=0
+  for rec in "${RUNS_DIR}"/*.json; do
+    [ -f "${rec}" ] || continue
+    # Skip result files
+    case "${rec}" in *.result.json) continue;; esac
+    any=1
+    local sid status
+    sid="$(jq -r '.sessionId' <"${rec}" 2>/dev/null || echo '?')"
+    status="$(jq -r '.status' <"${rec}" 2>/dev/null || echo '?')"
+    printf '%s\t%s\n' "${status}" "${sid}"
+  done
+  [ "${any}" -eq 0 ] && echo "(no run records)"
+  return 0
+}
+
+[ $# -ge 1 ] || usage
+sub="$1"; shift
+case "${sub}" in
+  start) cmd_start "$@" ;;
+  check) cmd_check "$@" ;;
+  list)  cmd_list "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac
