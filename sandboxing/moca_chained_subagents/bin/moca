@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# moca — thin CLI wrapper around the MOCA serverless-harness HTTP API.
+#
+# Three subcommands:
+#   moca start <session-id> <prompt-file>   dispatch a leaf, write a run record
+#   moca check <session-id>                 collect a leaf's result when done
+#   moca list                               show pending run records
+#
+# Dispatch uses MOCA's SYNCHRONOUS run path: POST /runs with no `async` field
+# blocks until the leaf finishes and returns the answer in the same response.
+# MOCA's async path (`async:true` + polling /runs/status) is not used here.
+#
+# To keep the operator's turn non-blocking while still using the sync path,
+# `moca start` DETACH-EXECUTES: it forks a background worker (nohup, redirected,
+# disowned) that owns the blocking HTTP call and writes the response to the
+# record's .result.json when it returns. `moca start` itself returns as soon as
+# the worker is forked. The worker is not in Claude's process group, so quitting
+# Claude Code does not kill it and the leaf still completes.
+#
+# Two independent reasons the result survives:
+#   1. The detached worker outlives the Claude session and writes .result.json.
+#   2. MOCA awaits its Redis result write BEFORE writing the sync HTTP response,
+#      so even if the worker is killed (or Knative's 300s request timeout cuts
+#      the connection), GET /runs/status?sessionId=... still returns the result.
+# `moca check` prefers (1) and falls back to (2).
+#
+# Reads base URL, host header, and the run-records dir from MOCA.md in the
+# current directory (written by setup.sh). Writes/reads run records in
+# .moca-runs/.
+#
+# Exit codes:
+#   0  success (dispatch forked; or check reports current state)
+#   1  usage error / missing deps
+#   2  MOCA not reachable or returned an error (details on stderr)
+#   3  run record not found (for check)
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<EOF
+usage:
+  moca start <session-id> <prompt-file>
+  moca check <session-id>
+  moca list
+  moca __exec <session-id> <prompt-file>   (internal: detached worker body)
+
+<session-id> is of the form "<run-id>.<leaf-label>" (e.g. "r1.diagnose").
+MOCA accepts only alphanumerics, '-', '_' and '.' in a session id, and it
+must start and end alphanumeric — a '/' is rejected server-side.
+<prompt-file> is a path to a file containing the leaf prompt text.
+
+Reads base URL / host header from ./MOCA.md. Writes run records to ./.moca-runs/.
+EOF
+  exit 1
+}
+
+die() { echo "moca: $*" >&2; exit 2; }
+
+for bin in curl jq; do
+  command -v "${bin}" >/dev/null 2>&1 || { echo "moca: missing required binary: ${bin}" >&2; exit 1; }
+done
+
+read_moca_md() {
+  local key="$1"
+  local file="${MOCA_MD:-MOCA.md}"
+  [ -f "${file}" ] || die "cannot find ${file} in $(pwd). Run from the scratch dir."
+  # Lines look like "Base URL:      http://localhost:8080"
+  grep -E "^${key}:[[:space:]]" "${file}" | sed -E "s/^${key}:[[:space:]]+//" | head -1
+}
+
+BASE_URL="${MOCA_BASE:-$(read_moca_md 'Base URL' || true)}"
+HOST_HEADER="${MOCA_HOST:-$(read_moca_md 'Host header' || true)}"
+RUNS_DIR="${MOCA_RUNS_DIR:-.moca-runs}"
+
+[ -n "${BASE_URL}" ]    || die "could not resolve base URL (set MOCA_BASE or add 'Base URL:' to MOCA.md)"
+[ -n "${HOST_HEADER}" ] || die "could not resolve host header (set MOCA_HOST or add 'Host header:' to MOCA.md)"
+
+record_path() {
+  local session_id="$1"
+  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').json"
+}
+
+result_path() {
+  local session_id="$1"
+  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').result.json"
+}
+
+log_path() {
+  local session_id="$1"
+  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').log"
+}
+
+# Max wall time the detached worker gives the blocking sync call. Knative's
+# own timeoutSeconds (300 by default) will usually cut the connection first;
+# this is just a backstop so a worker can never hang forever. Exceeding it
+# does not lose the result — MOCA has already persisted it, and `moca check`
+# falls back to /runs/status.
+MOCA_MAX_TIME="${MOCA_MAX_TIME:-900}"
+
+# MOCA rejects a session id that isn't alphanumerics plus '-', '_', '.' with
+# alphanumeric ends. Catch it locally: a server-side rejection still consumes
+# the leaf label (the record is written before the worker forks), which then
+# forces a rename on retry. Failing here keeps the label reusable.
+validate_session_id() {
+  local session_id="$1"
+  if ! printf '%s' "${session_id}" \
+      | grep -qE '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'; then
+    die "invalid session id '${session_id}'. MOCA allows alphanumerics, '-', '_', '.' and requires alphanumeric first/last characters. Use '<run-id>.<leaf-label>' (e.g. r1.diagnose) — '/' is not allowed."
+  fi
+}
+
+cmd_start() {
+  [ $# -eq 2 ] || usage
+  local session_id="$1"
+  local prompt_file="$2"
+  validate_session_id "${session_id}"
+  [ -f "${prompt_file}" ] || die "prompt file not found: ${prompt_file}"
+
+  mkdir -p "${RUNS_DIR}"
+  local record resultp logp
+  record="$(record_path "${session_id}")"
+  resultp="$(result_path "${session_id}")"
+  logp="$(log_path "${session_id}")"
+  if [ -f "${record}" ]; then
+    local existing_status
+    existing_status="$(jq -r '.status' <"${record}" 2>/dev/null || echo "unknown")"
+    die "record already exists for ${session_id} (status=${existing_status}): ${record}"
+  fi
+
+  # Resolve this script's own path so the detached worker can re-enter it even
+  # if the parent shell's PATH or cwd is gone.
+  local self
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  # Write the record BEFORE forking, so a record always exists on disk even if
+  # the fork or the machine dies immediately after. `moca list` can then show it.
+  jq -n --arg sid "${session_id}" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg rp "${resultp}" \
+        --arg lp "${logp}" \
+        '{sessionId:$sid, dispatchedAt:$at, status:"pending", mode:"sync-detached",
+          resultPath:$rp, logPath:$lp}' \
+    >"${record}"
+
+  # Detach-execute. nohup + full redirection + & + disown takes the worker out
+  # of this shell's job table and makes it immune to the SIGHUP that arrives
+  # when Claude Code's Bash tool tears down the session. setsid would be
+  # tidier but is not present on macOS.
+  MOCA_BASE="${BASE_URL}" \
+  MOCA_HOST="${HOST_HEADER}" \
+  MOCA_RUNS_DIR="${RUNS_DIR}" \
+  MOCA_MAX_TIME="${MOCA_MAX_TIME}" \
+  nohup "${self}" __exec "${session_id}" "${prompt_file}" \
+    >"${logp}" 2>&1 </dev/null &
+  local worker_pid=$!
+  disown "${worker_pid}" 2>/dev/null || true
+
+  # Record the pid so `check` can tell "worker still alive" from "worker died".
+  jq --arg pid "${worker_pid}" '.workerPid = ($pid|tonumber)' \
+    "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+
+  echo "dispatched ${session_id} (sync turn, detached pid ${worker_pid})"
+  echo "record: ${record}"
+}
+
+# Internal: the detached worker body. Owns the blocking sync POST /runs and
+# writes whatever came back to the result file. Never called by the skill.
+cmd_exec() {
+  [ $# -eq 2 ] || usage
+  local session_id="$1"
+  local prompt_file="$2"
+  local record resultp
+  record="$(record_path "${session_id}")"
+  resultp="$(result_path "${session_id}")"
+
+  local body
+  body="$(jq -n --arg sid "${session_id}" --rawfile p "${prompt_file}" \
+    '{sessionId:$sid, kind:"prompt", prompt:$p}')"
+
+  # The blocking call. No `async` field => MOCA runs the leaf and returns the
+  # answer inline. This is the call that outlives the Claude session.
+  local response http_code curl_rc=0
+  response="$(curl -sS -w '\n%{http_code}' \
+    --max-time "${MOCA_MAX_TIME}" \
+    -H "Host: ${HOST_HEADER}" \
+    -H 'content-type: application/json' \
+    -X POST "${BASE_URL}/runs" \
+    -d "${body}")" || curl_rc=$?
+
+  if [ "${curl_rc}" -ne 0 ]; then
+    # Transport died (timeout, proxy hangup, connection reset). The leaf may
+    # still have completed and persisted its result cluster-side, so mark the
+    # record so `check` knows to try /runs/status rather than declaring failure.
+    jq --arg e "curl exited ${curl_rc}" \
+       '.status = "detached" | .transportError = $e' \
+       "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+    echo "moca: transport failed (curl ${curl_rc}); result may still be recoverable via /runs/status" >&2
+    exit 2
+  fi
+
+  http_code="$(printf '%s' "${response}" | tail -1)"
+  body="$(printf '%s' "${response}" | sed '$d')"
+  printf '%s' "${body}" >"${resultp}"
+
+  case "${http_code}" in
+    200)
+      local status
+      status="$(printf '%s' "${body}" | jq -r '.status // "unknown"')"
+      case "${status}" in
+        done|responded|solved)
+          jq '.status = "done"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+          ;;
+        *)
+          # HTTP 200 does NOT mean success here: MOCA returns 200 for
+          # failed/aborted/paused leaves too, with the real outcome in .status.
+          jq --arg s "${status}" '.status = "failed" | .leafStatus = $s' \
+            "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+          ;;
+      esac
+      ;;
+    503)
+      # Saturation. MOCA treats 503 as "retry", not a terminal failure, and
+      # deliberately persists NO result record — so /runs/status would answer
+      # "queued" forever. Mark it distinctly so check can say "retry this".
+      jq --arg c "${http_code}" \
+         '.status = "saturated" | .httpCode = $c' \
+        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+      ;;
+    *)
+      jq --arg c "${http_code}" '.status = "failed" | .httpCode = $c' \
+        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+      ;;
+  esac
+}
+
+# Print a leaf answer out of a result body, trying the sync-response field
+# (.text for a prompt leaf) then the /runs/status and verdict shapes.
+print_answer() {
+  printf '%s' "$1" | jq -r 'if .text then .text
+                            elif .response then .response
+                            elif (.verdict|type) == "string" then .verdict
+                            elif .verdict then (.verdict|tojson)
+                            elif .patch then .patch
+                            else "" end'
+}
+
+worker_alive() {
+  local record="$1"
+  local pid
+  pid="$(jq -r '.workerPid // empty' <"${record}" 2>/dev/null || true)"
+  [ -n "${pid}" ] || return 1
+  kill -0 "${pid}" 2>/dev/null
+}
+
+# Ask MOCA directly whether it holds a result for this session. Used when the
+# local result file is missing or unusable (worker killed, gateway timeout).
+# MOCA persists the leaf result before answering the sync call, so a result is
+# often still here even when our side of the connection broke.
+recover_via_status() {
+  local session_id="$1" record="$2" resultp="$3"
+  local response http_code body status
+
+  response="$(curl -sS -w '\n%{http_code}' \
+    -H "Host: ${HOST_HEADER}" \
+    --get --data-urlencode "sessionId=${session_id}" \
+    "${BASE_URL}/runs/status")" \
+    || die "curl failed talking to ${BASE_URL}/runs/status"
+  http_code="$(printf '%s' "${response}" | tail -1)"
+  body="$(printf '%s' "${response}" | sed '$d')"
+
+  if [ "${http_code}" = "404" ]; then
+    jq '.status = "failed"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+    echo "status=failed (HTTP 404; MOCA holds no result for this sessionId)"
+    return 0
+  fi
+
+  if [ "${http_code}" != "200" ]; then
+    die "status check failed (HTTP ${http_code}). body=${body}"
+  fi
+
+  status="$(printf '%s' "${body}" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
+  case "${status}" in
+    responded|done|solved)
+      printf '%s' "${body}" >"${resultp}"
+      jq '.status = "done" | .recoveredVia = "runs/status"' \
+        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+      echo "status=done (recovered via /runs/status)"
+      echo "result: ${resultp}"
+      print_answer "${body}"
+      ;;
+    failed|aborted|paused)
+      printf '%s' "${body}" >"${resultp}"
+      jq --arg s "${status}" '.status = "failed" | .leafStatus = $s' \
+        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+      echo "status=${status}"
+      echo "reason: $(printf '%s' "${body}" | jq -r '.reason // "unknown"')"
+      ;;
+    queued)
+      # MOCA answers "queued" for three different situations it cannot tell
+      # apart: still running, never recorded, and result aged out. Our own
+      # connection is already broken, so we cannot narrow it further.
+      jq '.status = "lost"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+      echo "status=lost (MOCA reports 'queued' and holds no result)"
+      echo "MOCA returns 'queued' for a run still executing, one it never"
+      echo "recorded, and one whose result aged out — it cannot distinguish"
+      echo "them. If the leaf may still be running, re-check shortly."
+      echo "Otherwise re-dispatch under a NEW leaf label."
+      ;;
+    *)
+      echo "status=${status} (still running cluster-side; try again later)"
+      ;;
+  esac
+}
+
+cmd_check() {
+  [ $# -eq 1 ] || usage
+  local session_id="$1"
+  local record resultp
+  record="$(record_path "${session_id}")"
+  [ -f "${record}" ] || { echo "moca: no record for ${session_id} at ${record}" >&2; exit 3; }
+  resultp="$(jq -r '.resultPath' <"${record}")"
+
+  # Saturation is retryable, not terminal, and leaves no cluster-side record.
+  if [ "$(jq -r '.status // ""' <"${record}")" = "saturated" ]; then
+    echo "status=saturated (MOCA's sandbox pool was full; HTTP 503)"
+    echo "This is retryable and nothing ran. MOCA holds no result for it."
+    echo "Re-dispatch under a new leaf label when the pool has capacity."
+    return 0
+  fi
+
+  # 1. The detached worker's own result file is the primary source — it holds
+  #    the sync response body verbatim.
+  if [ -s "${resultp}" ]; then
+    local body status
+    body="$(cat "${resultp}")"
+
+    # The body is not guaranteed to be JSON: a Knative/Kourier timeout returns
+    # a plain-text 5xx ("activator request timeout") that never reached MOCA.
+    # Treat a non-JSON body as a gateway-level failure and try to recover the
+    # result cluster-side rather than letting jq spew parse errors.
+    if ! printf '%s' "${body}" | jq -e . >/dev/null 2>&1; then
+      echo "status=gateway-error (non-JSON response; the request did not complete through Kourier)"
+      echo "result: ${resultp}"
+      echo "body: ${body}"
+      echo "http: $(jq -r '.httpCode // "?"' <"${record}")"
+      echo "Falling back to /runs/status to see if the leaf finished anyway..."
+      recover_via_status "${session_id}" "${record}" "${resultp}"
+      return 0
+    fi
+
+    status="$(printf '%s' "${body}" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
+    case "${status}" in
+      done|responded|solved)
+        echo "status=done"
+        echo "result: ${resultp}"
+        print_answer "${body}"
+        return 0
+        ;;
+      paused)
+        echo "status=paused (leaf hit an approval gate)"
+        echo "result: ${resultp}"
+        echo "gate: $(printf '%s' "${body}" | jq -r '.gate.summary // "unknown"')"
+        return 0
+        ;;
+      *)
+        echo "status=failed (leaf reported ${status})"
+        echo "result: ${resultp}"
+        # `message` carries the underlying error and is only present on the
+        # sync response — /runs/status drops it.
+        echo "reason: $(printf '%s' "${body}" | jq -r '.reason // .error // "unknown"')"
+        local msg
+        msg="$(printf '%s' "${body}" | jq -r '.message // empty')"
+        [ -n "${msg}" ] && echo "message: ${msg}"
+        return 0
+        ;;
+    esac
+  fi
+
+  # 2. No result file yet. If the detached worker is still alive, the sync call
+  #    is simply still in flight.
+  if worker_alive "${record}"; then
+    echo "status=running (detached worker $(jq -r '.workerPid' <"${record}") still holding the sync call)"
+    return 0
+  fi
+
+  # 3. Worker is gone with no result file: it was killed, or the transport died.
+  #    MOCA persists the leaf result before answering the sync call, so the
+  #    result is very likely still retrievable cluster-side.
+  echo "status=unknown locally (no result file, worker not running); falling back to /runs/status" >&2
+  recover_via_status "${session_id}" "${record}" "${resultp}"
+}
+
+cmd_list() {
+  [ -d "${RUNS_DIR}" ] || { echo "(no ${RUNS_DIR} yet)"; return 0; }
+  local any=0
+  for rec in "${RUNS_DIR}"/*.json; do
+    [ -f "${rec}" ] || continue
+    # Skip result files
+    case "${rec}" in *.result.json) continue;; esac
+    any=1
+    local sid status note
+    sid="$(jq -r '.sessionId' <"${rec}" 2>/dev/null || echo '?')"
+    status="$(jq -r '.status' <"${rec}" 2>/dev/null || echo '?')"
+    note=""
+    # A record left "pending" by an earlier session is only genuinely in flight
+    # if its detached worker is still running; otherwise `check` must go to
+    # /runs/status to recover it.
+    if [ "${status}" = "pending" ]; then
+      if worker_alive "${rec}"; then
+        note="	(worker alive)"
+      else
+        note="	(worker gone — check to recover)"
+      fi
+    fi
+    printf '%s\t%s%s\n' "${status}" "${sid}" "${note}"
+  done
+  [ "${any}" -eq 0 ] && echo "(no run records)"
+  return 0
+}
+
+[ $# -ge 1 ] || usage
+sub="$1"; shift
+case "${sub}" in
+  start) cmd_start "$@" ;;
+  check) cmd_check "$@" ;;
+  list)  cmd_list "$@" ;;
+  __exec) cmd_exec "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac

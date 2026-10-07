@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "deny": [
+      "Task"
+    ],
+    "allow": [
+      "Bash(moca start*)",
+      "Bash(moca check*)",
+      "Bash(moca list*)",
+      "Bash(jq*)"
+    ]
+  }
+}

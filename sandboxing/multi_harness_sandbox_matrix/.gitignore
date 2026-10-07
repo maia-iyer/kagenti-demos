@@ -1,0 +1,18 @@
+# run/ is the single working area for the matrix: built binaries, per-run
+# scratch workspaces, result rows, and logs. All generated, none committed.
+# The .gitkeep files below are committed so the layout is visible in a fresh
+# clone without anyone having to run setup.sh to discover it.
+run/*
+!run/.gitkeep
+!run/bin/
+run/bin/*
+!run/bin/.gitkeep
+!run/workspaces/
+run/workspaces/*
+!run/workspaces/.gitkeep
+!run/results/
+run/results/*
+!run/results/.gitkeep
+!run/logs/
+run/logs/*
+!run/logs/.gitkeep
