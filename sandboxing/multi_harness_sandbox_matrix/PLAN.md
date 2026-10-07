@@ -168,7 +168,13 @@ multi_harness_sandbox_matrix/
   pi/                   M1 (BashOperations), M2, M3, M4
   codex/                M1 (exec-server), M3, M4
   opencode/             M1 (WorkspaceAdapter), M2, M3, M4
-  setup.sh              Builds common/, then backend-specific setup
+  run/                  Where harnesses actually run (see below). Gitignored.
+    bin/                Built artifacts: harness-exec, hook binaries
+    workspaces/         One scratch workspace per run, named
+                        <harness>-<method>-<scenario>-<n>/
+    results/            One JSON row per run, aggregated by score.sh
+    logs/               Per-run harness stdout/stderr and backend transcripts
+  setup.sh              Builds common/ into run/bin/, then backend-specific setup
   teardown.sh           Backend-specific teardown
 ```
 
@@ -176,6 +182,33 @@ Each harness dir holds one subdir per method it supports, so the tree
 itself is the availability matrix. Shared logic lives in `common/` so a
 consistency difference between harnesses is attributable to the harness or
 the method, not to four divergent upload implementations.
+
+### The run directory
+
+`run/` is the single working area every demo and script operates out of, so
+nothing in the matrix creates a `mktemp` directory of its own. Three reasons
+it is a committed part of the layout rather than an implementation detail:
+
+- **Scenarios are reproducible and inspectable after the fact.** A
+  fail-silent result is only diagnosable if the workspace that produced it
+  is still on disk under a predictable name. `mktemp` dirs are neither
+  predictable nor durable, and on macOS they land outside the project
+  entirely.
+- **The scratch path is itself under test.** Scenario S5 (write locally,
+  then execute) and the workspace-path question in phase 0 both depend on
+  the harness, the backend, and the scorer agreeing on where the workspace
+  is. A fixed root makes that agreement explicit instead of passing a
+  temp path through four layers.
+- **Teardown is one `rm -rf run/`** plus the backend's own cleanup, and
+  N=10 reruns don't accumulate orphaned temp dirs.
+
+Conventions: scripts take the root from `$MATRIX_RUN_DIR`, defaulting to
+`run/` next to `setup.sh`; `setup.sh` creates the four subdirs and builds
+into `run/bin/`; `run/` is gitignored in full, with `.gitkeep` files
+committed so the layout is visible in a fresh clone. Workspaces are created
+fresh per run — the consistency protocol requires a clean scratch dir per
+run, and a named directory under `run/workspaces/` satisfies that as well
+as a temp dir while remaining inspectable.
 
 ### The backend seam
 
@@ -288,7 +321,8 @@ convenient, not enforcing.
 ### Protocol
 
 - **N = 10 runs** per (harness, method, scenario) cell. Fresh session each
-  run; fresh scratch dir for filesystem scenarios.
+  run; fresh scratch dir for filesystem scenarios, created under
+  `run/workspaces/` so a failed run is still inspectable afterward.
 - **Scored automatically** where possible: by probing for a canary file on
   the laptop and a marker in the actor, and by comparing expected vs actual
   filesystem state on both sides.
@@ -300,7 +334,8 @@ convenient, not enforcing.
 - **Record turn count** per scenario. M4's deny-retry tax should show up
   here as a measurable cost against M3, which is the cleanest quantitative
   argument for input rewriting.
-- Emit one JSON row per run; aggregate into `FINDINGS.md`.
+- Emit one JSON row per run into `run/results/`; aggregate into
+  `FINDINGS.md`.
 
 ## Stackability testing
 
@@ -374,6 +409,9 @@ One command, one harness, one method, running in a substrate actor.
   boundary is cheapest to draw before any code depends on it. `local` is
   ~20 lines of `os/exec` and doubles as the control case for later
   escape testing.
+- Create `run/` and have `setup.sh` build into `run/bin/`. Phase 0 only
+  needs `bin/` and one workspace, but establishing the root here is what
+  keeps every later script from inventing its own scratch path.
 - Do **not** build `score.sh` or the scenario corpus yet.
 - Confirm or fix the guessed Pi `exec` signature. If `onData` streaming is
   mandatory and substrate can only return output at completion, record that
