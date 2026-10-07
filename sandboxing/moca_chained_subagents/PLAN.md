@@ -19,25 +19,50 @@ exercises subagents on serverless.
 ### Parent orchestrates the chain, not MOCA
 
 MOCA has no "on complete, trigger X" primitive. The parent Claude
-session is the orchestrator: it starts leaves, polls their status
-later, embeds completed outputs into subsequent leaves' prompts, and
-surfaces final results to the operator.
+session is the orchestrator: it starts leaves, collects their results
+on a later turn, embeds completed outputs into subsequent leaves'
+prompts, and surfaces final results to the operator.
 
-### Async dispatch, not sync
+### Detached sync dispatch, not the async queue
 
-Dispatch uses `POST /runs` + `GET /runs/status?sessionId=…` rather
-than a blocking sync `/runs` call. Reasons:
+Dispatch uses the **synchronous** `POST /runs` path — no `async`
+field — so MOCA runs the leaf and returns the answer in the same
+response. MOCA's async queue (`async:true` + polling
+`GET /runs/status`) is **not** used as the dispatch mechanism.
 
-- The operator can quit Claude between dispatch and collection. The
-  leaf runs to completion on the cluster regardless, and a resumed
-  Claude session reconstructs state from disk.
-- Long-running leaves don't tie up the Claude session.
-- The handle-and-poll shape is honest about what's happening: work
-  lives cluster-side, not inside the HTTP connection.
+A blocking call would normally pin the operator's turn open and die
+with the session, which is exactly what we don't want. So
+`moca start` **detach-executes**: it forks a background worker
+(`nohup`, fully redirected, disowned) that owns the blocking call and
+writes the response to disk when it returns. `moca start` returns as
+soon as the worker is forked.
 
-Trade-off: async is only available on unauthenticated MOCA
-deployments. If the install has auth on, the skill surfaces 401/403
-and stops rather than papering over it with a sync fallback.
+Why this beats the async queue here:
+
+- **It works on authenticated deployments.** MOCA rejects
+  `async:true` with 501 whenever a token is presented, so the async
+  path is structurally limited to unauthenticated installs. The sync
+  path has no such restriction.
+- **It keeps the pause/resume property anyway.** The worker sits
+  outside Claude Code's process group, so quitting Claude doesn't
+  kill it and the leaf still completes.
+- **It needs no KEDA ScaledJob.** The async queue requires the
+  `leaf-worker` ScaledJob to drain Redis; the sync path runs the agent
+  in the Knative harness revision itself. One less moving part that
+  can silently not be installed.
+
+Two independent mechanisms protect the result:
+
+1. The detached worker outlives the Claude session and writes
+   `.result.json`.
+2. MOCA persists each leaf's result cluster-side **before** writing
+   the sync response, so even if the worker is killed — or Knative's
+   300s request timeout cuts the connection — the result is
+   recoverable via `GET /runs/status` for 24h.
+
+So `/runs/status` is still used, but only as a **recovery fallback**,
+never as the primary collection path. `moca check` prefers (1) and
+falls back to (2).
 
 Run state is held in `.moca-runs/<run-id>-<leaf-label>.json` inside
 the scratch dir. One record per dispatched leaf; completed results
@@ -45,32 +70,51 @@ land in a sibling `.result.json` file. The scratch dir **is** the
 resumable state — no `$HOME` lookups, no Claude Code session-id
 tricks.
 
-### Fixture lives in-repo, mounted via a PVC
+### Session ids use `.`, not `/`
+
+MOCA validates `sessionId` as alphanumerics plus `-`, `_`, `.` with
+alphanumeric first/last characters. The natural-looking
+`<run-id>/<leaf-label>` is therefore rejected at the API boundary
+before any work starts, so the scheme is `<run-id>.<leaf-label>`
+(e.g. `review-123.diagnose`). The CLI validates the same rule locally
+so an illegal id fails at `start` without consuming the leaf label.
+
+### Fixture seeded directly into the sandbox pool
 
 MOCA accepts `repoUrl`+`ref` to git-fetch inside the sandbox, but that
-makes the fixture external to this directory and — more importantly —
-precludes mounting it `readOnly: true`, which is the one piece of
-substrate-enforced isolation the demo exists to show. Instead,
-`setup.sh` provisions a PVC in the MOCA namespace, copies
-`example_repo/` into it via a short-lived loader pod, and mounts that
-PVC into every leaf.
+makes the fixture external to this directory. Instead, `setup.sh`
+copies `example_repo/` into **every** pool-labeled sandbox pod at
+`/workspace/<run-id>/repo` via `kubectl cp`.
 
-The provisioning is factored through `lib/ctx.sh` — a thin
-`kubectl`-only shim whose functions mirror the `contextctl` verbs that
-would otherwise do this (`ctx create`, `ctx artifact publish`,
-`ctx sync push`, `ctx get`, `ctx delete`). Rationale: the demo should
-work on any MOCA-equipped cluster without a Context Service install,
-but the design still points at Context Service as the eventual host.
-Swapping back is a function-body change, not a restructure.
+Every pod in the pool needs the fixture because a leaf leases an
+arbitrary pool pod — the demo can't predict which one it lands on.
 
-### Two workloads, not one
+An earlier iteration provisioned a PVC through `lib/ctx.sh` (a
+`kubectl`-only shim mirroring `contextctl` verbs) so the workspace
+could be mounted `readOnly: true`. That approach is retired: this
+MOCA install exposes no per-run mount-posture controls, so the PVC
+bought nothing the pool seeding doesn't. `lib/ctx.sh` remains in the
+tree as a leftover and is **not** sourced by the current `setup.sh`.
 
-- `workload-a` mounts the PVC `readOnly: true` for the researcher.
-- `workload-b` mounts the same PVC `readOnly: false` for the fixer.
+### One dispatch path, no workload catalog
 
-Alternative considered: a single read-only workload with an in-sandbox
-copy-to-scratch step for B. Rejected as fallback-only — two workloads is
-cleaner and matches MOCA's native `workspace.readOnly` field.
+An earlier design used two pre-registered workloads — one mounting
+the workspace `readOnly: true` for the researcher, one `readOnly:
+false` for the fixer — to make the capability split
+substrate-enforced.
+
+That is not available on this install. `moca start` sends
+`kind:"prompt"` with no `workload`, no `workspaceRef`, and no
+per-run `readOnly` flag, and there is no `/workloads` endpoint to
+register posture-specific workloads against. So the
+researcher-vs-fixer split is **prompt-only** here: it lives in the
+leaf prompt text ("do not modify files" vs "apply this fix"), and a
+non-compliant leaf could ignore it.
+
+This is a real reduction in what the demo proves, and the README says
+so plainly rather than implying enforcement. Restoring
+substrate-enforced read-only mounts needs an upstream MOCA surface for
+per-run mount posture.
 
 ### Vendored stand-in library, not a real npm package
 
@@ -86,14 +130,17 @@ The fix B applies is a one-line rename in `src/index.js`. Tests pass.
 A single `SKILL.md` tells Claude:
 
 - `Task` is denied; the only subagent path is this skill.
-- Workloads are already provisioned by setup; do not call `/workloads`.
-- Three procedures: **start a leaf** (`POST /runs` + write record),
-  **check a leaf** (`GET /runs/status` + write result + update
-  record), **list pending runs** (read `.moca-runs/`).
-- Which workloads exist in this scratch dir and their mount posture.
-- Prompt-authoring guidance for leaves (state the mount posture, pass
+- There is no workload catalog on this install; dispatch takes no
+  workload argument and posture rules go in the prompt text.
+- Three procedures: **start a leaf** (`moca start` — writes a record
+  and forks the detached worker), **check a leaf** (`moca check` —
+  reads the worker's `.result.json`, falling back to `/runs/status`
+  only if the worker was lost), **list pending runs** (`moca list`).
+- Prompt-authoring guidance for leaves (state the workspace path, pass
   forward context from earlier leaves verbatim, describe the
   deliverable).
+- That `moca start` must not be wrapped in anything that waits on it,
+  and `moca check` must not be run in a polling loop.
 - How to sequence leaves if the operator asks for a chain.
 
 The skill does **not** prescribe how many leaves to run, in what
@@ -105,68 +152,97 @@ three-leaf fan-out, or anything else the operator asks for. The
 README's "Run a session" section carries example operator prompts as
 illustration, not as part of the skill contract.
 
-### Settings deny `Task`, allow only `/runs` curls
+### Settings deny `Task`, allow only the `moca` CLI
 
 `settings.json.example`:
 
 - `permissions.deny`: `Task` — forces the skill path.
-- `permissions.allow`: prefix-matched `curl` to `POST /runs` and
-  `GET /runs/status` on `localhost:8080`, plus `jq` for parsing.
-  Scoped as tightly as the Claude Code allow-rule schema supports.
+- `permissions.allow`: `Bash(moca start*)`, `Bash(moca check*)`,
+  `Bash(moca list*)`, plus `jq` for parsing.
+
+Routing through a small CLI rather than raw `curl` is deliberate: the
+permission prompt reads `moca start review-123.diagnose <file>`
+instead of a many-flag `curl` line, which makes it legible as "this
+is going to MOCA, not running locally" — the operator's visual
+confirmation at the moment of dispatch. It also guarantees the
+on-disk record shape a resumed session depends on, and gives the
+detached-worker fork somewhere to live.
 
 Local file ops on `.moca-runs/` go through Claude's Read/Write/Edit
 tools and don't need extra permissions.
 
-No hooks. No custom binary. The whole substrate on the operator side
-is: skill + settings + a running port-forward.
+No hooks. The operator-side substrate is: skill + settings + the
+`moca` CLI + a running port-forward.
 
 ## Scope limits (what's honest)
 
-- **A's read-only workspace is substrate-enforced** — the PVC is
-  mounted `readOnly: true`. Writes physically fail. Verifiable with
-  `kubectl exec`.
-- **A's "no exec / no network" is prompt-only.** MOCA gives every leaf
-  the same seven tools (`read, write, edit, ls, find, bash, grep`),
-  there's no per-leaf `tools` allowlist on `LeafEnvelope`, and there is
-  no web-fetch tool anywhere in MOCA. A non-compliant A could run
-  `bash`. Honest capability splits need upstream MOCA changes.
-- **B needs a writable workspace** — hence `workload-b`. There is no
-  way to give B exec and deny A exec within one workload today.
+- **Isolation is prompt-only, not substrate-enforced.** There is no
+  per-run read-only mount on this install, so the researcher and the
+  fixer get identical substrate posture. "Do not modify files" is a
+  sentence in a prompt, not a mount flag. This is the biggest honesty
+  gap in the demo and the README states it directly.
+- **A's "no exec / no network" is prompt-only too.** MOCA gives every
+  leaf the same seven tools (`read, write, edit, ls, find, bash,
+  grep`), there's no per-leaf `tools` allowlist on `LeafEnvelope`, and
+  there is no web-fetch tool anywhere in MOCA. A non-compliant
+  researcher could run `bash`. Honest capability splits need upstream
+  MOCA changes.
+- **Leaves share sandbox pods.** The pool is shared and the fixture is
+  seeded per-run-id, so two concurrent runs are separated by path, not
+  by a boundary. Fine for a single-operator demo; not a security
+  claim.
+- **What the demo does prove:** the parent never runs the subagent's
+  work locally (`Task` is denied and dispatch is visible in the
+  permission prompt), the work executes on cluster-side infrastructure
+  that scales to zero, and the chain survives the operator quitting
+  Claude mid-run.
 
 ## Verification arc (what the README walks through)
 
 1. MOCA up on kind; port-forward live.
-2. `./setup.sh` provisions the PVC, pushes `example_repo/`, creates
-   workloads A and B, stages scratch (including `.moca-runs/`).
+2. `./setup.sh` seeds `example_repo/` into every pool sandbox pod and
+   stages scratch (settings, skill, `bin/moca`, `.moca-runs/`,
+   `MOCA.md`).
 3. Operator runs Claude from scratch, pastes the "dispatch a
    diagnosis subagent" prompt.
 4. Claude reads the skill, does **not** invoke `Task` (deny fires if
    it tries).
-5. Permission prompt shows the full `POST /runs` curl targeting
-   `workload-a` — visual proof the leaf is being dispatched to MOCA.
-6. Claude writes a record to `.moca-runs/` and returns control. The
-   leaf is now running on the cluster.
+5. Permission prompt shows `moca start review-<ts>.diagnose <file>` —
+   short, legible, and clearly not a local shell execution.
+6. Claude writes a record to `.moca-runs/`, forks the detached worker,
+   reports the session id, and returns control. The leaf is now
+   running on the cluster.
 7. **Operator Ctrl-C's Claude** (optional but worth demonstrating).
-   `kubectl get pods -n moca-system` shows the leaf still running.
-8. Operator restarts Claude from the scratch dir, says "check on
-   that subagent". Claude polls `/runs/status`, writes the result,
-   surfaces the diagnosis.
-9. Operator pastes "dispatch a fixer against the read-write workload"
-   prompt. Second leaf starts.
-10. Operator asks for the result; Claude polls and surfaces the diff
-    and test outcome.
-11. Operator sees cold-start-and-drop-to-zero leaf pods in
-    `kubectl get pods -n moca-system`.
-12. Side check: `kubectl exec` into a workload-a leaf while it's
-    live, `touch /workspace/x` → read-only filesystem error.
+   The detached worker keeps holding the call; the leaf keeps running.
+8. Operator restarts Claude from the scratch dir, says "check on that
+   subagent". `moca list` shows the pending record, `moca check` reads
+   the worker's `.result.json`, Claude surfaces the diagnosis.
+9. Operator pastes the "dispatch a fixer with that diagnosis" prompt.
+   Claude embeds the diagnosis verbatim in leaf 2's prompt and starts
+   it.
+10. Operator asks for the result; Claude surfaces the diff and test
+    outcome.
+11. `kubectl -n default get pods -w` shows the
+    `serverless-harness-*` revision cold-starting on dispatch and
+    scaling back to zero when idle. (No `leaf-worker-*` pods — those
+    belong to the async queue this demo doesn't use.)
+12. Side check: the fix landed on a sandbox pod, not locally —
+    `kubectl -n default exec sandbox-0 -- cat
+    /workspace/<run-id>/repo/src/index.js` shows the rename, while the
+    operator's `example_repo/` is untouched.
 
 ## Out of scope
 
-- Standing up MOCA or Context Service — prerequisites, documented in
-  README.
+- Standing up MOCA — prerequisite, documented in README.
+- Substrate-enforced read-only workspaces — needs a per-run mount
+  posture surface upstream. Prompt-only for now.
 - Per-leaf tool allowlists on `LeafEnvelope` — upstream MOCA change.
 - Web-fetch tool for the researcher — upstream MOCA change.
 - Fan-out beyond A → B — single-chain is the whole demo.
-- Graceful fallback from async to sync when MOCA has auth enabled —
-  the skill surfaces 401/403 and stops. Supporting both modes would
-  roughly double the skill and bury the main thread.
+- Using MOCA's async queue — the detached sync path gives the same
+  pause/resume property, works on authenticated installs, and needs no
+  KEDA ScaledJob. Supporting both modes would roughly double the skill
+  and bury the main thread.
+- Returning files from the leaf. Only the response text comes back;
+  anything the operator needs to see must be asked for as text in the
+  prompt.

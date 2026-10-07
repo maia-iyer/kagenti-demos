@@ -2,9 +2,8 @@
 # Set up the moca_chained_subagents demo.
 #
 # Assumes MOCA (rossoctl/moca) is already installed on the current kubectl
-# context via its quick-start (deploy/knative/setup-kind.sh), and the KEDA
-# ScaledJob for leaf workers has been applied. This script does the
-# demo-specific setup:
+# context via its quick-start (deploy/knative/setup-kind.sh). This script does
+# the demo-specific setup:
 #   1. Seed example_repo/ into sandbox-0:/workspace/$RUN/repo via kubectl cp.
 #   2. Stage settings and skill into a scratch directory for a Claude session.
 #   3. Record the base URL, Host header, and workspaceRef the skill needs.
@@ -20,7 +19,6 @@ MOCA_PORT="${MOCA_PORT:-8080}"
 MOCA_BASE="${MOCA_BASE:-http://localhost:${MOCA_PORT}}"
 MOCA_HOST="${MOCA_HOST:-serverless-harness.default.example.com}"
 SANDBOX_POOL_SELECTOR="${SANDBOX_POOL_SELECTOR:-sh.kagenti.io/sandbox-pool=default}"
-SCALEDJOB_NAME="${SCALEDJOB_NAME:-leaf-worker}"
 RUN_ID="${RUN_ID:-review-$(date +%s)}"
 WORKSPACE_REF="${WORKSPACE_REF:-/workspace/${RUN_ID}/repo}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
@@ -47,24 +45,22 @@ SANDBOX_PODS="$(kubectl -n "${MOCA_NS}" get pods \
   -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
 if [ -z "${SANDBOX_PODS}" ]; then
   echo "    no Running sandbox pods matched selector '${SANDBOX_POOL_SELECTOR}' in '${MOCA_NS}'." >&2
-  echo "    Leaf workers lease any pool-labeled pod, so every one needs the fixture." >&2
+  echo "    A leaf leases any pool-labeled pod, so every one needs the fixture." >&2
   echo "    Did the MOCA quick-start finish? See:" >&2
   echo "      https://github.com/rossoctl/moca#quick-start" >&2
   exit 1
 fi
 
-if ! kubectl get scaledjob "${SCALEDJOB_NAME}" -n "${MOCA_NS}" >/dev/null 2>&1; then
-  echo "    KEDA ScaledJob '${SCALEDJOB_NAME}' not found." >&2
-  echo "    Apply it from the MOCA repo before continuing:" >&2
-  echo "      kubectl apply -f deploy/knative/leaf-scaledjob.yaml" >&2
-  echo "    (Without it, POST /runs is accepted but no worker ever starts.)" >&2
-  exit 1
-fi
+# NOTE: the KEDA ScaledJob ('leaf-worker') is deliberately NOT checked here.
+# It drains MOCA's async Redis stream, and this demo uses the SYNC run path
+# exclusively. On the sync path the Knative serverless-harness revision runs
+# the agent in-process and execs into a leased sandbox pod directly, so no
+# leaf-worker Job is ever created and the ScaledJob stays ACTIVE=False.
+# Requiring it would be a false prerequisite.
 
 echo "    ok: kubectl, curl, jq on PATH"
 echo "    ok: namespace ${MOCA_NS} exists"
 echo "    ok: sandbox pool pods: ${SANDBOX_PODS}"
-echo "    ok: ScaledJob ${SCALEDJOB_NAME} present"
 
 echo "==> Checking MOCA is reachable at ${MOCA_BASE} (Host: ${MOCA_HOST})..."
 HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
@@ -84,7 +80,7 @@ done
 echo "    ok"
 
 echo "==> Seeding example_repo/ into every pool-labeled sandbox at ${WORKSPACE_REF}..."
-# Every pool-labeled sandbox needs the fixture because the leaf-worker leases
+# Every pool-labeled sandbox needs the fixture because a leaf leases
 # any one of them for a given run — if the lease lands on an unseeded pod, the
 # agent cannot find the repo path and the leaf fails with reason "error".
 for pod in ${SANDBOX_PODS}; do
@@ -135,12 +131,22 @@ in namespace ${MOCA_NS}. Every curl to MOCA must send:
 
   -H "Host: ${MOCA_HOST}"
 
-Dispatch is async: POST ${MOCA_BASE}/runs starts a leaf and returns a handle;
-GET ${MOCA_BASE}/runs/status?sessionId=<id> returns the result when done.
+Dispatch is a DETACHED SYNCHRONOUS turn. POST ${MOCA_BASE}/runs with no
+'async' field blocks until the leaf finishes and returns the answer inline.
+'moca start' forks a detached worker (nohup, disowned) to hold that blocking
+call, so the turn returns immediately and the run survives Claude exiting.
+
+MOCA persists each leaf's result cluster-side BEFORE writing the sync
+response, so GET ${MOCA_BASE}/runs/status?sessionId=<id> can recover a
+result (for 24h) even if the detached worker is killed.
+
 Run records live in .moca-runs/ — see the moca-dispatch skill.
 
-Session-id scheme: "<run-id>/<leaf-label>" (e.g. "${RUN_ID}/diagnose",
-"${RUN_ID}/fix"). Pick <leaf-label> per leaf; it's operator-meaningful.
+Session-id scheme: "<run-id>.<leaf-label>" (e.g. "${RUN_ID}.diagnose",
+"${RUN_ID}.fix"). Pick <leaf-label> per leaf; it's operator-meaningful.
+MOCA validates session ids as alphanumerics plus '-', '_', '.', starting and
+ending alphanumeric — so '.' is the separator and a '/' is REJECTED at the
+API boundary before the leaf runs.
 EOF
 
 echo ""
@@ -156,7 +162,7 @@ echo "  2. Start Claude from the scratch dir:"
 echo ""
 echo "       cd ${SCRATCH_DIR} && claude"
 echo ""
-echo "  3. The demo flow is operator prompts; dispatch is async."
+echo "  3. The demo flow is operator prompts; dispatch is a detached sync turn."
 echo "     Suggested first prompt:"
 echo ""
 echo "       There's a Node.js project seeded at ${WORKSPACE_REF} on MOCA."
@@ -173,6 +179,11 @@ echo ""
 echo "       Good. Dispatch another subagent to apply that fix, run the"
 echo "       tests, and report the diff and outcome. Check on it when it's done."
 echo ""
-echo "  4. Watch leaf-worker pods cold-start:"
+echo "  4. Watch the harness revision cold-start and scale back to zero:"
 echo ""
 echo "       kubectl -n ${MOCA_NS} get pods -w"
+echo ""
+echo "     On the sync path the work runs in the serverless-harness-* pod"
+echo "     (which exec's into a leased sandbox-* pod). Expect that pod to"
+echo "     appear on dispatch and disappear once idle. There are no"
+echo "     leaf-worker-* pods on this path — those belong to the async queue."
