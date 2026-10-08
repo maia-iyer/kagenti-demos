@@ -72,7 +72,6 @@ type Config struct {
 	Actor     string // actor name; required
 	Atespace  string // defaults to "claude-sandbox"
 	Template  string // defaults to "ate-demo-sandbox/sandbox-template"
-	DNSSuffix string // defaults to "actors.resources.substrate.ate.dev"
 	RouterURL string // atenet-router address; defaults to "localhost:8000"
 
 	// WorkspaceDir is where the synced workspace lands actor-side. The
@@ -93,9 +92,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Template == "" {
 		c.Template = "ate-demo-sandbox/sandbox-template"
-	}
-	if c.DNSSuffix == "" {
-		c.DNSSuffix = "actors.resources.substrate.ate.dev"
 	}
 	if c.RouterURL == "" {
 		c.RouterURL = "localhost:8000"
@@ -362,9 +358,14 @@ func (b *Backend) postProcess(ctx context.Context, body map[string]any, timeout 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// Routing is by Host header through atenet-router, mirroring
-	// resources.ActorDNSName upstream.
-	req.Host = fmt.Sprintf("%s.%s.%s", b.cfg.Actor, b.cfg.Atespace, b.cfg.DNSSuffix)
+	// Routing is by the explicit ate-target-actor header, value
+	// "<atespace>/<actor>" -- the same scheme the upstream sandbox demo
+	// client uses. The router formerly derived the actor from a DNS-shaped
+	// Host header; that path was removed upstream ("Move from Host header to
+	// explicit headers for actor and atespace"), and a request that still
+	// relies on it 404s with "invalid actor reference" because nothing reads
+	// the Host header at all.
+	req.Header.Set("ate-target-actor", b.cfg.Atespace+"/"+b.cfg.Actor)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

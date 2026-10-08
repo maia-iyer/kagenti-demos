@@ -28,10 +28,11 @@ which ones are verified by running code versus only read from source.
 ## Status
 
 **Phase 0.** The `Backend` seam exists with two implementations, the Pi M1
-extension is written and contract-tested, and the local leg of the smoke test
-passes. The **substrate leg is unverified** — it needs a running cluster
-(see Prerequisites). Nothing here should be read as
-"M1 works through substrate" yet.
+extension is written and contract-tested, and **both legs of the smoke test
+pass**: `uname -s` returns Darwin through `local` and Linux through
+`substrate` (verified 2026-10-07, after fixing two upstream API breaks
+recorded in `FINDINGS.md` — proto skew in `kubectl-ate`, and the router's
+move from Host-header to explicit `ate-target-actor` header routing).
 
 ## The four redirection methods
 
@@ -128,8 +129,11 @@ Darwin host is unforgeable evidence that the command left the laptop.
 
 ```bash
 HARNESS_BACKEND=substrate HARNESS_WORKSPACE="$PWD" \
-  pi -e multi_harness_sandbox_matrix/pi/m1/index.ts
+  pi -e pi/m1/index.ts
 ```
+
+Run from the matrix root — like every other command in this README. (The
+extension path is relative to where you invoke `pi`, not to the workspace.)
 
 Set `HARNESS_BACKEND=local` to run the same extension with no cluster, which
 is the fastest way to tell an extension bug from a sandbox bug.
@@ -144,7 +148,7 @@ the human does not, and nothing says so.
 ```
 common/
   backend/            the seam: Backend, ExecRequest, ExecResult
-    local/            runs on this machine (control case + escape baseline)
+    local/            runs on the host (control case + escape baseline)
     substrate/        runs in an ate actor (all cluster concepts live here)
   cmd/harness-exec/   the single Go <-> harness boundary
 pi/m1/

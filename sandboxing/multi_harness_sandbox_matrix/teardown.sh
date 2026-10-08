@@ -43,8 +43,14 @@ if [[ $ACTORS -eq 1 ]]; then
     # Only actors this demo creates: smoke-* from smoke.sh and matrix-* from
     # scenario runs. Session actors (sess-*) belong to the Claude Code demo
     # and are left alone.
-    actors="$(kubectl ate get actors -a "${ATESPACE}" -o name 2>/dev/null \
-      | sed 's|.*/||' | grep -E '^(smoke|matrix)-' || true)"
+    #
+    # Listed as JSON rather than `-o name` because the kubectl-ate CLI
+    # removed that output format ("Must be one of: table, json, yaml"); the
+    # old invocation exits nonzero and this block would silently skip
+    # deletion -- the exact fail-silent class this repo exists to catch.
+    actors="$(kubectl ate get actors -a "${ATESPACE}" -o json 2>/dev/null \
+      | grep -o '"name": *"[^"]*"' | sed 's/.*"name": *"\([^"]*\)".*/\1/' \
+      | grep -E '^(smoke|matrix)-' || true)"
     if [[ -z "$actors" ]]; then
       echo "    No matrix actors found."
     else

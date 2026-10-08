@@ -102,8 +102,9 @@ What to look for:
 
 ## What has never been run
 
-The substrate path of this extension (`HARNESS_BACKEND=substrate` in a real
-Pi session) is unverified end-to-end — no cluster was available during
-phase 0. Everything above under "local backend" was exercised via the
-contract tests only; a real model-driven session through either backend is
-still worth a first careful run.
+Everything under "Test it" above has been run through
+`./smoke.sh --backend=substrate` and the contract tests, but **a real
+model-driven Pi session through either backend has not**. The first careful
+run should watch for exactly the things the contract tests cannot cover:
+model-emitted host absolute paths, `!` commands the user types mid-session,
+and behavior when the workspace crosses the upload ceiling mid-conversation.

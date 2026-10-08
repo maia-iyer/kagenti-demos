@@ -17,37 +17,43 @@ that reading source is not the same as running it:
 | Exit criterion | Status |
 | --- | --- |
 | `uname -s` returns Darwin through the `local` backend | ✅ VERIFIED |
-| `uname -s` returns Linux from a substrate actor | ⛔ BLOCKED — no substrate cluster on this machine |
+| `uname -s` returns Linux from a substrate actor | ✅ VERIFIED (2026-10-07) |
 | Pi `BashOperations.exec` signature confirmed or fixed | ✅ VERIFIED — the plan's guess was wrong in four ways |
 | Seven compatibility questions answered against `Backend` | ✅ written below (3 VERIFIED, 4 SOURCE/BLOCKED) |
-| `local` + `substrate` impls behind one interface, plus `harness-exec` | ✅ VERIFIED (substrate's transport path untested) |
+| `local` + `substrate` impls behind one interface, plus `harness-exec` | ✅ VERIFIED |
 | `run/` layout established, `setup.sh` builds into `run/bin/` | ✅ VERIFIED |
 
-**What blocks the substrate leg.** It is environment, not code, and it is
-**not a missing prerequisite** — it simply has not been run here. The checkout
-is present at `~/workdir/agentic-platform/substrate` (on `main`, with the
-`hack/` scripts below), so the only thing absent is a running cluster: the one
-kind cluster on this machine is `sh-knative`, `kubectl ate get atespaces`
-reports `services "api" not found`, and nothing listens on port 8000.
+**Closing the substrate leg turned up two upstream API breaks**, both from the
+same cause: this demo was written against a substrate checkout from before
+2026-08-31, and the cluster was built from current `main`. Worth recording
+because they failed differently:
 
-To close this criterion:
+1. **Client/server proto skew — fail-loud.** The installed `kubectl-ate`
+   (built 2026-08-19) still sent `Actor.actor_template_namespace` (protobuf
+   tag 2), removed upstream on 2026-09-01 ("Full cutover: Drop the k8s CRD
+   ActorTemplate fields"). The cluster's `RejectUnknownFieldsUnaryInterceptor`
+   refuses unknown fields, so actor creation failed with
+   `InvalidArgument: actor: unknown field with protobuf tag 2`. Fix:
+   `go install ./cmd/kubectl-ate` from the current checkout. If the server
+   had *ignored* unknown fields instead, the old CLI's template ref would
+   have been silently dropped — this failure was loud only because upstream
+   chose to reject.
+2. **Routing scheme removed — fail-loud here, but only after a fix.** The
+   backend addressed actors by a DNS-shaped Host header
+   (`<actor>.<atespace>.actors.resources.substrate.ate.dev`); upstream
+   removed Host-header routing on 2026-08-31 ("Move from Host header to
+   explicit headers for actor and atespace"). The router no longer reads the
+   Host header at all, so the request 404'd with `invalid actor reference`.
+   Fix: send the explicit `ate-target-actor: <atespace>/<actor>` header, as
+   the upstream sandbox demo client does.
 
-```bash
-cd ~/workdir/agentic-platform/substrate
-./hack/create-kind-cluster.sh
-./hack/install-ate-kind.sh --deploy-ate-system \
-  --credential-provider='{"name":"k8s.io"}' \
-  --deploy-demo-counter --deploy-demo-sandbox
-kubectl port-forward -n ate-system svc/atenet-router 8000:80   # leave running
-
-cd -   # back to multi_harness_sandbox_matrix
-./setup.sh --backend=substrate
-./smoke.sh --backend=substrate    # uname -s MUST return Linux
-```
-
-Until that passes, the substrate code path is **written and unit-tested but
-not executed end-to-end**, and nothing downstream should treat "M1 works
-through substrate" as established.
+A third, smaller break of the same class: `teardown.sh --actors` used
+`kubectl ate get actors -o name`, an output format the CLI has since dropped.
+The command exits nonzero, the cleanup block "skips" — and **every actor is
+silently left running**. That is a fail-silent bug in this repo's own cleanup
+path, of exactly the class the matrix exists to measure. Fixed by listing via
+`-o json`; noted here because the pattern (`grep` the old format, `|| true`
+the failure) is easy to reintroduce.
 
 ---
 
