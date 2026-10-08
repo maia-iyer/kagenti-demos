@@ -35,7 +35,9 @@ To close this criterion:
 ```bash
 cd ~/workdir/agentic-platform/substrate
 ./hack/create-kind-cluster.sh
-./hack/install-ate-kind.sh --deploy-ate-system --deploy-demo-counter --deploy-demo-sandbox
+./hack/install-ate-kind.sh --deploy-ate-system \
+  --credential-provider='{"name":"k8s.io"}' \
+  --deploy-demo-counter --deploy-demo-sandbox
 kubectl port-forward -n ate-system svc/atenet-router 8000:80   # leave running
 
 cd -   # back to multi_harness_sandbox_matrix

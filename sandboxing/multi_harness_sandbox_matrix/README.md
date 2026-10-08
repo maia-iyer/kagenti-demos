@@ -29,8 +29,8 @@ which ones are verified by running code versus only read from source.
 
 **Phase 0.** The `Backend` seam exists with two implementations, the Pi M1
 extension is written and contract-tested, and the local leg of the smoke test
-passes. The **substrate leg is unverified** — it needs a cluster that is not
-present on this machine (see Prerequisites). Nothing here should be read as
+passes. The **substrate leg is unverified** — it needs a running cluster
+(see Prerequisites). Nothing here should be read as
 "M1 works through substrate" yet.
 
 ## The four redirection methods
@@ -77,17 +77,29 @@ belong to the Claude Code demo, not to this matrix.
 
 ### Prerequisites (one-time, from a `substrate/` checkout)
 
-Not part of this repo. On this machine the checkout is at
-`~/workdir/agentic-platform/substrate`:
+Not part of this repo — you need your own checkout of the `substrate`
+repository. From its root:
 
 ```bash
 ./hack/create-kind-cluster.sh
-./hack/install-ate-kind.sh --deploy-ate-system --deploy-demo-counter --deploy-demo-sandbox
+./hack/install-ate-kind.sh --deploy-ate-system \
+  --credential-provider='{"name":"k8s.io"}' \
+  --deploy-demo-counter --deploy-demo-sandbox
+go install ./cmd/kubectl-ate   # provides `kubectl ate`, used below
 ```
+
+`--deploy-ate-system` refuses to run without a `--credential-provider`;
+the bundled `k8s.io` provider and its empty, default-deny policy are fine
+here — nothing in this matrix injects egress credentials.
 
 This creates a new kind cluster. If you already have unrelated kind clusters,
 check what it selects as the current context before running the matrix
 against it.
+
+These commands summarize the substrate repo's own setup, and drift when it
+changes. The upstream
+[Quickstart (Development)](https://github.com/agent-substrate/substrate#quickstart-development)
+is the reference to check against when they do.
 
 Then, in a terminal you leave open:
 
