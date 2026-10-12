@@ -1,8 +1,10 @@
 # Local Claude Code driving chained MOCA subagents
 
-Claude Code runs on your laptop. It has **no built-in subagent tool** —
-`Task` is denied in `.claude/settings.json`. To delegate, it uses a
-skill that knows how to dispatch an isolated leaf to
+Claude Code runs on your laptop. It **does** have a built-in subagent
+tool — `Task` — but **no built-in way to offload work to the cloud**:
+a `Task` subagent runs in-process on the same laptop, inside the
+same session. This demo denies `Task` in `.claude/settings.json` and
+delegates instead through a skill that dispatches an isolated leaf to
 [MOCA](https://github.com/rossoctl/serverless-harness) by shelling out
 to a small `moca` CLI (installed into the scratch dir by `setup.sh`
 and put on `$PATH` via the staged settings).
