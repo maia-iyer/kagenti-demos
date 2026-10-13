@@ -1,13 +1,14 @@
 {
   "permissions": {
     "deny": [
-      "Task"
+      "Task",
+      "Read(./.moca-auth/**)"
     ],
     "allow": [
       "Bash(moca start*)",
       "Bash(moca check*)",
       "Bash(moca list*)",
-      "Bash(jq*)"
+      "Bash(moca cancel*)"
     ]
   }
 }
