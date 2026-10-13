@@ -41,11 +41,6 @@ multi-leaf flows from the operator's requests.
 
 For the full design, see [PLAN.md](PLAN.md).
 
-> **Running on MOCA's `deploy/k8s` path.** This demo previously targeted
-> MOCA's Knative/KEDA deployment, which upstream
-> [deprecated on 2026-10-11](https://github.com/rossoctl/moca/blob/main/docs/migrating-from-knative.md).
-> See [What changed from the Knative path](#what-changed-from-the-knative-path).
-
 ## How it works
 
 Four pieces cooperate:
@@ -80,8 +75,7 @@ in-flight work by reading that directory.
 
 ## Two origins, two kinds of token
 
-This is the biggest structural difference from the old Knative setup,
-and it's worth understanding before you debug anything:
+This is worth understanding before you debug anything:
 
 | Origin | Port-forward | Serves | Needs |
 | --- | --- | --- | --- |
@@ -118,8 +112,7 @@ Three consequences:
 - **Leaves are not isolated from each other.** The isolation boundary
   is this chain versus everything else, not leaf versus leaf.
 - **Session ids are server-generated.** You pass `moca` a short local
-  label (`diagnose`, `fix`) that names files in `.moca-runs/`. The old
-  `<run-id>.<leaf-label>` scheme is gone.
+  label (`diagnose`, `fix`) that names files in `.moca-runs/`.
 
 ## How state flows
 
@@ -279,14 +272,11 @@ With exactly one inference credential stored, MOCA selects it
 automatically. If you have several, pass
 `MOCA_INFERENCE_CRED=<name>` to `setup.sh`.
 
-> **There is no operator-wide key fallback on this path.**
+> **There is no operator-wide key fallback.**
 > `SH_ALLOW_OPERATOR_FALLBACK=true` also requires
 > `SH_OPERATOR_INFERENCE_TOKEN`, which this deployment does not wire —
 > turning it on makes the control plane refuse to boot. A per-user
 > credential is the only supported option here.
-
-No Knative timeout to raise, no Kourier, no `Host` header, and no
-`leaf-worker` ScaledJob: none of those exist on this path.
 
 ## Setup
 
@@ -397,9 +387,9 @@ kubectl -n moca get pods
 kubectl -n moca logs -f deploy/moca-supervisor
 ```
 
-Both the supervisor and the sandbox pods are **warm** — nothing scales
-to zero on this path, and nothing cold-starts. What you're watching for
-is the work landing in a sandbox pod that your laptop never touches.
+Both the supervisor and the sandbox pods are **warm**. What you're
+watching for is the work landing in a sandbox pod that your laptop
+never touches.
 
 ## Pause and resume
 
@@ -458,26 +448,6 @@ timeout, and removes the scratch directory (including the API token).
 It does **not** touch MOCA, your cluster, or your `mocactl` login. If
 the port-forwards are still running, `Ctrl-C` them.
 
-## What changed from the Knative path
-
-If you ran the earlier version of this demo, essentially the whole
-transport changed:
-
-| Then (Knative) | Now (`deploy/k8s`) |
-| --- | --- |
-| `POST /runs`, `GET /runs/status` | `POST /v1/turn`, `GET /v1/turn?sessionId=` |
-| `-H "Host: serverless-harness…"` via Kourier | Two port-forwards, no Host header |
-| Unauthenticated | API token + per-session token, both required |
-| Operator-chosen ids (`review-1.diagnose`) | Server-generated session id + local labels |
-| A fixture on every pool pod at `/workspace/<run-id>/repo` | A fixture on every sandbox pod at `/workspace/<session-id>` — still `kubectl cp` |
-| Local `nohup` worker holding a blocking call | Server-side detachable turn, 24h replay |
-| Raise Knative's 300s `timeoutSeconds` | No request cap to raise |
-| Scale-to-zero; `leaf-worker` ScaledJob | Warm supervisor and sandbox pods |
-| Namespace `default`, pods `sandbox-N` | Namespaces `moca` / `moca-sandbox`, pods `moca-sandbox-N` |
-
-The upstream deprecation notice and full mapping is in
-[`docs/migrating-from-knative.md`](https://github.com/rossoctl/moca/blob/main/docs/migrating-from-knative.md).
-
 ## Troubleshooting
 
 - **`curl: (7)` / connection refused.** A port-forward isn't running.
@@ -487,7 +457,7 @@ The upstream deprecation notice and full mapping is in
   `mocactl --control-plane-url http://127.0.0.1:8090 login`.
 - **`setup.sh` says "no inference credential stored".** Add one with
   `mocactl credentials add` (see Prerequisites). Session creation fails
-  without it, and there is no operator-key fallback on this path.
+  without it, and there is no operator-key fallback.
 - **`setup.sh` says "you have N inference credentials".** MOCA
   auto-selects only when there's exactly one. Re-run with
   `MOCA_INFERENCE_CRED=<name> ./setup.sh`.
@@ -526,11 +496,10 @@ The upstream deprecation notice and full mapping is in
 
 ## Security note
 
-This demo runs against a throwaway local cluster. MOCA's own auth **is**
-enabled on this path (unlike the old Knative demo), so leaves require a
-valid token — but the demo stores an API token on disk in the scratch
-dir and widens a cluster-wide workspace timeout. Don't point it at
-anything you care about.
+This demo runs against a throwaway local cluster. MOCA's own auth is
+enabled, so leaves require a valid token — but the demo stores an API
+token on disk in the scratch dir and widens a cluster-wide workspace
+timeout. Don't point it at anything you care about.
 
 ## Files in this directory
 
@@ -545,10 +514,6 @@ setup.sh                   Creates the session, seeds the fixture, stages the sc
 teardown.sh                Deletes the session, restores settings, removes the scratch dir
 example_repo/              Vendored fixture — Node.js project with a renamed-API bug
 ```
-
-> `lib/ctx.sh` is a leftover from an earlier design that used a
-> Context Service PVC + per-posture workloads. The current setup
-> seeds one session's workspace and does not source it.
 
 In the scratch dir after `setup.sh`:
 
