@@ -4,12 +4,18 @@
 # Assumes MOCA (rossoctl/moca) is already installed on the current kubectl
 # context via deploy/k8s/setup.sh, and that both port-forwards are running.
 # This script does the demo-specific setup:
-#   1. Obtain an API token (via mocactl) and check an inference credential exists.
-#   2. Create ONE session for the chain; every leaf is a turn in it.
-#   3. Seed example_repo/ into that session's workspace on every sandbox
-#      pod via kubectl cp, and widen the workspace idle timeout so a paused
-#      demo does not lose its files.
-#   4. Stage settings and skill into a scratch directory for a Claude session.
+#   1. Verify the toolchain, the namespaces, and that mocactl (with the
+#      subagent commands) can drive the install end to end (mocactl doctor).
+#   2. Stage a scratch dir for the run: a copy of example_repo/ (the seed
+#      source for every leaf), a leaves/ dir for prompts/notes/results,
+#      MOCA.md runtime facts (including this run's demo tag), the
+#      moca-dispatch skill, and Claude Code settings.
+#
+# Everything else happens at dispatch time, via mocactl: `spawn` creates a
+# fresh session per leaf (mocactl owns all auth), and the parent seeds each
+# leaf's workspace with kubectl cp right after spawn. Setup therefore no
+# longer mints tokens, creates a session, widens timeouts, or copies
+# anything into the cluster.
 #
 # This script does NOT stand up MOCA. See the demo README prerequisites.
 
@@ -20,8 +26,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOCA_NS="${MOCA_NS:-moca}"
 SANDBOX_NS="${SANDBOX_NS:-moca-sandbox}"
 # Sandbox pods are matched by label (the moca-sandbox StatefulSet's template
-# label) so the fixture lands on every pod that could serve the session.
+# label) so a leaf's fixture can be seeded on every pod that could serve it.
 SANDBOX_POD_SELECTOR="${SANDBOX_POD_SELECTOR:-app=moca-sandbox}"
+SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-sandbox}"
 # The control plane tells clients where the harness is, and deploy/k8s
 # advertises it as http://127.0.0.1:8080 — so the supervisor's port-forward
 # must use local port 8080 specifically.
@@ -30,20 +37,31 @@ CP_PORT="${CP_PORT:-8090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
-# How long a sandbox workspace survives with no tool call before MOCA reclaims
-# it. The default is 30m, which is short enough that "dispatch diagnose, go to
-# lunch, dispatch fix" loses the seeded repo. The demo widens it so the pause
-# the demo is built to show is actually safe.
-WORKSPACE_IDLE="${WORKSPACE_IDLE:-8h}"
 
 echo "==> Prerequisite checks..."
 
-for bin in kubectl curl jq; do
+for bin in kubectl jq; do
   if ! command -v "${bin}" >/dev/null 2>&1; then
     echo "    missing required binary: ${bin}" >&2
     exit 1
   fi
 done
+# mocactl is invoked directly by the demo (it is never re-staged into the
+# scratch dir), so it must already be on PATH here.
+if ! command -v mocactl >/dev/null 2>&1; then
+  echo "    mocactl is not on PATH. Install it (Node 22+):" >&2
+  echo "      curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | sh" >&2
+  exit 1
+fi
+# Capability probe: mocactl must have the subagent commands. An old mocactl
+# answers 'unknown command' here instead.
+spawn_probe="$(mocactl spawn 2>&1 || true)"
+if ! printf '%s' "${spawn_probe}" | grep -q 'spawn needs a prompt'; then
+  echo "    this mocactl has no working 'spawn' subagent command — too old." >&2
+  echo "    Install mocactl >= edge-a02b9db and re-run." >&2
+  exit 1
+fi
+echo "    ok: kubectl, jq, mocactl on PATH (subagent commands present)"
 
 if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
   echo "    namespace '${MOCA_NS}' not found on current kubectl context." >&2
@@ -57,271 +75,78 @@ if ! kubectl -n "${SANDBOX_NS}" get statefulset moca-sandbox >/dev/null 2>&1; th
   echo "    Did deploy/k8s/setup.sh finish?" >&2
   exit 1
 fi
-
-echo "    ok: kubectl, curl, jq on PATH"
 echo "    ok: namespaces ${MOCA_NS} and ${SANDBOX_NS} exist"
 
-echo "==> Checking both port-forwards are up..."
-cp_code="$(curl -sS -o /dev/null -w '%{http_code}' "${CP_URL}/healthz" 2>/dev/null || echo '000')"
-if ! echo "${cp_code}" | grep -qE '^(200|204|404)$'; then
-  echo "    cannot reach the control plane at ${CP_URL} (HTTP ${cp_code})." >&2
-  echo "    Start it in another terminal:" >&2
+echo "==> Running mocactl doctor..."
+# doctor (with the port-forward URLs via env) covers everything the old setup
+# probed by hand: control-plane reachability, login, credential, harness
+# located/reachable/trusted, and an end-to-end scratch session. It prints one
+# suggested fix per failing check and exits non-zero on failure.
+if ! SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" mocactl doctor; then
+  echo "" >&2
+  echo "    doctor failed. Its output above includes the fix for each failing" >&2
+  echo "    check. Both port-forwards must be running:" >&2
+  echo "      kubectl port-forward -n ${MOCA_NS} svc/moca-supervisor ${HARNESS_PORT}:8080" >&2
   echo "      kubectl port-forward -n ${MOCA_NS} svc/moca-control-plane ${CP_PORT}:8080" >&2
   exit 1
 fi
-h_code="$(curl -sS -o /dev/null -w '%{http_code}' "${HARNESS_URL}/healthz" 2>/dev/null || echo '000')"
-if ! echo "${h_code}" | grep -qE '^(200|204|401|404)$'; then
-  echo "    cannot reach the harness at ${HARNESS_URL} (HTTP ${h_code})." >&2
-  echo "    Start it in another terminal (local port must be ${HARNESS_PORT}):" >&2
-  echo "      kubectl port-forward -n ${MOCA_NS} svc/moca-supervisor ${HARNESS_PORT}:8080" >&2
-  exit 1
-fi
-echo "    ok: control plane (HTTP ${cp_code}), harness (HTTP ${h_code})"
-
-echo "==> Obtaining an API token..."
-# Tokens live in header files, never on a command line: argv is world-readable
-# through ps. Everything under .moca-auth/ is 0600 and teardown.sh removes it.
-AUTH_DIR="${SCRATCH_DIR}/.moca-auth"
-mkdir -p "${AUTH_DIR}"
-chmod 700 "${AUTH_DIR}"
-API_HDR="${AUTH_DIR}/api.hdr"
-
-API_TOKEN=""
-if [ -n "${MOCA_API_TOKEN:-}" ]; then
-  API_TOKEN="${MOCA_API_TOKEN}"
-  echo "    using MOCA_API_TOKEN from the environment"
-elif command -v mocactl >/dev/null 2>&1; then
-  rc=0
-  API_TOKEN="$(mocactl --control-plane-url "${CP_URL}" auth token 2>/dev/null)" || rc=$?
-  if [ "${rc}" -ne 0 ] || [ -z "${API_TOKEN}" ]; then
-    case "${rc}" in
-      3) echo "    not logged in. Run:  mocactl --control-plane-url ${CP_URL} login" >&2 ;;
-      4) echo "    mocactl could not reach the control plane at ${CP_URL}." >&2 ;;
-      *) echo "    'mocactl auth token' failed (exit ${rc})." >&2 ;;
-    esac
-    exit 1
-  fi
-  echo "    ok: token from mocactl"
-else
-  echo "    no API token available: mocactl is not installed and MOCA_API_TOKEN is unset." >&2
-  echo "    Either install mocactl and run 'mocactl login', or mint a token in-cluster:" >&2
-  echo "      kubectl -n ${MOCA_NS} exec deploy/moca-control-plane -c control-plane -- \\" >&2
-  echo "        node --import tsx --input-type=module -e \"...\"   # see deploy/k8s/smoke.sh" >&2
-  echo "    then re-run with MOCA_API_TOKEN=<token>" >&2
-  exit 1
-fi
-( umask 077; printf 'Authorization: Bearer %s\n' "${API_TOKEN}" >"${API_HDR}" )
-unset API_TOKEN
-
-echo "==> Checking for an inference credential..."
-# Session creation itself fails without one. The operator-key fallback
-# (SH_ALLOW_OPERATOR_FALLBACK) is NOT available on this deployment: it also
-# needs SH_OPERATOR_INFERENCE_TOKEN, which this slice does not wire, so turning
-# it on makes the control plane refuse to boot. A per-user credential is the
-# only supported path here.
-creds_body="$(curl -sS -H @"${API_HDR}" "${CP_URL}/v1/credentials" 2>/dev/null || echo '{}')"
-inference_names="$(printf '%s' "${creds_body}" \
-  | jq -r '[(.credentials // [])[] | select(.consumer == "inference") | .name] | join(" ")' 2>/dev/null || true)"
-inference_count="$(printf '%s' "${inference_names}" | wc -w | tr -d ' ')"
-
-if [ "${inference_count}" -eq 0 ]; then
-  echo "    no inference credential stored for this user." >&2
-  echo "    MOCA issues inference credentials per user, and session creation" >&2
-  echo "    fails without one. Add your Anthropic key:" >&2
-  echo "" >&2
-  echo "      printf %s \"\$ANTHROPIC_API_KEY\" | mocactl --control-plane-url ${CP_URL} \\" >&2
-  echo "        credentials add anthropic --host api.anthropic.com \\" >&2
-  echo "        --kind api-key --endpoint https://api.anthropic.com" >&2
-  echo "" >&2
-  echo "    then re-run this script." >&2
-  exit 1
-fi
-
-SESSION_BODY='{}'
-if [ "${inference_count}" -gt 1 ]; then
-  if [ -z "${MOCA_INFERENCE_CRED:-}" ]; then
-    echo "    you have ${inference_count} inference credentials (${inference_names})." >&2
-    echo "    MOCA auto-selects only when there is exactly one. Pick one:" >&2
-    echo "      MOCA_INFERENCE_CRED=<name> ./setup.sh" >&2
-    exit 1
-  fi
-  SESSION_BODY="$(jq -n --arg n "${MOCA_INFERENCE_CRED}" '{credentials:{inference:$n}}')"
-  echo "    ok: using inference credential '${MOCA_INFERENCE_CRED}'"
-else
-  echo "    ok: one inference credential (${inference_names}) — auto-selected"
-fi
-
-echo "==> Widening the sandbox workspace idle timeout to ${WORKSPACE_IDLE}..."
-# Do this BEFORE creating the session: it rolls the sandbox pods, which is
-# harmless now and would destroy a seeded workspace later.
-if kubectl -n "${SANDBOX_NS}" set env statefulset/moca-sandbox \
-     "SH_WORKSPACE_IDLE=${WORKSPACE_IDLE}" >/dev/null 2>&1; then
-  kubectl -n "${SANDBOX_NS}" rollout status statefulset/moca-sandbox --timeout=180s >/dev/null 2>&1 || true
-  echo "    ok: SH_WORKSPACE_IDLE=${WORKSPACE_IDLE}"
-else
-  echo "    warning: could not set SH_WORKSPACE_IDLE; the 30m default applies." >&2
-  echo "    A chain paused longer than 30m between leaves will lose its files." >&2
-fi
-
-echo "==> Creating the session for this chain..."
-# ONE session for the whole chain. Every leaf is a turn in it, so every leaf
-# shares the sandbox workspace at /workspace/<sessionId> — that is what lets a
-# fix leaf see the files a diagnose leaf examined. MOCA generates the id.
-resp="$(curl -sS -w '\n%{http_code}' \
-  -X POST -H @"${API_HDR}" -H 'Content-Type: application/json' \
-  -d "${SESSION_BODY}" "${CP_URL}/v1/sessions")" \
-  || { echo "    cannot reach the control plane at ${CP_URL}." >&2; exit 1; }
-http_code="$(printf '%s' "${resp}" | tail -1)"
-body="$(printf '%s' "${resp}" | sed '$d')"
-if [ "${http_code}" != "200" ] && [ "${http_code}" != "201" ]; then
-  echo "    session creation failed (HTTP ${http_code})." >&2
-  echo "    body: ${body}" >&2
-  exit 1
-fi
-SESSION_ID="$(printf '%s' "${body}" | jq -r '.sessionId // empty')"
-[ -n "${SESSION_ID}" ] || { echo "    control plane returned no sessionId. body: ${body}" >&2; exit 1; }
-# The session token that comes back is only a sanity check here — the moca
-# CLI mints a fresh one immediately before every harness call, so setup has
-# no use for it beyond confirming the session is usable.
-SESSION_TOKEN="$(printf '%s' "${body}" | jq -r '.token // empty')"
-[ -n "${SESSION_TOKEN}" ] || { echo "    control plane returned no session token." >&2; exit 1; }
-unset SESSION_TOKEN
-echo "    ok: session ${SESSION_ID}"
-WORKSPACE="/workspace/${SESSION_ID}"
-
-echo "==> Seeding example_repo/ into every sandbox pod at ${WORKSPACE}..."
-# The sandbox worker creates a session's workspace with mkdir semantics on
-# the session's first tool call — a directory that already exists is used
-# as-is, never wiped — and MOCA's idle sweeper only reclaims workspaces
-# that have actually run a tool call. So kubectl can put the fixture in
-# place before any turn runs. Every pod gets it because a session pins to
-# a sandbox only on its FIRST turn; until then any pod can serve it.
-SANDBOX_PODS="$(kubectl -n "${SANDBOX_NS}" get pods \
-  -l "${SANDBOX_POD_SELECTOR}" \
-  --field-selector=status.phase=Running \
-  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
-if [ -z "${SANDBOX_PODS}" ]; then
-  echo "    no Running sandbox pods matched selector '${SANDBOX_POD_SELECTOR}' in '${SANDBOX_NS}'." >&2
-  echo "    Did deploy/k8s/setup.sh finish?" >&2
-  exit 1
-fi
-for pod in ${SANDBOX_PODS}; do
-  kubectl -n "${SANDBOX_NS}" wait --for=condition=Ready "pod/${pod}" --timeout=90s >/dev/null
-done
-
-for pod in ${SANDBOX_PODS}; do
-  echo "    - ${pod}"
-  kubectl -n "${SANDBOX_NS}" exec "${pod}" -c sandbox -- sh -c "mkdir -p '${WORKSPACE}'"
-  # Clean any previous seeding so re-runs are idempotent.
-  kubectl -n "${SANDBOX_NS}" exec "${pod}" -c sandbox -- \
-    sh -c "rm -rf '${WORKSPACE}'/* '${WORKSPACE}'/.[!.]* 2>/dev/null; true"
-  kubectl -n "${SANDBOX_NS}" cp -c sandbox "${SCRIPT_DIR}/example_repo/." "${pod}:${WORKSPACE}"
-done
-
-echo "==> Verifying the fixture landed..."
-for pod in ${SANDBOX_PODS}; do
-  for f in package.json src/index.js; do
-    if ! kubectl -n "${SANDBOX_NS}" exec "${pod}" -c sandbox -- \
-         test -f "${WORKSPACE}/${f}" >/dev/null 2>&1; then
-      echo "    ${WORKSPACE}/${f} is missing on ${pod} — the kubectl cp did not land there." >&2
-      exit 1
-    fi
-  done
-done
-echo "    ok: fixture verified on: ${SANDBOX_PODS}"
 
 echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
+# Fresh staging on every run: the demo tag is per-run, so notes and results
+# from an earlier run would be orphaned. Collect results before re-running.
+rm -rf "${SCRATCH_DIR}"
+mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-dispatch" "${SCRATCH_DIR}/leaves"
 
-mkdir -p "${SCRATCH_DIR}/.claude/skills"
-mkdir -p "${SCRATCH_DIR}/.moca-runs"
-mkdir -p "${SCRATCH_DIR}/bin"
-cp "${SCRIPT_DIR}/settings.json.example" \
-   "${SCRATCH_DIR}/.claude/settings.json"
-rm -rf "${SCRATCH_DIR}/.claude/skills/moca-dispatch"
-cp -r "${SCRIPT_DIR}/skill" \
-      "${SCRATCH_DIR}/.claude/skills/moca-dispatch"
-install -m 0755 "${SCRIPT_DIR}/bin/moca" "${SCRATCH_DIR}/bin/moca"
+# Claude Code settings, patched two ways: the env block that points mocactl
+# at the port-forwards, and the kubectl allow patterns rewritten for this
+# run's sandbox namespace (the example file carries the default ns).
+# mocactl itself is already on PATH — verified above, not patched.
+cp "${SCRIPT_DIR}/settings.json.example" "${SCRATCH_DIR}/.claude/settings.json"
+settings_tmp="$(mktemp)"
+jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" --arg ns "${SANDBOX_NS}" \
+   '.env = ((.env // {}) + {SH_CONTROL_PLANE_URL: $cp, SH_HARNESS_URL: $harness})
+    | .permissions.allow |= map(gsub("moca-sandbox"; $ns))' \
+   "${SCRATCH_DIR}/.claude/settings.json" >"${settings_tmp}"
+mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 
-# Rewrite .claude/settings.json so the moca CLI is on PATH for Bash tool
-# invocations. The example file ships without an env block; inject one
-# that prepends the scratch dir's bin/ to $PATH.
-python3 - "${SCRATCH_DIR}/.claude/settings.json" "${SCRATCH_DIR}/bin" <<'PY'
-import json, sys, os
-settings_path, bin_dir = sys.argv[1], sys.argv[2]
-with open(settings_path) as f:
-    s = json.load(f)
-env = s.setdefault("env", {})
-env["PATH"] = f"{bin_dir}:" + os.environ.get("PATH", "/usr/bin:/bin")
-with open(settings_path, "w") as f:
-    json.dump(s, f, indent=2)
-    f.write("\n")
-PY
+# The dispatch skill — the agent flow's mechanism contract (the by-hand
+# appendix in the README never reads it; a Claude session does).
+cp "${SCRIPT_DIR}/skill/SKILL.md" \
+   "${SCRATCH_DIR}/.claude/skills/moca-dispatch/SKILL.md"
+
+# The fixture the parent seeds every leaf's workspace from (kubectl cp
+# source at dispatch time).
+cp -R "${SCRIPT_DIR}/example_repo" "${SCRATCH_DIR}/example_repo"
+
+# One demo tag per scratch dir. mocactl's subagent ledger is machine-global;
+# the tag is what scopes listing and teardown to this demo instance.
+TAG="chained-$(date +%Y%m%d-%H%M%S)"
 
 cat > "${SCRATCH_DIR}/MOCA.md" <<EOF
-# MOCA settings for this scratch session
+# MOCA runtime facts for this demo run
 
-Control plane URL:  ${CP_URL}
-Harness URL:        ${HARNESS_URL}
-Session id:         ${SESSION_ID}
-Workspace:          ${WORKSPACE}
-Sandbox pods:       ${SANDBOX_PODS}
-Sandbox namespace:  ${SANDBOX_NS}
+Control plane URL:     ${CP_URL}
+Harness URL:           ${HARNESS_URL}
+Demo tag:              ${TAG}
+Sandbox namespace:     ${SANDBOX_NS}
+Sandbox pod selector:  ${SANDBOX_POD_SELECTOR}
+Sandbox container:     ${SANDBOX_CONTAINER}
+Fixture (seed source): ./example_repo
+Leaves dir:            ./leaves
 
-## How dispatch works
+Every mocactl command run from this directory needs the port-forward URLs
+in the environment (the staged .claude/settings.json does this for Claude):
 
-There are TWO origins. The control plane (${CP_URL}) owns sessions and
-credentials; the harness (${HARNESS_URL}) runs turns. They take different
-tokens: an API token for the control plane, and a SESSION token — minted per
-session, valid about 300 seconds — for the harness. The moca CLI re-mints a
-session token immediately before every harness call, so expiry never matters.
+  export SH_CONTROL_PLANE_URL=${CP_URL}
+  export SH_HARNESS_URL=${HARNESS_URL}
 
-Dispatch is a DETACHABLE TURN. 'moca start' POSTs to ${HARNESS_URL}/v1/turn
-with {"detachable":true}, reads the stream only long enough to learn the turn
-id, and walks away. MOCA does not abort a detachable turn when its client
-disconnects — it writes every frame to a server-side log instead. So the leaf
-keeps running with nothing held open locally.
-
-'moca check' COLLECTS by reattaching: GET ${HARNESS_URL}/v1/turn?sessionId=...
-replays the turn from the beginning and follows it if it is still running. A
-finished turn replays in full for 24 HOURS, so a result survives quitting
-Claude Code, closing the laptop, and rebooting.
-
-## One session, one workspace
-
-Every leaf in this chain is a turn in session ${SESSION_ID}, so every leaf
-shares the sandbox workspace at ${WORKSPACE}. That is what lets a fix leaf see
-the files a diagnose leaf examined. Two consequences:
-
-  - Leaves must run SEQUENTIALLY. A session runs one turn at a time; a second
-    concurrent turn is refused with HTTP 409 turn_in_progress.
-  - Leaves are not isolated from each other. The isolation boundary is this
-    chain versus anything else, not leaf versus leaf.
-
-The workspace is reclaimed after ${WORKSPACE_IDLE} with no tool call, and is
-lost outright if the sandbox pod restarts (it is container-local, with no
-volume). The turn log in Redis is unaffected by either.
-
-## Which sandbox pod?
-
-The fixture was seeded into every pod listed above, because a session pins
-to a sandbox only on its first turn. After a leaf has run, find the serving
-pod by listing the workspace on each — the serving one shows the leaf's
-changes, the others only the seeded fixture:
-
-  for p in ${SANDBOX_PODS}; do
-    kubectl -n ${SANDBOX_NS} exec "\$p" -c sandbox -- ls -la ${WORKSPACE}
-  done
-
-## Timeouts worth knowing
-
-  - A turn that runs more than 30 minutes with NOBODY attached is aborted with
-    abortReason "unwatched". Running 'moca check' counts as attaching.
-  - A supervisor restart aborts detached turns (abortReason "restarting").
-  - Both are infrastructure outcomes, not findings about the code.
-
-Run records live in .moca-runs/ and the API token in .moca-auth/ — see the
-moca-dispatch skill. Leaf labels (e.g. "diagnose", "fix") name records locally;
-they are not session ids.
+Notes:
+- Every leaf is its own session with its own workspace at
+  /workspace/<sessionId>. The parent seeds the fixture into that workspace
+  right after spawn (kubectl cp to every sandbox pod).
+- There is no cancel; a dispatched leaf runs to completion. Results persist
+  server-side for 24h — collect with 'mocactl get <sessionId>' inside that
+  window.
 EOF
 
 echo ""
@@ -334,35 +159,16 @@ echo ""
 echo "       kubectl port-forward -n ${MOCA_NS} svc/moca-supervisor ${HARNESS_PORT}:8080"
 echo "       kubectl port-forward -n ${MOCA_NS} svc/moca-control-plane ${CP_PORT}:8080"
 echo ""
-echo "  2. Start Claude from the scratch dir:"
+echo "  2. Drive the demo by hand from the scratch dir — the full sequence"
+echo "     (spawn, seed, collect, chain) is the demo README's 'Appendix:"
+echo "     running the flow by hand':"
+echo ""
+echo "       cd ${SCRATCH_DIR}"
+echo "       export SH_CONTROL_PLANE_URL=${CP_URL} SH_HARNESS_URL=${HARNESS_URL}"
+echo "       mocactl spawn \"\$(cat leaves/diagnose.prompt.txt)\" \\"
+echo "         --kind prompt --tag ${TAG} --json"
+echo ""
+echo "  3. Or start Claude from the scratch dir and drive it with operator"
+echo "     prompts (the agent flow — see the README's 'Run a session'):"
 echo ""
 echo "       cd ${SCRATCH_DIR} && claude"
-echo ""
-echo "  3. The demo flow is operator prompts; dispatch is a detachable turn."
-echo "     Suggested first prompt:"
-echo ""
-echo "       There's a Node.js project at ${WORKSPACE} on MOCA."
-echo "       Dispatch a subagent to diagnose why its tests are failing."
-echo ""
-echo "     Claude will start the leaf and return control immediately."
-echo "     You can quit Claude entirely and come back later — the turn runs"
-echo "     cluster-side and its result is collectable for 24h. When you're"
-echo "     ready to collect the diagnosis, say:"
-echo ""
-echo "       Check on that subagent and report the diagnosis."
-echo ""
-echo "     Then, after reviewing the diagnosis:"
-echo ""
-echo "       Good. Dispatch another subagent to apply that fix, run the"
-echo "       tests, and report the diff and outcome. Check on it when it's done."
-echo ""
-echo "  4. Watch the work land in the sandbox:"
-echo ""
-echo "       for p in ${SANDBOX_PODS}; do"
-echo "         kubectl -n ${SANDBOX_NS} exec \"\$p\" -c sandbox -- ls -la ${WORKSPACE}"
-echo "       done"
-echo ""
-echo "     The harness runs in the moca-supervisor pod (namespace ${MOCA_NS});"
-echo "     the agent's tool calls execute in a sandbox pod (namespace"
-echo "     ${SANDBOX_NS}) — the session pins to one of the seeded pods on its"
-echo "     first turn. Both are warm — nothing scales to zero."
