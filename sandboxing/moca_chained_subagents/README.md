@@ -368,7 +368,7 @@ hours later, same session or a resumed one):
 Claude runs `mocactl get <sessionId> --out leaves --json` and branches
 on the printed `status`: `queued` → report "still running" and stop
 (one check per turn — the leaf is durable server-side, no polling);
-`done` → read `leaves/<sessionId>.text` and surface the diagnosis.
+`responded` → read `leaves/<sessionId>.text` and surface the diagnosis.
 
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
@@ -446,6 +446,12 @@ ledger). Nothing lives in the Claude Code session identifier.
   the worker died before the server recorded anything (port-forward
   down at dispatch, or a supervisor restart mid-run). Re-dispatch a
   fresh leaf.
+- **A leaf that runs longer than five minutes looks failed locally.**
+  The spawn worker's sync `POST /v1/runs` carries Node's default
+  300-second response timeout, so `subagents` records
+  `failed: fetch failed` at the five-minute mark while the run keeps
+  going server-side — and stays collectable with `get`. Trust `get`,
+  not the ledger state.
 - **Delete the sessions last.** `teardown.sh` deletes them, which
   makes their stored results unreachable. Collect what you care
   about first.
@@ -482,6 +488,17 @@ running, `Ctrl-C` them.
   supervisor restarted mid-run. The result will never land;
   re-dispatch a fresh leaf (under a new label). The worker's log, if
   you want the corpse: `~/.local/state/mocactl/spawn-<sessionId>.log`.
+- **`subagents` shows `failed` / `fetch failed` right at the five-minute
+  mark, but `get` still says `queued`.** Not necessarily a failure: the
+  spawn worker's sync `POST /v1/runs` carries Node's default 300-second
+  response timeout, so the worker's own fetch is cut off five minutes in
+  while the run keeps going on the server. Keep collecting — `get`
+  eventually printing `responded` means all is well (only the ledger
+  state is wrong, and it is sticky). If `get` stays `queued` well past
+  that, the run itself never finished server-side — re-dispatch under a
+  fresh label. Leaves that outrun five minutes are usually working
+  around the sandbox image's missing node/npm; the prompt templates
+  forbid that.
 - **`get` says `no session`.** Wrong session id, or the session was
   deleted / aged out past 24h.
 - **A leaf reports the fixture never arrived.** The seed race went
@@ -561,10 +578,14 @@ minute or two).
 
 The project's tests currently fail. Run the test suite (npm test), read the
 relevant code and the docs under docs/upstream-refs/, and report:
-1. The exact failing assertion and the test command you ran.
+1. The exact failing assertion and the test command that exercises it.
 2. The root cause, with file paths and line references.
 3. The minimal change that would fix it, described precisely — another agent
    will apply it on a fresh copy of this project.
+
+If node/npm are not installed in the sandbox, do NOT install or download
+anything — no package manager, no Node tarball. Diagnose from the source
+and docs alone, and say in your report that the suite could not be run.
 
 Do NOT edit any files: this is a diagnosis-only task. End your turn with the
 full diagnosis as your final message.
@@ -591,8 +612,11 @@ EOF
 
 **4 — seed the leaf's workspace.** Every pod, because the session pins
 to one only on its first turn. Both orderings (seed-before-boot,
-seed-after-boot) are safe — the leaf's prompt tells it to wait for
-`package.json`:
+seed-after-boot) boot the leaf correctly — its prompt tells it to wait
+for `package.json` — with one caveat: a leaf quick enough to edit files
+while the copy is still landing can have those edits overwritten by it
+(this happened once in testing; the leaf noticed and re-applied its
+work). Seed right after spawn and the window is small:
 
 ```bash
 for POD in $(kubectl -n moca-sandbox get pods -l app=moca-sandbox -o name); do
@@ -617,8 +641,10 @@ mocactl get "$SID" --out leaves --json
 ```
 
 Branch on the printed `status`, not the exit code: `queued` (exit 1)
-→ still running; `failed` (exit 1) → reason on stderr; `done`
-(exit 0) → read the result:
+→ still running; `failed` or `paused` (exit 1) → reason on stderr;
+`responded` (exit 0) → read the result. `responded` is the prompt-kind
+success — `solved` is the solve-kind twin, and `mocactl subagents`
+calls both of them `done`:
 
 ```bash
 cat leaves/"$SID".text
@@ -626,7 +652,9 @@ cat leaves/"$SID".text
 
 The diagnosis should name the renamed API: `src/index.js` calls
 `lib.oldName` while the vendored `node_modules/lib` (v2.0.0) exports
-only `newName`.
+only `newName`. (If the sandbox image has no node/npm, the leaf reports
+this from source without running the suite — expected, and its prompt
+tells it not to work around that.)
 
 **6 — chain the fix leaf.** Author its prompt with the diagnosis
 inlined **verbatim** (never point one leaf at another leaf's files —
@@ -648,15 +676,21 @@ $DIAG
 ------------------------------------------------------------------------
 
 Apply the fix in your workspace copy — edit src/, never node_modules — then
-run npm test to confirm the suite passes. Report:
+run npm test to confirm the suite passes. If node/npm are not installed in
+the sandbox, do NOT install or download anything — no package manager, no
+Node tarball: say so in your report, and verify the fix by re-reading the
+changed code against the test's assertion instead. Report:
 1. The exact change you made (file, line, before/after).
-2. The test output after your change.
+2. The test output after your change — or, if the suite could not be run,
+   the reason and your inspection-based verification.
 
 End your turn with the full report as your final message.
 EOF
 ```
 
-Dispatch it exactly like the diagnose leaf, then collect:
+Dispatch it exactly like the diagnose leaf, then collect **later** — the
+fix leaf takes minutes, and `get` exit 1 with "has not finished yet"
+just means still running:
 
 ```bash
 mocactl spawn "$(cat leaves/fix.prompt.txt)" --kind prompt --tag "$TAG" --json
@@ -679,8 +713,9 @@ mocactl get "$FIX_SID" --out leaves --json
 cat leaves/"$FIX_SID".text
 ```
 
-The report should say `src/index.js` changed (`oldName` → `newName`)
-and that the tests pass.
+The report should say `src/index.js` changed (`oldName` → `newName`) and
+that the tests pass — or, if the sandbox has no node/npm, that the fix was
+verified by inspection.
 
 **7 — see the whole chain:**
 
@@ -688,7 +723,11 @@ and that the tests pass.
 mocactl subagents --tag "$TAG"
 ```
 
-Both leaves should show `done`.
+Both leaves should show `done` — unless one ran longer than five minutes:
+the spawn worker's own HTTP request is cut off at the five-minute mark, so
+a long leaf shows up here as `failed` / `fetch failed` even though it
+completed server-side (see Troubleshooting). `mocactl get` is the source
+of truth: `responded` means it finished.
 
 Inspect a leaf's workspace while it survives (within ~30 minutes of
 its last tool call; the fix leaf's should show the change):
