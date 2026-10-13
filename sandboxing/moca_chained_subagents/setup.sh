@@ -8,8 +8,8 @@
 #      subagent commands) can drive the install end to end (mocactl doctor).
 #   2. Stage a scratch dir for the run: a copy of example_repo/ (the seed
 #      source for every leaf), a leaves/ dir for prompts/notes/results,
-#      MOCA.md runtime facts (including this run's demo tag), and Claude
-#      Code settings.
+#      MOCA.md runtime facts (including this run's demo tag), the
+#      moca-dispatch skill, and Claude Code settings.
 #
 # Everything else happens at dispatch time, via mocactl: `spawn` creates a
 # fresh session per leaf (mocactl owns all auth), and the parent seeds each
@@ -95,17 +95,24 @@ echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
 # Fresh staging on every run: the demo tag is per-run, so notes and results
 # from an earlier run would be orphaned. Collect results before re-running.
 rm -rf "${SCRATCH_DIR}"
-mkdir -p "${SCRATCH_DIR}/.claude" "${SCRATCH_DIR}/leaves"
+mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-dispatch" "${SCRATCH_DIR}/leaves"
 
-# Claude Code settings, patched with the env block that points mocactl at
-# the port-forwards. mocactl itself is already on PATH — verified above, not
-# patched.
+# Claude Code settings, patched two ways: the env block that points mocactl
+# at the port-forwards, and the kubectl allow patterns rewritten for this
+# run's sandbox namespace (the example file carries the default ns).
+# mocactl itself is already on PATH — verified above, not patched.
 cp "${SCRIPT_DIR}/settings.json.example" "${SCRATCH_DIR}/.claude/settings.json"
 settings_tmp="$(mktemp)"
-jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" \
-   '.env = ((.env // {}) + {SH_CONTROL_PLANE_URL: $cp, SH_HARNESS_URL: $harness})' \
+jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" --arg ns "${SANDBOX_NS}" \
+   '.env = ((.env // {}) + {SH_CONTROL_PLANE_URL: $cp, SH_HARNESS_URL: $harness})
+    | .permissions.allow |= map(gsub("moca-sandbox"; $ns))' \
    "${SCRATCH_DIR}/.claude/settings.json" >"${settings_tmp}"
 mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
+
+# The dispatch skill — the agent flow's mechanism contract (the by-hand
+# appendix in the README never reads it; a Claude session does).
+cp "${SCRIPT_DIR}/skill/SKILL.md" \
+   "${SCRATCH_DIR}/.claude/skills/moca-dispatch/SKILL.md"
 
 # The fixture the parent seeds every leaf's workspace from (kubectl cp
 # source at dispatch time).

@@ -308,9 +308,10 @@ This:
    This replaces all the old hand-rolled health/token/credential
    probes.
 3. Stages the scratch dir at `~/tmp/moca-chained-scratch/`:
-   `.claude/settings.json` (with the port-forward URLs injected as
-   env), a copy of `example_repo/`, an empty `leaves/`, and `MOCA.md`
-   with the runtime facts and this run's demo tag.
+   `.claude/settings.json` (with the port-forward URLs injected as env and
+   the kubectl allow patterns rewritten for the sandbox namespace), the
+   `moca-dispatch` skill, a copy of `example_repo/`, an empty `leaves/`,
+   and `MOCA.md` with the runtime facts and this run's demo tag.
 
 Setup creates **no session and seeds nothing into the cluster** —
 every session is created by `mocactl spawn` at dispatch time, and
@@ -531,8 +532,9 @@ you care about.
 PLAN-mocactl.md            Implementation plan for the mocactl migration (this README's design)
 README.md                  This file
 skill/SKILL.md             Skill Claude reads to dispatch leaves to MOCA via mocactl
-settings.json.example      Permission policy staged into the scratch dir: denies Task,
-                           allows the dispatch commands
+settings.json.example      Permission policy staged into the scratch dir: denies Task and
+                           reading mocactl's config dir, allows the mocactl dispatch and
+                           kubectl seed commands
 setup.sh                   Verifies prereqs via mocactl doctor, stages the scratch dir
 teardown.sh                Deletes the demo's leaf sessions + workspaces, removes the scratch dir
 example_repo/              Vendored fixture — Node.js project with a renamed-API bug
@@ -543,7 +545,9 @@ In the scratch dir after `setup.sh`:
 ```
 ~/tmp/moca-chained-scratch/
 ├── .claude/
-│   └── settings.json      Permission policy + port-forward env for mocactl
+│   ├── settings.json      Permission policy + port-forward env for mocactl
+│   └── skills/
+│       └── moca-dispatch/SKILL.md   The dispatch skill Claude reads
 ├── example_repo/          Fixture copy the parent seeds every leaf from
 ├── leaves/                Leaf prompts, notes (*.json), and collected results (<sid>.text)
 └── MOCA.md                Runtime facts: tag, URLs, namespace/selector/container
