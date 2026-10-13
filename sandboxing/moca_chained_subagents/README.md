@@ -5,209 +5,278 @@ tool — `Task` — but **no built-in way to offload work to the cloud**:
 a `Task` subagent runs in-process on the same laptop, inside the
 same session. This demo denies `Task` in `.claude/settings.json` and
 delegates instead through a skill that dispatches an isolated leaf to
-[MOCA](https://github.com/rossoctl/serverless-harness) by shelling out
-to a small `moca` CLI (installed into the scratch dir by `setup.sh`
-and put on `$PATH` via the staged settings).
+[MOCA](https://github.com/rossoctl/moca) by shelling out to a small
+`moca` CLI (installed into the scratch dir by `setup.sh` and put on
+`$PATH` via the staged settings).
 
-Dispatch is a **detached synchronous turn**. The parent `POST`s to
-`/runs` with no `async` field, so MOCA runs the leaf and returns the
-answer in that same response. To keep the operator's turn from
-blocking on it, `moca start` **detach-executes**: it forks a
-background worker (`nohup`, fully redirected, disowned) that owns the
-blocking HTTP call and writes the response to disk when it returns.
-`moca start` itself returns as soon as that worker is forked.
+Dispatch is a **detachable turn**. `moca start` POSTs to the harness's
+`/v1/turn` with `detachable: true`, reads the response stream only long
+enough to learn the turn's id, and then walks away. MOCA does not abort
+a detachable turn when its client disconnects — it writes every frame
+of the turn to a server-side log instead, so the leaf keeps running
+with nothing held open on your laptop.
 
-Because the worker sits outside Claude Code's process group,
-**you can quit Claude Code and come back later** — the leaf keeps
-running, the worker keeps holding the call, and a resumed Claude
-session picks up pending runs from `.moca-runs/` in the scratch dir.
+`moca check` collects by **reattaching**: it re-opens the turn's stream,
+replays it from the beginning, and follows it if it's still running.
 
-Two independent mechanisms protect the result:
-
-1. The detached worker outlives the Claude session and writes
-   `.result.json`.
-2. MOCA persists each leaf's result cluster-side **before** it writes
-   the sync HTTP response, so if the worker is killed *after the leaf
-   finished*, the result is still recoverable via `GET /runs/status`
-   for 24h.
-
-`moca check` prefers (1) and falls back to (2). Note (2) only covers a
-leaf that ran to completion — if Knative's 300s timeout cuts a leaf off
-mid-run, nothing was persisted and the work is lost. See the caveats
-under "Pause and resume".
+Durability is therefore entirely the server's job. There is no local
+background process to keep alive, which means **you can quit Claude
+Code, close the laptop, or reboot** and still collect the result. A
+finished turn stays collectable for **24 hours**.
 
 The orchestration shape is the **operator's**, not the skill's. For
 this demo the operator issues prompts in sequence:
 
 1. *"Dispatch a subagent to diagnose the failing test."* The parent
-   writes a run record, forks the detached worker, and returns the
-   session id. Operator can walk away.
+   writes a run record, starts the turn, and returns. Operator can
+   walk away.
 2. Later: *"Check on that subagent and report the diagnosis."* The
-   parent reads the worker's result file and surfaces the diagnosis.
+   parent reattaches to the turn and surfaces the diagnosis.
 3. *"Dispatch a fixer with that diagnosis."* Repeat the pattern.
 
 MOCA does not know about the chain; from its perspective each leaf is
-an independent `/runs` call that scales to zero when it's done. The
-skill does not know about the chain either — it describes how to
-start and collect one leaf, and the model composes multi-leaf flows
-from the operator's requests.
+one turn in a session. The skill does not know about the chain either —
+it describes how to start and collect one leaf, and the model composes
+multi-leaf flows from the operator's requests.
 
 For the full design, see [PLAN.md](PLAN.md).
 
+> **Running on MOCA's `deploy/k8s` path.** This demo previously targeted
+> MOCA's Knative/KEDA deployment, which upstream
+> [deprecated on 2026-10-11](https://github.com/rossoctl/moca/blob/main/docs/migrating-from-knative.md).
+> See [What changed from the Knative path](#what-changed-from-the-knative-path).
+
 ## How it works
 
-Three pieces cooperate:
+Four pieces cooperate:
 
 1. **A skill (`moca-dispatch`)** — the mechanism contract. Tells
-   Claude how to invoke the `moca` CLI (`start`, `check`, `list`),
-   how to compose leaf prompts (workspace path, forward-passed
-   context, deliverable shape), and how to sequence a chain. Does
-   **not** prescribe how many leaves to run or in what order — that
-   comes from the operator's prompts.
+   Claude how to invoke the `moca` CLI (`start`, `check`, `list`,
+   `cancel`), how to compose leaf prompts (workspace path,
+   forward-passed context, deliverable shape), and how to sequence a
+   chain. Does **not** prescribe how many leaves to run or in what
+   order — that comes from the operator's prompts.
 2. **A `moca` CLI** — a small shell script staged at
-   `<scratch>/bin/moca` by setup. Wraps the sync `POST /runs` (plus
-   `GET /runs/status` as a recovery fallback) with the host header,
-   forks and tracks the detached worker, parses MOCA's responses, and
-   writes/updates run records in `.moca-runs/` so the shape on disk is
-   always what the skill expects. Keeps the permission prompt short
-   (`moca start r1.diagnose r1-diagnose.prompt.txt`) instead of a long
-   curl line.
+   `<scratch>/bin/moca` by setup. Mints session tokens, starts
+   detachable turns, reattaches to collect them, rebuilds each answer
+   from the turn's streamed text frames, and writes run records in
+   `.moca-runs/` so the shape on disk is always what the skill expects.
+   Keeps the permission prompt short (`moca start diagnose
+   diagnose.prompt.txt`) instead of a long curl line.
 3. **A denied `Task` tool** — `.claude/settings.json` denies the
    built-in subagent tool, so the model has to route through the skill
    instead of forking in-process. The permission prompt on each
    `moca start …` is the operator's visual confirmation that the leaf
    is being dispatched to MOCA, not run locally.
-4. **A seeded sandbox pool** — `setup.sh` copies `example_repo/`
-   into every pool-labeled sandbox pod at
-   `/workspace/<run-id>/repo` via `kubectl cp`. A leaf leases an
-   arbitrary pool pod, so every one needs the fixture. The skill only
-   dispatches runs; it never touches `/workspace` at runtime.
+4. **One session, seeded at setup** — `setup.sh` creates a single MOCA
+   session for the whole chain and seeds `example_repo/` into that
+   session's sandbox workspace with a bootstrap turn. The skill only
+   dispatches turns; it never touches `/workspace` at runtime.
 
-The sync `POST /runs` returns the leaf's answer inline to the detached
-worker, which writes it to `.result.json`. Run records live in
-`.moca-runs/` in the scratch dir — one JSON file per dispatched leaf,
-plus its `.prompt.txt`, `.result.json`, and the worker's `.log`. A
-resumed Claude session finds in-flight work by reading that directory,
-and `moca list` reports whether each pending run's worker is still
-alive.
+Run records live in `.moca-runs/` in the scratch dir — one JSON file
+per dispatched leaf, plus its `.prompt.txt`, the raw `.sse` transcript,
+and the extracted `.answer.txt`. A resumed Claude session finds
+in-flight work by reading that directory.
+
+## Two origins, two kinds of token
+
+This is the biggest structural difference from the old Knative setup,
+and it's worth understanding before you debug anything:
+
+| Origin | Port-forward | Serves | Needs |
+| --- | --- | --- | --- |
+| Control plane | `8090` | `/v1/sessions`, `/v1/credentials` | **API token** |
+| Supervisor (harness) | **`8080`** | `/v1/turn`, `/v1/turn/cancel` | **Session token** |
+
+- The **API token** is your identity. `mocactl` obtains it via a GitHub
+  device-flow login and refreshes it for you.
+- A **session token** is scoped to one session and lives about **300
+  seconds**. The harness rejects an API token, and the control plane
+  rejects a session token.
+
+Because 300s is shorter than any realistic pause, `moca` re-mints a
+session token (`POST /v1/sessions/{id}/token`) immediately before every
+harness call rather than caching one. You never manage this by hand.
+
+The supervisor's port-forward **must** use local port `8080`: the
+control plane advertises the harness to clients as
+`http://127.0.0.1:8080`.
+
+## One session, one workspace
+
+Every leaf in a chain is a turn in the **same** session, so every leaf
+shares one sandbox workspace at `/workspace/<session-id>`. That is what
+lets a fix leaf work on the files a diagnose leaf examined — MOCA
+derives the workspace path from the session id, so there is no way to
+point two sessions at one directory.
+
+Three consequences:
+
+- **Leaves run sequentially.** A session runs one turn at a time; a
+  second concurrent turn is refused with `409 turn_in_progress` and
+  nothing starts. The chain this demo shows is sequential anyway.
+- **Leaves are not isolated from each other.** The isolation boundary
+  is this chain versus everything else, not leaf versus leaf.
+- **Session ids are server-generated.** You pass `moca` a short local
+  label (`diagnose`, `fix`) that names files in `.moca-runs/`. The old
+  `<run-id>.<leaf-label>` scheme is gone.
 
 ## How state flows
 
-- **Setup time.** `setup.sh` copies `example_repo/` into every
-  pool-labeled sandbox pod at `/workspace/<run-id>/repo` via
-  `kubectl cp`. The fixture is cluster-side before Claude ever starts.
+- **Setup time.** `setup.sh` creates the session, then runs a bootstrap
+  turn that extracts `example_repo/` into the session's workspace. The
+  fixture is cluster-side before Claude ever starts. (It is seeded by
+  the agent rather than `kubectl cp` because the workspace doesn't
+  exist, and the sandbox pod isn't chosen, until the session's first
+  tool call.)
 - **Dispatch.** The only state going from the laptop to MOCA at
-  dispatch time is the prompt text and the sessionId. The parent
+  dispatch time is the prompt text and the session id. The parent
   embeds any output from prior leaves into the next leaf's prompt as
-  plain text; there is no shared memory between leaves.
-- **Execution.** MOCA cold-starts the harness revision, which runs the
-  agent and exec's into one of the leased pool pods, working against
-  `/workspace/<run-id>/repo` on that pod.
-- **Return.** The leaf's answer comes back as the `.text` field of the
-  sync `POST /runs` response (alongside `status: "responded"` and a
-  `usage` block), which the detached worker writes verbatim to
-  `.result.json`. Files the leaf wrote stay on the sandbox pod and do
-  **not** come back to the laptop. If the operator wants to see a diff
-  or a test log, the leaf's prompt must ask for it as text in the
-  response.
+  plain text.
+- **Execution.** The supervisor hands the turn to a warm worker, which
+  runs the agent and executes its tool calls in the sandbox pod,
+  working in `/workspace/<session-id>`.
+- **Return.** The leaf's prose arrives as a stream of `text` frames,
+  each carrying a delta; `moca check` concatenates them into
+  `.answer.txt`. Files the leaf wrote stay on the sandbox pod and do
+  **not** come back to the laptop. If you want to see a diff or a test
+  log, the leaf's prompt must ask for it as text in the response.
 
 ## Inspecting state in the sandbox
 
-Files a leaf writes stay on the sandbox pod — they do not come back to
-the laptop. To see what actually changed, go look:
+Files a leaf writes stay on the sandbox pod. To see what actually
+changed, go look (substitute the session id and pod from `MOCA.md`):
 
 ```bash
-# Which run directories exist on a pool pod
-kubectl -n default exec sandbox-0 -- ls /workspace
+# The workspace for this session
+kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
+  ls -la /workspace/<session-id>
 
-# The fixture for this run
-kubectl -n default exec sandbox-0 -- ls -la /workspace/<run-id>/repo
-
-# Did the fixer's rename land?
-kubectl -n default exec sandbox-0 -- cat /workspace/<run-id>/repo/src/index.js
+# Did the fixer's change land?
+kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
+  cat /workspace/<session-id>/src/index.js
 ```
 
-Two things to keep in mind:
+Three things to keep in mind:
 
-- **A leaf leases an arbitrary pool pod.** If a change isn't on
-  `sandbox-0`, check `sandbox-1` and `sandbox-2`. To find it without
-  guessing, ask the leaf's prompt to report `hostname` in its answer.
+- **`setup.sh` tells you which pod** — it verifies the fixture and
+  records the pod name in `MOCA.md`. A session stays on the sandbox
+  that served its previous turn, so that pod stays correct.
+- **`-c sandbox` is required**, and the namespace is `moca-sandbox`,
+  not `moca`.
 - **The fixture is not a git repo**, so `git diff` won't work in the
   sandbox. If you want a diff, have the leaf's prompt ask for one as
-  text in its response.
+  text.
 
-Local run state — prompts, results, worker logs — lives in
-`.moca-runs/` in the scratch dir:
+Local run state lives in `.moca-runs/` in the scratch dir:
 
 ```bash
 cd ~/tmp/moca-chained-scratch
-moca list                                    # every record + worker liveness
-cat .moca-runs/<run-id>-<leaf>.result.json   # full response incl. usage
-cat .moca-runs/<run-id>-<leaf>.log           # the detached worker's stderr
+moca list                              # every record + status
+cat .moca-runs/<leaf>.answer.txt       # the extracted answer
+cat .moca-runs/<leaf>.sse              # raw frames, incl. tool calls
 ```
 
 ## What's honest and what isn't
 
-- **Isolation here is prompt-only, not substrate-enforced.** This
-  MOCA install exposes a shared pool of sandbox pods and no per-run
-  mount-posture controls — `moca start` sends `kind:"prompt"`, and
-  there is no `workload` field, no per-run `readOnly` flag, and no
-  `/workloads` endpoint to pre-register posture-specific workloads.
-  The researcher-vs-fixer split lives in the prompts you write
-  ("do not modify files" vs "apply this fix"); a non-compliant leaf
-  could ignore it. A later version of this demo may bring back
-  substrate-enforced read-only mounts if MOCA grows that surface.
+- **Isolation here is prompt-only, not substrate-enforced.** `moca
+  start` sends a prompt and nothing else — there is no `readOnly` flag
+  and no workload catalog on this install. The researcher-vs-fixer
+  split lives in the prompts you write ("do not modify files" vs
+  "apply this fix"); a non-compliant leaf could ignore it.
 
-- **Every leaf gets the same tools.** MOCA gives every leaf the same
-  seven (`read, write, edit, ls, find, bash, grep`) with no web-fetch
-  tool and no per-leaf `tools` allowlist on `LeafEnvelope`. Honest
-  capability splits would need an upstream `tools` field.
+- **Leaves in a chain are not isolated from each other.** They share a
+  session and therefore a workspace. The real boundary is the sandbox
+  pod and its NetworkPolicy, which separate this chain from the rest of
+  the cluster — not one leaf from the next.
+
+- **`/workspace/<session-id>` is not a security boundary.** Upstream
+  says so explicitly: every session's directory sits under the same
+  `/workspace` root, owned by the same user, in the same container. A
+  leaf that runs `cd ..` can read another session's files.
+
+- **The workspace is not durable.** It is container-local with no
+  volume, so a sandbox pod restart destroys it — taking the fixture
+  with it. It is also reclaimed after a period with no tool call
+  (`setup.sh` widens that to 8h; the default is 30m). The turn log in
+  Redis is unaffected by either, so a *collected answer* survives what
+  the *files* don't. If the files vanish mid-chain, re-run `./setup.sh`
+  for a fresh session.
+
+- **Every leaf gets the same tools.** There is no per-leaf tools
+  allowlist, so honest capability splits would need upstream support.
 
 - **Chaining is parent-side.** MOCA has no "on complete, trigger X"
-  primitive; the parent Claude session does the sequencing between
-  the operator's two prompts. The skill does not encode the chain
-  either — the operator's two prompts and the parent's judgment do.
+  primitive; the parent Claude session does the sequencing between the
+  operator's prompts.
 
 ## Prerequisites
 
-- A kind cluster with [MOCA](https://github.com/rossoctl/moca) deployed via
-  its [quick-start](https://github.com/rossoctl/moca#quick-start). That
-  flow installs the harness in the `default` namespace behind Kourier and
-  brings up the sandbox pool.
-- `kubectl` configured for that cluster.
+- A kind cluster with [MOCA](https://github.com/rossoctl/moca) deployed
+  via `deploy/k8s/setup.sh`. From a MOCA checkout:
 
-> **No KEDA ScaledJob needed.** The `leaf-worker` ScaledJob drains
-> MOCA's async Redis stream. This demo uses the sync run path
-> exclusively, where the Knative harness revision runs the agent
-> itself and exec's into a leased sandbox pod — so no `leaf-worker`
-> Job is ever created and the ScaledJob stays `ACTIVE=False` even
-> while leaves are running. If it's installed, it's harmless and idle.
-- `curl` and `jq` on your `PATH`.
+  ```bash
+  cd deploy/k8s
+  SH_GITHUB_CLIENT_ID=<your-oauth-client-id> ./setup.sh --target kind --build
+  ```
+
+  This installs the supervisor, control plane, relay, Redis and the
+  sandbox StatefulSet into namespaces `moca` and `moca-sandbox`.
+
+  > **kind ≥ 0.24.0 with a NetworkPolicy-enforcing CNI is a hard
+  > requirement.** Isolation between the sandbox namespace and
+  > everything else is enforced by NetworkPolicy; a CNI that ignores
+  > them silently removes the boundary rather than failing loudly.
+
+- `kubectl` configured for that cluster.
+- `curl`, `jq`, `tar`, `base64` on your `PATH`.
+- [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
+  (needs Node 22+), for login and credentials:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | sh
+  ```
+
 - Claude Code CLI.
 
-MOCA is reached through Kourier. In another terminal, port-forward the
-Kourier gateway and export the Host / Base env vars:
+### Start both port-forwards
+
+In two other terminals. The harness **must** be on local port 8080:
 
 ```bash
-kubectl port-forward -n kourier-system svc/kourier 8080:80
-
-export HOST="serverless-harness.default.example.com"
-export BASE="http://localhost:8080"
+kubectl port-forward -n moca svc/moca-supervisor 8080:8080
+kubectl port-forward -n moca svc/moca-control-plane 8090:8080
 ```
 
-Every call to MOCA must send `-H "Host: $HOST"` — Kourier routes by Host.
-`setup.sh` and the dispatch skill both do this automatically.
-
-**Raise the Knative request timeout before your first dispatch.** The
-300s default is not enough for the fixer leaf, which must edit a file,
-re-run tests, and report a diff — often after a cold start. Exceeding
-it yields `504 activator request timeout` and an unrecoverable result
-(see Troubleshooting).
+### Log in and store an inference credential
 
 ```bash
-kubectl -n default patch service.serving.knative.dev serverless-harness \
-  --type=merge -p '{"spec":{"template":{"spec":{"timeoutSeconds":1800}}}}'
+export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+mocactl login
+mocactl doctor
 ```
+
+MOCA issues inference credentials **per user**, and session creation
+fails without one. Store your Anthropic key:
+
+```bash
+printf %s "$ANTHROPIC_API_KEY" | mocactl credentials add anthropic \
+  --host api.anthropic.com --kind api-key \
+  --endpoint https://api.anthropic.com
+```
+
+With exactly one inference credential stored, MOCA selects it
+automatically. If you have several, pass
+`MOCA_INFERENCE_CRED=<name>` to `setup.sh`.
+
+> **There is no operator-wide key fallback on this path.**
+> `SH_ALLOW_OPERATOR_FALLBACK=true` also requires
+> `SH_OPERATOR_INFERENCE_TOKEN`, which this deployment does not wire —
+> turning it on makes the control plane refuse to boot. A per-user
+> credential is the only supported option here.
+
+No Knative timeout to raise, no Kourier, no `Host` header, and no
+`leaf-worker` ScaledJob: none of those exist on this path.
 
 ## Setup
 
@@ -219,25 +288,37 @@ From this directory:
 
 This:
 
-1. Verifies `kubectl`, `curl`, `jq` are on `PATH` and that MOCA is
-   reachable at `http://localhost:8080`.
-2. Copies `example_repo/` into every pool-labeled sandbox pod at
-   `/workspace/<run-id>/repo` via `kubectl cp`.
-3. Stages `.claude/settings.json`, `.claude/skills/moca-dispatch/`,
+1. Verifies the tooling, both namespaces, and both port-forwards.
+2. Obtains an API token via `mocactl auth token` (or `MOCA_API_TOKEN`)
+   and writes it to `<scratch>/.moca-auth/api.hdr`, mode 0600.
+3. Checks you have an inference credential.
+4. Widens the sandbox workspace idle timeout to 8h, so a paused demo
+   doesn't lose its files.
+5. Creates **one** session for the chain and seeds `example_repo/` into
+   `/workspace/<session-id>` with a bootstrap turn, then verifies the
+   files landed and records which sandbox pod served it.
+6. Stages `.claude/settings.json`, `.claude/skills/moca-dispatch/`,
    and `bin/moca` into `~/tmp/moca-chained-scratch/`, and patches
-   `settings.json` so the scratch `bin/` is on `$PATH` for the
-   Bash tool.
-4. Writes `MOCA.md` into the scratch dir with the base URL, host
-   header, run id, and workspace path.
+   `settings.json` so the scratch `bin/` is on `$PATH`.
+7. Writes `MOCA.md` with both URLs, the session id, the workspace path,
+   and the sandbox pod.
 
 Environment overrides (set before running):
 
-- `MOCA_NS` — MOCA namespace (default `default`).
-- `MOCA_PORT` — local port the port-forward uses (default `8080`).
-- `SANDBOX_POOL_SELECTOR` — label selector for pool pods
-  (default `sh.kagenti.io/sandbox-pool=default`).
-- `RUN_ID` / `WORKSPACE_REF` — run id and workspace path to seed.
+- `MOCA_NS` / `SANDBOX_NS` — namespaces (default `moca` /
+  `moca-sandbox`).
+- `HARNESS_PORT` / `CP_PORT` — local port-forward ports (default
+  `8080` / `8090`). Changing `HARNESS_PORT` breaks discovery.
+- `MOCA_API_TOKEN` — use this token instead of calling `mocactl`.
+- `MOCA_INFERENCE_CRED` — pick a credential when you have several.
+- `WORKSPACE_IDLE` — workspace idle timeout (default `8h`).
 - `SCRATCH_DIR` — scratch dir path.
+
+> **Tokens are written to header files, never passed on a command
+> line.** Anything on a command line is readable by any process on the
+> machine via `ps`. `<scratch>/.moca-auth/` is mode 0700, its contents
+> 0600, the staged settings deny reading it, and `teardown.sh` removes
+> it.
 
 ## Run a session
 
@@ -250,10 +331,10 @@ not encode the flow; you drive it.
 
 **Prompt 1 — start the diagnosis.** Paste something like:
 
-> There's a Node.js project seeded at `/workspace/<run-id>/repo` on
-> MOCA (the exact path is in `MOCA.md`). Dispatch a subagent to
-> diagnose why its tests are failing. Tell the leaf to read-only —
-> do not modify files, do not run shell commands beyond `npm test`.
+> There's a Node.js project at the workspace path in `MOCA.md` on
+> MOCA. Dispatch a subagent to diagnose why its tests are failing.
+> Tell the leaf it's read-only — do not modify files, do not run
+> shell commands beyond `npm test`.
 
 Claude should:
 
@@ -261,125 +342,98 @@ Claude should:
 2. **Not** invoke `Task` — if it tries, the deny fires and it
    re-routes through the skill.
 3. Write the leaf's prompt to a file in `.moca-runs/` and run
-   `moca start <run-id>/diagnose <that file>`. The permission prompt
-   shows the `moca start …` command — short, legible, and clearly
-   not a local shell execution.
-4. The CLI writes a record file at
-   `.moca-runs/<run-id>-<leaf-label>.json`, forks the detached worker,
-   and returns control to you with the sessionId and the worker's pid.
-   The leaf is now running on the cluster; this turn is over.
+   `moca start diagnose <that file>`. The permission prompt shows the
+   `moca start …` command — short, legible, and clearly not a local
+   shell execution.
+4. The CLI writes a record at `.moca-runs/diagnose.json`, starts the
+   detachable turn, and returns control to you with the session and
+   turn ids. The leaf is now running on the cluster; this turn is over.
 
 **Prompt 2 — collect the diagnosis.** When you're ready (seconds to
-minutes later, same session or a resumed one):
+hours later, same session or a resumed one):
 
 > Check on that subagent and report the diagnosis.
 
-Claude runs `moca check <session-id>`, which reads the
-`.result.json` the detached worker wrote and prints the leaf's `.text`
-to stdout for Claude to surface to you. If the leaf is still running,
-`check` says so and the turn ends — Claude should not sit in a polling
-loop.
+Claude runs `moca check diagnose`, which reattaches to the turn,
+rebuilds the answer from its text frames, and prints it. If the leaf is
+still running, `check` says so and the turn ends — Claude should not
+sit in a polling loop.
 
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
 > Good. Dispatch another subagent to apply that fix, run the tests,
 > and report the diff and outcome.
 
-Claude dispatches a second leaf, embedding the diagnosis from
-Prompt 2 verbatim in the new leaf's prompt. Record is written.
-Control returns to you.
+Claude dispatches a second leaf, embedding the diagnosis from Prompt 2
+verbatim in the new leaf's prompt.
 
-> **Note on isolation.** On this MOCA install there is no per-run
-> read-only mount — both the researcher and the fixer leaves get
-> the same substrate posture. The researcher's "don't modify files"
-> contract lives in its prompt, not in the mount. See "What's honest
-> and what isn't" above.
+> **Note on isolation.** Both leaves share this chain's session and
+> workspace, which is what lets the fixer see the files the researcher
+> read. The researcher's "don't modify files" contract lives in its
+> prompt, not in the substrate. See "What's honest and what isn't".
 
 **Prompt 4 — collect the fix result.**
 
 > Check on it.
 
-Claude polls, surfaces the diff and test outcome.
+Claude reattaches and surfaces the diff and test outcome.
 
 While leaves run, in another terminal:
 
 ```bash
-kubectl -n default get pods -w
+kubectl -n moca get pods
+kubectl -n moca logs -f deploy/moca-supervisor
 ```
 
-You should see the `serverless-harness-*` revision cold-start on
-dispatch and scale back to zero once it goes idle. That's the
-MOCA-value visual: the subagent's work ran on infrastructure that
-didn't exist before you asked and won't exist after.
-
-You will **not** see `leaf-worker-*` pods — those belong to MOCA's
-async queue, which this demo doesn't use. On the sync path the harness
-revision runs the agent itself and exec's into a leased `sandbox-*`
-pod.
+Both the supervisor and the sandbox pods are **warm** — nothing scales
+to zero on this path, and nothing cold-starts. What you're watching for
+is the work landing in a sandbox pod that your laptop never touches.
 
 ## Pause and resume
 
-Because the blocking call lives in a detached worker rather than in
-Claude's turn, you can quit Claude any time after a dispatch has
-written its record file in `.moca-runs/`. The worker keeps holding the
-call and the leaf keeps running on the cluster.
+Because MOCA owns the turn's durability, you can quit Claude any time
+after a dispatch has written its record in `.moca-runs/`. Nothing local
+is holding the turn open.
 
-To resume: just start Claude again from the scratch dir
-(`cd ~/tmp/moca-chained-scratch && claude`). On the next turn, ask
-Claude to check for pending runs:
+To resume: start Claude again from the scratch dir
+(`cd ~/tmp/moca-chained-scratch && claude`) and ask:
 
 > Any subagents still pending from an earlier session?
 
-Claude runs `moca list`, which finds records with `status: "pending"`
-and reports whether each one's detached worker is still alive. For
-each, `moca check` reads the worker's result file — or, if the worker
-was lost, recovers the result from `/runs/status`.
+Claude runs `moca list` and reports each record's status. For anything
+`running`, `moca check` reattaches and collects it.
 
 The scratch dir **is** the resumable state. Everything needed to pick
-up a dropped session — settings, skill, pending run records,
-completed results — is in it. Nothing lives in `$HOME` or in the
+up a dropped session is in it. Nothing lives in `$HOME` or in the
 Claude Code session identifier.
+
+**What survives and what doesn't:**
+
+| Event | Result collectable? |
+| --- | --- |
+| Quit Claude Code | Yes |
+| Reboot the laptop | Yes |
+| Wait up to 24h | Yes (`SH_TURN_LOG_TTL_S`) |
+| Wait past 24h | No — `status=lost` |
+| Leaf runs 30min with nobody attached | No — aborted `unwatched` |
+| Supervisor pod restarts mid-turn | No — aborted `restarting` |
+| Sandbox pod restarts | Answer yes, **files no** |
+| `./teardown.sh` | No — deletes the session |
 
 **Caveats.**
 
-- **Quitting Claude is safe; rebooting your laptop is not.** The
-  detached worker is a local process. If it dies, the leaf still
-  completes cluster-side and `moca check` recovers the result from
-  `/runs/status` — but only within MOCA's retention window.
-- **Result retention is 24h by default**
-  (`LEAF_RESULT_TTL_SECONDS`). After that, a recovery poll returns
-  `{"status":"queued"}` — MOCA cannot distinguish an expired result
-  from one that never ran — and the CLI reports `status=lost`.
-- **Knative caps a single request at 300s** (`timeoutSeconds` in
-  MOCA's `service.yaml`), and this is the most likely way a realistic
-  leaf fails. Kourier's activator returns a plain-text `504
-  activator request timeout` — not JSON — and `moca check` reports
-  `status=gateway-error`.
-
-  **A 300s timeout usually means the result is gone, not recoverable.**
-  The "MOCA persists before responding" guarantee only helps once the
-  leaf *finished*; a leaf cut off mid-run never got that far, and
-  `/runs/status` answers `queued` (which MOCA also returns for "never
-  recorded" and "expired", so it cannot be distinguished). `moca check`
-  reports `status=lost`.
-
-  Raise `timeoutSeconds` before demoing — see Prerequisites. Keep leaf
-  prompts tightly scoped too; narrow deliverables finish faster and are
-  less likely to hit the cap.
-
-  **A timed-out leaf may have still done the work.** The 504 kills the
-  reporting channel, not the leaf — it can apply its edits on the
-  sandbox pod and then lose the connection before answering. `moca
-  check` cannot tell this apart from "never ran". Go look at the pod
-  (see "Inspecting state in the sandbox") before assuming nothing
-  happened.
-- **Saturation is retryable, not a failure.** On a full sandbox pool
-  MOCA returns 503 and deliberately stores *no* result record, so
-  nothing ran. The CLI reports `status=saturated`; re-dispatch under a
-  new leaf label.
-- Unlike MOCA's async queue, this sync path **works on authenticated
-  deployments too** (`async:true` is rejected with 501 whenever a
-  token is presented). This demo's cluster is unauthenticated anyway.
+- **The 30-minute unwatched abort is the one to watch.** A turn running
+  with nobody attached for 30 continuous minutes is aborted with
+  `abortReason: unwatched`. Running `moca check` counts as attaching
+  and resets that clock, so check in on long leaves rather than
+  disappearing for an hour. A **finished** turn is never aborted — it
+  just waits out its 24h window.
+- **These are infrastructure outcomes, not findings.** `unwatched`,
+  `restarting`, `lease_lost`, `owner_lost`, `saturated` and `refused`
+  all tell you nothing about the code under review. The CLI explains
+  each in plain language; don't let them get reported as a diagnosis.
+- **Delete the session last.** `teardown.sh` deletes it, which makes
+  its turn logs unreachable. Collect what you care about first.
 
 ## Teardown
 
@@ -387,64 +441,85 @@ Claude Code session identifier.
 ./teardown.sh
 ```
 
-This removes the seeded fixture from the sandbox pool pods and
-deletes the scratch directory. It does **not** touch MOCA or your
-cluster. If a `kubectl port-forward` is still running, `Ctrl-C` it.
+This deletes the demo's session, restores the sandbox workspace idle
+timeout, and removes the scratch directory (including the API token).
+It does **not** touch MOCA, your cluster, or your `mocactl` login. If
+the port-forwards are still running, `Ctrl-C` them.
+
+## What changed from the Knative path
+
+If you ran the earlier version of this demo, essentially the whole
+transport changed:
+
+| Then (Knative) | Now (`deploy/k8s`) |
+| --- | --- |
+| `POST /runs`, `GET /runs/status` | `POST /v1/turn`, `GET /v1/turn?sessionId=` |
+| `-H "Host: serverless-harness…"` via Kourier | Two port-forwards, no Host header |
+| Unauthenticated | API token + per-session token, both required |
+| Operator-chosen ids (`review-1.diagnose`) | Server-generated session id + local labels |
+| A fixture on every pool pod at `/workspace/<run-id>/repo` | One workspace at `/workspace/<session-id>` |
+| Local `nohup` worker holding a blocking call | Server-side detachable turn, 24h replay |
+| Raise Knative's 300s `timeoutSeconds` | No request cap to raise |
+| Scale-to-zero; `leaf-worker` ScaledJob | Warm supervisor and sandbox pods |
+| Namespace `default`, pods `sandbox-N` | Namespaces `moca` / `moca-sandbox`, pods `moca-sandbox-N` |
+
+The upstream deprecation notice and full mapping is in
+[`docs/migrating-from-knative.md`](https://github.com/rossoctl/moca/blob/main/docs/migrating-from-knative.md).
 
 ## Troubleshooting
 
-- **`curl: (7)` / connection refused.** The MOCA port-forward is not
-  running. Start it in another terminal.
-- **`401` / `403` from `POST /runs`.** Your MOCA deployment has auth
-  enabled and the CLI sends no token. The sync path itself supports
-  authenticated deployments; this demo just doesn't wire up a token.
-- **`moca check` reports `Session id must be non-empty, contain only
-  alphanumeric characters, '-', '_', and '.'`.** The session id
-  contained an illegal character — almost always a `/`. MOCA rejects
-  it at the API boundary, so **nothing ran**; this is not a finding
-  about the project under test. Use `<run-id>.<leaf-label>` (e.g.
-  `review-123.diagnose`). The CLI now validates this locally before
-  dispatching, so you should see it fail at `start` instead. Note the
-  "must be non-empty" wording is a red herring when the id was
-  non-empty but had a bad character.
-
-- **`moca check` says `status=saturated`.** MOCA's sandbox pool was
-  full (HTTP 503) and nothing ran. Wait or scale, then re-dispatch
-  under a new leaf label.
-- **`moca check` says `status=lost`.** The detached worker is gone and
-  MOCA holds no result for that sessionId — either the result aged out
-  (24h TTL), MOCA was restarted, or the leaf was never scheduled.
-  Re-dispatch under a new leaf label if you still want the work done.
-- **A run never seems to finish.** Check whether its worker is alive
-  with `moca list`. If the worker is alive but the leaf is slow, check
-  `kubectl -n default get pods` for a running `serverless-harness-*`
-  pod. Remember Knative cuts any single request at 300s by default —
-  the result is still recoverable, but the worker will log a transport
-  error.
-- **The worker's own errors.** Each run's detached worker logs to
-  `.moca-runs/<run>-<leaf>.log`. Read it when `check` can't explain a
-  failure.
-- **Claude tries `Task` and gets denied, then stops.** The skill
-  wasn't found. Confirm
+- **`curl: (7)` / connection refused.** A port-forward isn't running.
+  You need **both** — the harness on 8080 and the control plane on
+  8090.
+- **`setup.sh` says "not logged in".** Run
+  `mocactl --control-plane-url http://127.0.0.1:8090 login`.
+- **`setup.sh` says "no inference credential stored".** Add one with
+  `mocactl credentials add` (see Prerequisites). Session creation fails
+  without it, and there is no operator-key fallback on this path.
+- **`setup.sh` says "you have N inference credentials".** MOCA
+  auto-selects only when there's exactly one. Re-run with
+  `MOCA_INFERENCE_CRED=<name> ./setup.sh`.
+- **`401` / `403` from the harness.** A session token is required on
+  `/v1/turn`, and an API token is rejected there. The CLI mints one per
+  call, so this usually means `MOCA.md`'s session id doesn't match the
+  token's session — re-run `./setup.sh`.
+- **`moca check` says `status=refused (HTTP 409 turn_in_progress)`.**
+  Another leaf of this chain is still running. All leaves share one
+  session, and a session runs one turn at a time. Collect the running
+  leaf first (`moca list`, then `moca check <it>`).
+- **`moca check` says `status=running` forever.** Reattaching is free
+  and doesn't disturb the leaf, so keep checking. If it has run more
+  than 30 minutes, it may have been aborted `unwatched` — `check` will
+  say so once the terminal frame lands.
+- **`moca check` says `status=lost`.** MOCA holds no turn log: it never
+  started, or the 24h window expired. Re-dispatch under a new label.
+- **`status=failed` with `abortReason: unwatched`.** Nobody was
+  attached for 30 minutes while the leaf ran. Infrastructure, not a
+  finding. Re-dispatch and `moca check` sooner.
+- **`status=failed` with `abortReason: restarting`.** The supervisor
+  rolled mid-turn, which aborts detached turns. Re-dispatch.
+- **The fixture is gone from the workspace.** The sandbox pod restarted
+  (the workspace has no volume), or it sat idle past the timeout. Run
+  `./teardown.sh && ./setup.sh` for a fresh session.
+- **`setup.sh` says it "could not verify the fixture".** The bootstrap
+  turn didn't extract the archive. Read the transcript it names
+  (`<scratch>/.moca-auth/bootstrap.sse`) to see what the agent actually
+  did.
+- **Claude tries `Task` and gets denied, then stops.** The skill wasn't
+  found. Confirm
   `~/tmp/moca-chained-scratch/.claude/skills/moca-dispatch/SKILL.md`
   exists; re-run `./setup.sh` if it doesn't.
-- **Claude asks "which workload is read-only?" or similar.** The
-  operator prompt said "read-only workload" / "read-write workload",
-  but this MOCA install exposes no workload catalog and the CLI
-  takes no workload argument. Rephrase the prompt without those
-  terms — the researcher-vs-fixer split is prompt-only here (see
-  "What's honest and what isn't").
-- **A diagnosis leaf reads a stale version of the fixture.** The
-  sandbox pods weren't re-seeded after you edited `example_repo/`.
-  Run `./teardown.sh && ./setup.sh` — setup wipes the per-run
-  directory on each pool pod and re-copies.
+- **Claude asks "which workload is read-only?"** This install exposes
+  no workload catalog and the CLI takes no workload argument. Rephrase
+  without those terms — the split is prompt-only here.
 
 ## Security note
 
-This demo is not secured. MOCA is unauthenticated in the default kind
-deployment; anyone with access to the port-forward can dispatch leaves.
-Do not run this configuration against anything other than a throwaway
-local cluster.
+This demo runs against a throwaway local cluster. MOCA's own auth **is**
+enabled on this path (unlike the old Knative demo), so leaves require a
+valid token — but the demo stores an API token on disk in the scratch
+dir and widens a cluster-wide workspace timeout. Don't point it at
+anything you care about.
 
 ## Files in this directory
 
@@ -452,17 +527,17 @@ local cluster.
 PLAN.md                    Design doc (trimmed)
 README.md                  This file
 skill/SKILL.md             Skill Claude reads to dispatch leaves to MOCA
-bin/moca                   Small CLI the skill shells out to (start / check / list);
-                           start detach-executes the blocking sync call
-settings.json.example      Permission policy: denies Task, allows moca start/check/list
-setup.sh                   Seeds fixture into sandbox pods, stages scratch (incl. .moca-runs/ and bin/moca)
-teardown.sh                Removes seeded fixture and the scratch dir
+bin/moca                   CLI the skill shells out to (start / check / list / cancel);
+                           start opens a detachable turn, check reattaches to collect
+settings.json.example      Permission policy: denies Task, allows the moca CLI
+setup.sh                   Creates the session, seeds the fixture, stages the scratch dir
+teardown.sh                Deletes the session, restores settings, removes the scratch dir
 example_repo/              Vendored fixture — Node.js project with a renamed-API bug
 ```
 
 > `lib/ctx.sh` is a leftover from an earlier design that used a
 > Context Service PVC + per-posture workloads. The current setup
-> seeds the sandbox pool directly and does not source it.
+> seeds one session's workspace and does not source it.
 
 In the scratch dir after `setup.sh`:
 
@@ -472,34 +547,35 @@ In the scratch dir after `setup.sh`:
 │   ├── settings.json              Allow-list for moca CLI + PATH env pointing at bin/
 │   └── skills/moca-dispatch/      Copied from skill/
 ├── bin/
-│   └── moca                       CLI the skill invokes; detach-executes the sync POST /runs
-├── .moca-runs/                    Run records (+ *.prompt.txt / *.result.json / *.log siblings)
-└── MOCA.md                        Base URL, host header, run-id, workspace path for this session
+│   └── moca                       CLI the skill invokes
+├── .moca-auth/                    API token (0600) + bootstrap transcript
+├── .moca-runs/                    Run records (+ *.prompt.txt / *.sse / *.answer.txt)
+└── MOCA.md                        URLs, session id, workspace path, sandbox pod
 ```
 
 ## Appendix: running the flow by hand
 
 What Claude is meant to run for each operator prompt, without the agent
-noise. Substitute your run id from `MOCA.md` for `review-123`; leaf
-prompt text is illustrative.
+noise. Leaf prompt text is illustrative.
 
 ```bash
 cd ~/tmp/moca-chained-scratch
 export PATH="$HOME/tmp/moca-chained-scratch/bin:$PATH"
+WS="$(grep -E '^Workspace:' MOCA.md | sed -E 's/^Workspace:[[:space:]]+//')"
 ```
 
 Prompt 1 — dispatch the diagnosis:
 
 ```bash
-cat > .moca-runs/review-123-diagnose.prompt.txt <<'EOF'
+cat > .moca-runs/diagnose.prompt.txt <<EOF
 You are a read-only diagnostic agent working in an isolated sandbox.
-Your workspace is a Node.js project at /workspace/review-123/repo.
+Your workspace is a Node.js project at ${WS}.
 
 Task: determine why the project's tests are failing.
 
 Constraints:
 - Do NOT modify, create, or delete any files.
-- The only shell command you may run is `npm test`.
+- The only shell command you may run is \`npm test\`.
 
 Deliverable — respond in plain text with:
 1. The exact error message from the test run.
@@ -508,24 +584,24 @@ Deliverable — respond in plain text with:
 4. The one-line change that would fix it (describe it; do not apply it).
 EOF
 
-moca start "review-123.diagnose" .moca-runs/review-123-diagnose.prompt.txt
+moca start diagnose .moca-runs/diagnose.prompt.txt
 ```
 
 Prompt 2 — collect the diagnosis:
 
 ```bash
 moca list
-moca check "review-123.diagnose"
+moca check diagnose
 ```
 
 Prompt 3 — dispatch the fixer, embedding the diagnosis verbatim:
 
 ```bash
-DIAG="$(moca check "review-123.diagnose" | tail -n +3)"
+DIAG="$(cat .moca-runs/diagnose.answer.txt)"
 
-cat > .moca-runs/review-123-fix.prompt.txt <<EOF
+cat > .moca-runs/fix.prompt.txt <<EOF
 You are a fixer agent working in an isolated sandbox.
-Your workspace is a Node.js project at /workspace/review-123/repo.
+Your workspace is a Node.js project at ${WS}.
 
 A previous read-only agent diagnosed the test failure. Its findings:
 
@@ -538,52 +614,48 @@ Task: apply the fix described above, then run \`npm test\`.
 Deliverable — respond in plain text with:
 1. The changed line, before and after, with its file path.
 2. Whether the tests now pass.
-3. The output of \`hostname\`, so I know which sandbox pod you used.
 EOF
 
-moca start "review-123.fix" .moca-runs/review-123-fix.prompt.txt
+moca start fix .moca-runs/fix.prompt.txt
 ```
 
 Prompt 4 — collect the fix result:
 
 ```bash
-moca check "review-123.fix"
-```
-
-Watch the harness cold-start and scale to zero (another terminal):
-
-```bash
-kubectl -n default get pods -w
+moca check fix
 ```
 
 Confirm the fix landed cluster-side, not locally:
 
 ```bash
-for p in sandbox-0 sandbox-1 sandbox-2; do
-  echo "=== $p ==="
-  kubectl -n default exec "$p" -- cat /workspace/review-123/repo/src/index.js
-done
+SID="$(grep -E '^Session id:' MOCA.md | sed -E 's/^Session id:[[:space:]]+//')"
+POD="$(grep -E '^Sandbox pod:' MOCA.md | sed -E 's/^Sandbox pod:[[:space:]]+//')"
+kubectl -n moca-sandbox exec "$POD" -c sandbox -- cat "/workspace/${SID}/src/index.js"
 ```
 
 Inspect a failed leaf:
 
 ```bash
-cat .moca-runs/review-123.fix.json
-cat .moca-runs/review-123.fix.result.json
-cat .moca-runs/review-123.fix.log
+cat .moca-runs/fix.json        # record: status, turnId, abortReason
+cat .moca-runs/fix.sse         # raw frames, incl. every tool call
 ```
 
-Re-dispatch after a failure (needs a new leaf label):
+Cancel a leaf that's still running:
 
 ```bash
-cp .moca-runs/review-123-fix.prompt.txt .moca-runs/review-123-fix2.prompt.txt
-moca start "review-123.fix2" .moca-runs/review-123-fix2.prompt.txt
+moca cancel fix
 ```
 
-Re-seed between runs (a fixer leaf mutates its pod):
+Re-dispatch after a failure (needs a new label):
 
 ```bash
-kubectl -n default cp example_repo/. sandbox-0:/workspace/review-123/repo
-# or, fresh run id across all pods, from the demo dir:
+cp .moca-runs/fix.prompt.txt .moca-runs/fix2.prompt.txt
+moca start fix2 .moca-runs/fix2.prompt.txt
+```
+
+Start a completely fresh chain (new session, re-seeded fixture):
+
+```bash
+cd -  # back to the demo dir
 ./teardown.sh && ./setup.sh
 ```

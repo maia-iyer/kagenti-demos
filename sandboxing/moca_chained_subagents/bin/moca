@@ -1,55 +1,64 @@
 #!/usr/bin/env bash
-# moca — thin CLI wrapper around the MOCA serverless-harness HTTP API.
+# moca — thin CLI wrapper around the MOCA harness HTTP API (deploy/k8s path).
 #
-# Three subcommands:
-#   moca start <session-id> <prompt-file>   dispatch a leaf, write a run record
-#   moca check <session-id>                 collect a leaf's result when done
-#   moca list                               show pending run records
+# Four subcommands:
+#   moca start <leaf-label> <prompt-file>   dispatch a leaf, write a run record
+#   moca check <leaf-label>                 collect a leaf's result
+#   moca list                               show run records
+#   moca cancel <leaf-label>                cancel a leaf still in flight
 #
-# Dispatch uses MOCA's SYNCHRONOUS run path: POST /runs with no `async` field
-# blocks until the leaf finishes and returns the answer in the same response.
-# MOCA's async path (`async:true` + polling /runs/status) is not used here.
+# Dispatch uses MOCA's DETACHABLE TURN path: POST /v1/turn with
+# {"detachable":true} and Accept: text/event-stream. The server owns the turn's
+# durability — it writes every frame to a per-turn Redis Stream and does NOT
+# abort the turn when the client disconnects. So `moca start` reads the stream
+# only long enough to learn the turnId, then walks away; the leaf keeps running
+# cluster-side. Nothing local holds the connection and there is no background
+# worker to keep alive.
 #
-# To keep the operator's turn non-blocking while still using the sync path,
-# `moca start` DETACH-EXECUTES: it forks a background worker (nohup, redirected,
-# disowned) that owns the blocking HTTP call and writes the response to the
-# record's .result.json when it returns. `moca start` itself returns as soon as
-# the worker is forked. The worker is not in Claude's process group, so quitting
-# Claude Code does not kill it and the leaf still completes.
+# `moca check` COLLECTS by reattaching: GET /v1/turn?sessionId=... replays the
+# turn's frames from the beginning and follows it if still running. A finished
+# turn replays in full for 24h (SH_TURN_LOG_TTL_S), so a result survives
+# quitting Claude Code, closing the laptop, and rebooting.
 #
-# Two independent reasons the result survives:
-#   1. The detached worker outlives the Claude session and writes .result.json.
-#   2. MOCA awaits its Redis result write BEFORE writing the sync HTTP response,
-#      so even if the worker is killed (or Knative's 300s request timeout cuts
-#      the connection), GET /runs/status?sessionId=... still returns the result.
-# `moca check` prefers (1) and falls back to (2).
+# Two origins, two token kinds (see MOCA.md):
+#   - control plane: /v1/sessions, /v1/sessions/{id}/token  -> API token
+#   - harness:       /v1/turn, /v1/turn/cancel              -> SESSION token
+# A session token lives ~300s and carries the session id it was minted for, so
+# both `start` and `check` re-mint one immediately before use. An API token is
+# rejected on /v1/turn, and vice versa.
 #
-# Reads base URL, host header, and the run-records dir from MOCA.md in the
-# current directory (written by setup.sh). Writes/reads run records in
-# .moca-runs/.
+# All leaves of a chain share ONE session, and therefore one sandbox workspace
+# at /workspace/<sessionId>. That is what lets the fix leaf see the files the
+# diagnose leaf looked at. It also means leaves must run SEQUENTIALLY: a second
+# concurrent turn on the same session is refused with 409 turn_in_progress.
+#
+# Reads the two base URLs, the session id and the run-records dir from MOCA.md
+# in the current directory (written by setup.sh). Writes run records to
+# .moca-runs/ and reads the API token from .moca-auth/api.hdr.
 #
 # Exit codes:
-#   0  success (dispatch forked; or check reports current state)
+#   0  success (dispatch accepted; or check reports current state)
 #   1  usage error / missing deps
 #   2  MOCA not reachable or returned an error (details on stderr)
-#   3  run record not found (for check)
+#   3  run record not found (for check/cancel)
 
 set -euo pipefail
 
 usage() {
   cat >&2 <<EOF
 usage:
-  moca start <session-id> <prompt-file>
-  moca check <session-id>
+  moca start <leaf-label> <prompt-file>
+  moca check <leaf-label>
   moca list
-  moca __exec <session-id> <prompt-file>   (internal: detached worker body)
+  moca cancel <leaf-label>
 
-<session-id> is of the form "<run-id>.<leaf-label>" (e.g. "r1.diagnose").
-MOCA accepts only alphanumerics, '-', '_' and '.' in a session id, and it
-must start and end alphanumeric — a '/' is rejected server-side.
+<leaf-label> names the leaf locally (e.g. "diagnose", "fix"). It is NOT a
+session id — the session is created once by setup.sh and shared by every leaf
+in the chain; MOCA generates its id. The label only names files in .moca-runs/,
+so it must be alphanumerics plus '-', '_', '.'.
 <prompt-file> is a path to a file containing the leaf prompt text.
 
-Reads base URL / host header from ./MOCA.md. Writes run records to ./.moca-runs/.
+Reads URLs and the session id from ./MOCA.md. Writes records to ./.moca-runs/.
 EOF
   exit 1
 }
@@ -64,330 +73,424 @@ read_moca_md() {
   local key="$1"
   local file="${MOCA_MD:-MOCA.md}"
   [ -f "${file}" ] || die "cannot find ${file} in $(pwd). Run from the scratch dir."
-  # Lines look like "Base URL:      http://localhost:8080"
+  # Lines look like "Harness URL:      http://127.0.0.1:8080"
   grep -E "^${key}:[[:space:]]" "${file}" | sed -E "s/^${key}:[[:space:]]+//" | head -1
 }
 
-BASE_URL="${MOCA_BASE:-$(read_moca_md 'Base URL' || true)}"
-HOST_HEADER="${MOCA_HOST:-$(read_moca_md 'Host header' || true)}"
+CP_URL="${MOCA_CP_URL:-$(read_moca_md 'Control plane URL' || true)}"
+HARNESS_URL="${MOCA_HARNESS_URL:-$(read_moca_md 'Harness URL' || true)}"
+SESSION_ID="${MOCA_SESSION_ID:-$(read_moca_md 'Session id' || true)}"
 RUNS_DIR="${MOCA_RUNS_DIR:-.moca-runs}"
+AUTH_DIR="${MOCA_AUTH_DIR:-.moca-auth}"
+API_HDR="${AUTH_DIR}/api.hdr"
 
-[ -n "${BASE_URL}" ]    || die "could not resolve base URL (set MOCA_BASE or add 'Base URL:' to MOCA.md)"
-[ -n "${HOST_HEADER}" ] || die "could not resolve host header (set MOCA_HOST or add 'Host header:' to MOCA.md)"
+[ -n "${CP_URL}" ]      || die "could not resolve control plane URL (set MOCA_CP_URL or add 'Control plane URL:' to MOCA.md)"
+[ -n "${HARNESS_URL}" ] || die "could not resolve harness URL (set MOCA_HARNESS_URL or add 'Harness URL:' to MOCA.md)"
+[ -n "${SESSION_ID}" ]  || die "could not resolve session id (set MOCA_SESSION_ID or add 'Session id:' to MOCA.md). Did setup.sh run?"
 
-record_path() {
-  local session_id="$1"
-  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').json"
-}
+# How long `check` is willing to follow a still-running turn before reporting
+# "running". This bound is LOAD-BEARING: the server's attach handler follows a
+# live turn until it ends, so without --max-time `check` would block exactly
+# like a synchronous call. A timeout here is the normal "still running"
+# outcome, not an error.
+MOCA_CHECK_TIMEOUT="${MOCA_CHECK_TIMEOUT:-20}"
 
-result_path() {
-  local session_id="$1"
-  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').result.json"
-}
+# How long `start` waits for the first 'turn' frame, which carries the turnId.
+# Must be generous enough to cover session rehydration and sandbox selection.
+# Note the server does NOT start the turn at all if the client is already gone
+# when it goes to begin, so this must not be aggressively short.
+MOCA_START_TIMEOUT="${MOCA_START_TIMEOUT:-60}"
 
-log_path() {
-  local session_id="$1"
-  echo "${RUNS_DIR}/$(printf '%s' "${session_id}" | tr '/' '-').log"
-}
-
-# Max wall time the detached worker gives the blocking sync call. Knative's
-# own timeoutSeconds (300 by default) will usually cut the connection first;
-# this is just a backstop so a worker can never hang forever. Exceeding it
-# does not lose the result — MOCA has already persisted it, and `moca check`
-# falls back to /runs/status.
-MOCA_MAX_TIME="${MOCA_MAX_TIME:-900}"
-
-# MOCA rejects a session id that isn't alphanumerics plus '-', '_', '.' with
-# alphanumeric ends. Catch it locally: a server-side rejection still consumes
-# the leaf label (the record is written before the worker forks), which then
-# forces a rename on retry. Failing here keeps the label reusable.
-validate_session_id() {
-  local session_id="$1"
-  if ! printf '%s' "${session_id}" \
-      | grep -qE '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'; then
-    die "invalid session id '${session_id}'. MOCA allows alphanumerics, '-', '_', '.' and requires alphanumeric first/last characters. Use '<run-id>.<leaf-label>' (e.g. r1.diagnose) — '/' is not allowed."
+# The label names local files only — the session id is server-generated and
+# always a UUID, so it needs no validation.
+validate_label() {
+  local label="$1"
+  if ! printf '%s' "${label}" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'; then
+    die "invalid leaf label '${label}'. Use alphanumerics plus '-', '_', '.' (e.g. diagnose, fix)."
   fi
+}
+
+record_path() { echo "${RUNS_DIR}/$(printf '%s' "$1" | tr '/' '-').json"; }
+sse_path()    { echo "${RUNS_DIR}/$(printf '%s' "$1" | tr '/' '-').sse"; }
+answer_path() { echo "${RUNS_DIR}/$(printf '%s' "$1" | tr '/' '-').answer.txt"; }
+
+# Update a record in place, applying a jq filter with optional --arg pairs.
+update_record() {
+  local record="$1"; shift
+  jq "$@" "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
+}
+
+# Mint a fresh session token and write it to a 0600 header file, echoing the
+# path. Session tokens expire in ~300s, so this runs immediately before every
+# harness call rather than being cached.
+#
+# Tokens go in header FILES, never on the curl command line: argv is
+# world-readable via ps.
+session_token_hdr() {
+  [ -f "${API_HDR}" ] || die "no API token at ${API_HDR}. Re-run setup.sh (or 'mocactl login' then setup.sh)."
+  local out="${AUTH_DIR}/session.hdr"
+  local response http_code body token
+  response="$(curl -sS -w '\n%{http_code}' \
+    -X POST -H @"${API_HDR}" \
+    "${CP_URL}/v1/sessions/$(printf '%s' "${SESSION_ID}" | jq -sRr @uri)/token")" \
+    || die "cannot reach the control plane at ${CP_URL}. Is the port-forward running?"
+  http_code="$(printf '%s' "${response}" | tail -1)"
+  body="$(printf '%s' "${response}" | sed '$d')"
+
+  case "${http_code}" in
+    200) : ;;
+    401|403)
+      die "control plane rejected the API token (HTTP ${http_code}). It may have expired, or it belongs to a different user than the one that created session ${SESSION_ID}. Re-run setup.sh."
+      ;;
+    404)
+      die "session ${SESSION_ID} not found (HTTP 404). It was deleted (teardown.sh) or expired. Re-run setup.sh to start a new chain."
+      ;;
+    *)
+      die "could not mint a session token (HTTP ${http_code}). body=${body}"
+      ;;
+  esac
+
+  token="$(printf '%s' "${body}" | jq -r '.token // empty')"
+  [ -n "${token}" ] || die "control plane returned no token. body=${body}"
+  mkdir -p "${AUTH_DIR}"
+  ( umask 077; printf 'Authorization: Bearer %s\n' "${token}" >"${out}" )
+  echo "${out}"
+}
+
+# Rebuild a leaf's answer from an SSE transcript by concatenating the deltas of
+# every 'text' frame in order. The model's prose arrives as a stream of deltas,
+# so this is the only way to recover it.
+extract_answer() {
+  sed -n 's/^data: //p' "$1" | jq -j 'select(.type == "text") | .delta' 2>/dev/null || true
+}
+
+# Terminal frame, if the transcript has one: exactly one 'done' or 'error' ends
+# a turn.
+terminal_frame() {
+  sed -n 's/^data: //p' "$1" \
+    | jq -c 'select(.type == "done" or .type == "error")' 2>/dev/null | tail -1
+}
+
+# The tool calls a leaf made, for operators who want to see the work.
+print_tool_results() {
+  sed -n 's/^data: //p' "$1" \
+    | jq -r 'select(.type == "tool_result" and (.isError | not)) | .preview' 2>/dev/null || true
 }
 
 cmd_start() {
   [ $# -eq 2 ] || usage
-  local session_id="$1"
-  local prompt_file="$2"
-  validate_session_id "${session_id}"
+  local label="$1" prompt_file="$2"
+  validate_label "${label}"
   [ -f "${prompt_file}" ] || die "prompt file not found: ${prompt_file}"
 
   mkdir -p "${RUNS_DIR}"
-  local record resultp logp
-  record="$(record_path "${session_id}")"
-  resultp="$(result_path "${session_id}")"
-  logp="$(log_path "${session_id}")"
+  local record ssep
+  record="$(record_path "${label}")"
+  ssep="$(sse_path "${label}")"
   if [ -f "${record}" ]; then
-    local existing_status
-    existing_status="$(jq -r '.status' <"${record}" 2>/dev/null || echo "unknown")"
-    die "record already exists for ${session_id} (status=${existing_status}): ${record}"
+    local existing
+    existing="$(jq -r '.status' <"${record}" 2>/dev/null || echo unknown)"
+    die "record already exists for '${label}' (status=${existing}): ${record}. Use a new label, or 'moca check ${label}'."
   fi
 
-  # Resolve this script's own path so the detached worker can re-enter it even
-  # if the parent shell's PATH or cwd is gone.
-  local self
-  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-
-  # Write the record BEFORE forking, so a record always exists on disk even if
-  # the fork or the machine dies immediately after. `moca list` can then show it.
-  jq -n --arg sid "${session_id}" \
-        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg rp "${resultp}" \
-        --arg lp "${logp}" \
-        '{sessionId:$sid, dispatchedAt:$at, status:"pending", mode:"sync-detached",
-          resultPath:$rp, logPath:$lp}' \
-    >"${record}"
-
-  # Detach-execute. nohup + full redirection + & + disown takes the worker out
-  # of this shell's job table and makes it immune to the SIGHUP that arrives
-  # when Claude Code's Bash tool tears down the session. setsid would be
-  # tidier but is not present on macOS.
-  MOCA_BASE="${BASE_URL}" \
-  MOCA_HOST="${HOST_HEADER}" \
-  MOCA_RUNS_DIR="${RUNS_DIR}" \
-  MOCA_MAX_TIME="${MOCA_MAX_TIME}" \
-  nohup "${self}" __exec "${session_id}" "${prompt_file}" \
-    >"${logp}" 2>&1 </dev/null &
-  local worker_pid=$!
-  disown "${worker_pid}" 2>/dev/null || true
-
-  # Record the pid so `check` can tell "worker still alive" from "worker died".
-  jq --arg pid "${worker_pid}" '.workerPid = ($pid|tonumber)' \
-    "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-
-  echo "dispatched ${session_id} (sync turn, detached pid ${worker_pid})"
-  echo "record: ${record}"
-}
-
-# Internal: the detached worker body. Owns the blocking sync POST /runs and
-# writes whatever came back to the result file. Never called by the skill.
-cmd_exec() {
-  [ $# -eq 2 ] || usage
-  local session_id="$1"
-  local prompt_file="$2"
-  local record resultp
-  record="$(record_path "${session_id}")"
-  resultp="$(result_path "${session_id}")"
+  local hdr
+  hdr="$(session_token_hdr)"
 
   local body
-  body="$(jq -n --arg sid "${session_id}" --rawfile p "${prompt_file}" \
-    '{sessionId:$sid, kind:"prompt", prompt:$p}')"
+  body="$(jq -n --arg sid "${SESSION_ID}" --rawfile p "${prompt_file}" \
+    '{sessionId:$sid, prompt:$p, detachable:true}')"
 
-  # The blocking call. No `async` field => MOCA runs the leaf and returns the
-  # answer inline. This is the call that outlives the Claude session.
-  local response http_code curl_rc=0
-  response="$(curl -sS -w '\n%{http_code}' \
-    --max-time "${MOCA_MAX_TIME}" \
-    -H "Host: ${HOST_HEADER}" \
-    -H 'content-type: application/json' \
-    -X POST "${BASE_URL}/runs" \
-    -d "${body}")" || curl_rc=$?
+  # Write the record BEFORE dispatching so one always exists on disk even if
+  # this process dies mid-call; `moca list` can then show it.
+  jq -n --arg l "${label}" --arg sid "${SESSION_ID}" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg sp "${ssep}" \
+    '{leaf:$l, sessionId:$sid, turnId:null, dispatchedAt:$at,
+      status:"dispatching", mode:"detachable-turn", cursor:null, ssePath:$sp}' \
+    >"${record}"
 
-  if [ "${curl_rc}" -ne 0 ]; then
-    # Transport died (timeout, proxy hangup, connection reset). The leaf may
-    # still have completed and persisted its result cluster-side, so mark the
-    # record so `check` knows to try /runs/status rather than declaring failure.
-    jq --arg e "curl exited ${curl_rc}" \
-       '.status = "detached" | .transportError = $e' \
-       "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-    echo "moca: transport failed (curl ${curl_rc}); result may still be recoverable via /runs/status" >&2
-    exit 2
-  fi
+  # Open the stream, keep only what arrives before the first 'turn' frame, and
+  # stop reading. The turn continues server-side: the detachable path registers
+  # a disconnect as "nobody is watching", not as a cancellation.
+  #
+  # curl writes into the transcript; we tail it for the turn frame rather than
+  # piping, so that closing our reader cannot truncate a partial write.
+  : >"${ssep}"
+  local curl_rc=0
+  curl -sN --max-time "${MOCA_START_TIMEOUT}" \
+    -X POST \
+    -H @"${hdr}" \
+    -H 'Accept: text/event-stream' \
+    -H 'Content-Type: application/json' \
+    -o "${ssep}" \
+    -w '%{http_code}' \
+    -d "${body}" \
+    "${HARNESS_URL}/v1/turn" >"${ssep}.code" 2>/dev/null &
+  local curl_pid=$!
 
-  http_code="$(printf '%s' "${response}" | tail -1)"
-  body="$(printf '%s' "${response}" | sed '$d')"
-  printf '%s' "${body}" >"${resultp}"
+  # Wait for the turn frame (which carries turnId) to land, then let go.
+  local turn_id="" waited=0
+  while [ "${waited}" -lt "${MOCA_START_TIMEOUT}" ]; do
+    if [ -s "${ssep}" ]; then
+      turn_id="$(sed -n 's/^data: //p' "${ssep}" \
+        | jq -r 'select(.type == "turn") | .turnId' 2>/dev/null | head -1 || true)"
+      [ -n "${turn_id}" ] && break
+    fi
+    # The server may also have refused outright (4xx/5xx), in which case curl
+    # exits without ever emitting a turn frame.
+    kill -0 "${curl_pid}" 2>/dev/null || break
+    sleep 1
+    waited=$((waited + 1))
+  done
 
-  case "${http_code}" in
-    200)
-      local status
-      status="$(printf '%s' "${body}" | jq -r '.status // "unknown"')"
-      case "${status}" in
-        done|responded|solved)
-          jq '.status = "done"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-          ;;
-        *)
-          # HTTP 200 does NOT mean success here: MOCA returns 200 for
-          # failed/aborted/paused leaves too, with the real outcome in .status.
-          jq --arg s "${status}" '.status = "failed" | .leafStatus = $s' \
-            "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-          ;;
-      esac
-      ;;
-    503)
-      # Saturation. MOCA treats 503 as "retry", not a terminal failure, and
-      # deliberately persists NO result record — so /runs/status would answer
-      # "queued" forever. Mark it distinctly so check can say "retry this".
-      jq --arg c "${http_code}" \
-         '.status = "saturated" | .httpCode = $c' \
-        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-      ;;
-    *)
-      jq --arg c "${http_code}" '.status = "failed" | .httpCode = $c' \
-        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-      ;;
-  esac
-}
-
-# Print a leaf answer out of a result body, trying the sync-response field
-# (.text for a prompt leaf) then the /runs/status and verdict shapes.
-print_answer() {
-  printf '%s' "$1" | jq -r 'if .text then .text
-                            elif .response then .response
-                            elif (.verdict|type) == "string" then .verdict
-                            elif .verdict then (.verdict|tojson)
-                            elif .patch then .patch
-                            else "" end'
-}
-
-worker_alive() {
-  local record="$1"
-  local pid
-  pid="$(jq -r '.workerPid // empty' <"${record}" 2>/dev/null || true)"
-  [ -n "${pid}" ] || return 1
-  kill -0 "${pid}" 2>/dev/null
-}
-
-# Ask MOCA directly whether it holds a result for this session. Used when the
-# local result file is missing or unusable (worker killed, gateway timeout).
-# MOCA persists the leaf result before answering the sync call, so a result is
-# often still here even when our side of the connection broke.
-recover_via_status() {
-  local session_id="$1" record="$2" resultp="$3"
-  local response http_code body status
-
-  response="$(curl -sS -w '\n%{http_code}' \
-    -H "Host: ${HOST_HEADER}" \
-    --get --data-urlencode "sessionId=${session_id}" \
-    "${BASE_URL}/runs/status")" \
-    || die "curl failed talking to ${BASE_URL}/runs/status"
-  http_code="$(printf '%s' "${response}" | tail -1)"
-  body="$(printf '%s' "${response}" | sed '$d')"
-
-  if [ "${http_code}" = "404" ]; then
-    jq '.status = "failed"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-    echo "status=failed (HTTP 404; MOCA holds no result for this sessionId)"
+  if [ -n "${turn_id}" ]; then
+    # Detach: stop watching, leave the turn running.
+    kill "${curl_pid}" 2>/dev/null || true
+    wait "${curl_pid}" 2>/dev/null || curl_rc=$?
+    update_record "${record}" --arg t "${turn_id}" '.turnId = $t | .status = "running"'
+    echo "dispatched '${label}' as a detachable turn"
+    echo "  session: ${SESSION_ID}"
+    echo "  turn:    ${turn_id}"
+    echo "  record:  ${record}"
+    echo ""
+    echo "The turn is running cluster-side and does not need this process."
+    echo "Collect it with: moca check ${label}"
     return 0
   fi
 
-  if [ "${http_code}" != "200" ]; then
-    die "status check failed (HTTP ${http_code}). body=${body}"
-  fi
+  # No turn frame: the dispatch was refused, or nothing arrived in time.
+  wait "${curl_pid}" 2>/dev/null || curl_rc=$?
+  local http_code
+  http_code="$(cat "${ssep}.code" 2>/dev/null || echo '000')"
+  rm -f "${ssep}.code"
 
-  status="$(printf '%s' "${body}" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
-  case "${status}" in
-    responded|done|solved)
-      printf '%s' "${body}" >"${resultp}"
-      jq '.status = "done" | .recoveredVia = "runs/status"' \
-        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-      echo "status=done (recovered via /runs/status)"
-      echo "result: ${resultp}"
-      print_answer "${body}"
+  case "${http_code}" in
+    409)
+      update_record "${record}" '.status = "refused" | .reason = "turn_in_progress"'
+      echo "status=refused (HTTP 409 turn_in_progress)" >&2
+      echo "" >&2
+      echo "Another leaf of this chain is still running. All leaves share one" >&2
+      echo "session, and a session runs one turn at a time — so leaves must be" >&2
+      echo "sequential. Collect the leaf in flight first:" >&2
+      echo "    moca list        # find the running leaf" >&2
+      echo "    moca check <it>  # collect it" >&2
+      echo "then dispatch '${label}' again (delete ${record} first)." >&2
+      exit 2
       ;;
-    failed|aborted|paused)
-      printf '%s' "${body}" >"${resultp}"
-      jq --arg s "${status}" '.status = "failed" | .leafStatus = $s' \
-        "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-      echo "status=${status}"
-      echo "reason: $(printf '%s' "${body}" | jq -r '.reason // "unknown"')"
+    401|403)
+      update_record "${record}" --arg c "${http_code}" '.status = "failed" | .httpCode = $c'
+      die "harness rejected the session token (HTTP ${http_code}). A session token is required on /v1/turn and lives only ~300s; this one was minted seconds ago, so check that MOCA.md's session id matches the token's session."
       ;;
-    queued)
-      # MOCA answers "queued" for three different situations it cannot tell
-      # apart: still running, never recorded, and result aged out. Our own
-      # connection is already broken, so we cannot narrow it further.
-      jq '.status = "lost"' "${record}" >"${record}.tmp" && mv "${record}.tmp" "${record}"
-      echo "status=lost (MOCA reports 'queued' and holds no result)"
-      echo "MOCA returns 'queued' for a run still executing, one it never"
-      echo "recorded, and one whose result aged out — it cannot distinguish"
-      echo "them. If the leaf may still be running, re-check shortly."
-      echo "Otherwise re-dispatch under a NEW leaf label."
+    503)
+      update_record "${record}" '.status = "saturated"'
+      echo "status=saturated (HTTP 503) — no capacity right now. Nothing ran." >&2
+      echo "Delete ${record} and re-dispatch shortly." >&2
+      exit 2
+      ;;
+    000|'')
+      update_record "${record}" '.status = "unknown"'
+      die "no response from the harness at ${HARNESS_URL} within ${MOCA_START_TIMEOUT}s. Is the port-forward running? The turn MAY have started — try 'moca check ${label}' before re-dispatching."
       ;;
     *)
-      echo "status=${status} (still running cluster-side; try again later)"
+      update_record "${record}" --arg c "${http_code}" '.status = "failed" | .httpCode = $c'
+      die "dispatch failed (HTTP ${http_code}). Transcript: ${ssep}"
       ;;
   esac
 }
 
 cmd_check() {
   [ $# -eq 1 ] || usage
-  local session_id="$1"
-  local record resultp
-  record="$(record_path "${session_id}")"
-  [ -f "${record}" ] || { echo "moca: no record for ${session_id} at ${record}" >&2; exit 3; }
-  resultp="$(jq -r '.resultPath' <"${record}")"
+  local label="$1"
+  validate_label "${label}"
+  local record
+  record="$(record_path "${label}")"
+  [ -f "${record}" ] || { echo "moca: no record for '${label}' at ${record}" >&2; exit 3; }
 
-  # Saturation is retryable, not terminal, and leaves no cluster-side record.
-  if [ "$(jq -r '.status // ""' <"${record}")" = "saturated" ]; then
-    echo "status=saturated (MOCA's sandbox pool was full; HTTP 503)"
-    echo "This is retryable and nothing ran. MOCA holds no result for it."
-    echo "Re-dispatch under a new leaf label when the pool has capacity."
+  local status
+  status="$(jq -r '.status // ""' <"${record}")"
+
+  # Terminal states already collected: just reprint, no network call.
+  if [ "${status}" = "done" ]; then
+    echo "status=done (already collected)"
+    cat "$(answer_path "${label}")" 2>/dev/null || true
+    return 0
+  fi
+  if [ "${status}" = "saturated" ] || [ "${status}" = "refused" ]; then
+    echo "status=${status} — nothing ran, so there is nothing to collect."
+    echo "Delete ${record} and re-dispatch."
     return 0
   fi
 
-  # 1. The detached worker's own result file is the primary source — it holds
-  #    the sync response body verbatim.
-  if [ -s "${resultp}" ]; then
-    local body status
-    body="$(cat "${resultp}")"
+  local ssep hdr
+  ssep="$(jq -r '.ssePath' <"${record}")"
+  hdr="$(session_token_hdr)"
 
-    # The body is not guaranteed to be JSON: a Knative/Kourier timeout returns
-    # a plain-text 5xx ("activator request timeout") that never reached MOCA.
-    # Treat a non-JSON body as a gateway-level failure and try to recover the
-    # result cluster-side rather than letting jq spew parse errors.
-    if ! printf '%s' "${body}" | jq -e . >/dev/null 2>&1; then
-      echo "status=gateway-error (non-JSON response; the request did not complete through Kourier)"
-      echo "result: ${resultp}"
-      echo "body: ${body}"
-      echo "http: $(jq -r '.httpCode // "?"' <"${record}")"
-      echo "Falling back to /runs/status to see if the leaf finished anyway..."
-      recover_via_status "${session_id}" "${record}" "${resultp}"
-      return 0
-    fi
+  # Reattach and replay from the BEGINNING of the turn. We deliberately do not
+  # send Last-Event-ID: a cursor at or past the tail of a FINISHED turn makes
+  # the server answer with just the turn frame (ended:true) and no text frames
+  # at all — which would look like an empty answer. The 24h log holds the whole
+  # turn, so a full replay is both correct and cheap.
+  local fresh="${ssep}.live" curl_rc=0 http_code
+  : >"${fresh}"
+  http_code="$(curl -sN --max-time "${MOCA_CHECK_TIMEOUT}" \
+    -H @"${hdr}" \
+    -H 'Accept: text/event-stream' \
+    -o "${fresh}" \
+    -w '%{http_code}' \
+    --get --data-urlencode "sessionId=${SESSION_ID}" \
+    "${HARNESS_URL}/v1/turn" 2>/dev/null)" || curl_rc=$?
 
-    status="$(printf '%s' "${body}" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
-    case "${status}" in
-      done|responded|solved)
-        echo "status=done"
-        echo "result: ${resultp}"
-        print_answer "${body}"
+  # curl 28 is the --max-time cutoff: expected when following a live turn.
+  if [ "${curl_rc}" -ne 0 ] && [ "${curl_rc}" -ne 28 ]; then
+    rm -f "${fresh}"
+    die "could not reach the harness at ${HARNESS_URL} (curl ${curl_rc}). Is the port-forward running?"
+  fi
+
+  if [ "${curl_rc}" -eq 0 ]; then
+    case "${http_code}" in
+      200) : ;;
+      404)
+        rm -f "${fresh}"
+        update_record "${record}" '.status = "lost"'
+        echo "status=lost (HTTP 404 turn_not_found)"
+        echo ""
+        echo "MOCA holds no turn log for this session. Either the turn never"
+        echo "started, or its log aged out (results are kept 24h). The answer"
+        echo "is not recoverable — re-dispatch under a new label."
         return 0
         ;;
-      paused)
-        echo "status=paused (leaf hit an approval gate)"
-        echo "result: ${resultp}"
-        echo "gate: $(printf '%s' "${body}" | jq -r '.gate.summary // "unknown"')"
+      401|403)
+        rm -f "${fresh}"
+        die "harness rejected the session token (HTTP ${http_code}) when reattaching."
+        ;;
+      503)
+        rm -f "${fresh}"
+        echo "status=running (HTTP 503 redis_unavailable — MOCA's log store is briefly unavailable)"
+        echo "The turn is unaffected. Try 'moca check ${label}' again shortly."
         return 0
         ;;
       *)
-        echo "status=failed (leaf reported ${status})"
-        echo "result: ${resultp}"
-        # `message` carries the underlying error and is only present on the
-        # sync response — /runs/status drops it.
-        echo "reason: $(printf '%s' "${body}" | jq -r '.reason // .error // "unknown"')"
-        local msg
-        msg="$(printf '%s' "${body}" | jq -r '.message // empty')"
-        [ -n "${msg}" ] && echo "message: ${msg}"
-        return 0
+        rm -f "${fresh}"
+        die "reattach failed (HTTP ${http_code})."
         ;;
     esac
   fi
 
-  # 2. No result file yet. If the detached worker is still alive, the sync call
-  #    is simply still in flight.
-  if worker_alive "${record}"; then
-    echo "status=running (detached worker $(jq -r '.workerPid' <"${record}") still holding the sync call)"
+  # Keep the replay as the authoritative transcript.
+  mv "${fresh}" "${ssep}"
+
+  # A trimmed log means the replay skipped frames.
+  if sed -n 's/^data: //p' "${ssep}" | jq -e 'select(.type == "turn" and .truncated == true)' >/dev/null 2>&1; then
+    echo "note: MOCA trimmed this turn's log, so the transcript is partial." >&2
+  fi
+
+  local term
+  term="$(terminal_frame "${ssep}")"
+
+  if [ -z "${term}" ]; then
+    # No terminal frame yet (including the --max-time cutoff): still running.
+    update_record "${record}" '.status = "running"'
+    echo "status=running"
+    echo ""
+    echo "The leaf is still working. Reattaching does not disturb it — check"
+    echo "again in a little while."
     return 0
   fi
 
-  # 3. Worker is gone with no result file: it was killed, or the transport died.
-  #    MOCA persists the leaf result before answering the sync call, so the
-  #    result is very likely still retrievable cluster-side.
-  echo "status=unknown locally (no result file, worker not running); falling back to /runs/status" >&2
-  recover_via_status "${session_id}" "${record}" "${resultp}"
+  local ttype
+  ttype="$(printf '%s' "${term}" | jq -r '.type')"
+
+  if [ "${ttype}" = "done" ]; then
+    local answerp
+    answerp="$(answer_path "${label}")"
+    extract_answer "${ssep}" >"${answerp}"
+    update_record "${record}" '.status = "done"'
+    echo "status=done"
+    echo "transcript: ${ssep}"
+    echo ""
+    cat "${answerp}"
+    return 0
+  fi
+
+  # type == error
+  local reason abort msg
+  reason="$(printf '%s' "${term}" | jq -r '.stopReason // empty')"
+  abort="$(printf '%s' "${term}" | jq -r '.abortReason // empty')"
+  msg="$(printf '%s' "${term}" | jq -r '.errorMessage // empty')"
+
+  update_record "${record}" --arg a "${abort}" '.status = "failed" | .abortReason = $a'
+  echo "status=failed"
+  echo "transcript: ${ssep}"
+  [ -n "${reason}" ] && echo "stopReason: ${reason}" || true
+  [ -n "${msg}" ]    && echo "message: ${msg}" || true
+
+  # The abort reasons are infrastructure outcomes, not findings about the code
+  # under review. Say so, or they read as the leaf's verdict.
+  case "${abort}" in
+    unwatched)
+      echo ""
+      echo "MOCA aborted this turn because nobody was attached to it for 30"
+      echo "minutes while it ran. This is an infrastructure timeout, not a"
+      echo "result: the leaf did not finish its work. Re-dispatch under a new"
+      echo "label and run 'moca check' sooner — checking resets the clock."
+      ;;
+    restarting)
+      echo ""
+      echo "MOCA's supervisor restarted while this turn was in flight, which"
+      echo "aborts detached turns. Infrastructure, not a result. Re-dispatch"
+      echo "under a new label."
+      ;;
+    cancelled)
+      echo ""
+      echo "This turn was cancelled (moca cancel, or an operator elsewhere)."
+      ;;
+    lease_lost|owner_lost)
+      echo ""
+      echo "MOCA lost ownership of this turn (${abort}) and abandoned it."
+      echo "Infrastructure, not a result. Re-dispatch under a new label."
+      ;;
+    '') : ;;
+    *)
+      echo "abortReason: ${abort}"
+      ;;
+  esac
+  return 0
+}
+
+cmd_cancel() {
+  [ $# -eq 1 ] || usage
+  local label="$1"
+  validate_label "${label}"
+  local record
+  record="$(record_path "${label}")"
+  [ -f "${record}" ] || { echo "moca: no record for '${label}' at ${record}" >&2; exit 3; }
+
+  local turn_id hdr
+  turn_id="$(jq -r '.turnId // empty' <"${record}")"
+  [ -n "${turn_id}" ] || die "record for '${label}' has no turnId, so there is nothing to cancel."
+  hdr="$(session_token_hdr)"
+
+  local response http_code
+  response="$(curl -sS -w '\n%{http_code}' \
+    -X POST -H @"${hdr}" -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg s "${SESSION_ID}" --arg t "${turn_id}" '{sessionId:$s, turnId:$t}')" \
+    "${HARNESS_URL}/v1/turn/cancel")" \
+    || die "could not reach the harness at ${HARNESS_URL}."
+  http_code="$(printf '%s' "${response}" | tail -1)"
+
+  case "${http_code}" in
+    200|202|204)
+      update_record "${record}" '.status = "cancelled"'
+      echo "cancelled '${label}' (turn ${turn_id})"
+      ;;
+    404)
+      update_record "${record}" '.status = "lost"'
+      echo "no such turn (HTTP 404) — it already ended or its log aged out."
+      ;;
+    *)
+      die "cancel failed (HTTP ${http_code})."
+      ;;
+  esac
 }
 
 cmd_list() {
@@ -395,24 +498,20 @@ cmd_list() {
   local any=0
   for rec in "${RUNS_DIR}"/*.json; do
     [ -f "${rec}" ] || continue
-    # Skip result files
-    case "${rec}" in *.result.json) continue;; esac
     any=1
-    local sid status note
-    sid="$(jq -r '.sessionId' <"${rec}" 2>/dev/null || echo '?')"
-    status="$(jq -r '.status' <"${rec}" 2>/dev/null || echo '?')"
+    local leaf status note
+    leaf="$(jq -r '.leaf // "?"' <"${rec}" 2>/dev/null || echo '?')"
+    status="$(jq -r '.status // "?"' <"${rec}" 2>/dev/null || echo '?')"
     note=""
-    # A record left "pending" by an earlier session is only genuinely in flight
-    # if its detached worker is still running; otherwise `check` must go to
-    # /runs/status to recover it.
-    if [ "${status}" = "pending" ]; then
-      if worker_alive "${rec}"; then
-        note="	(worker alive)"
-      else
-        note="	(worker gone — check to recover)"
-      fi
-    fi
-    printf '%s\t%s%s\n' "${status}" "${sid}" "${note}"
+    # Status comes from the record alone: durability is the server's job now,
+    # so there is no local process whose liveness could mean anything.
+    case "${status}" in
+      running)   note="	(check to collect)" ;;
+      saturated) note="	(nothing ran — re-dispatch)" ;;
+      refused)   note="	(409 — a leaf was already in flight)" ;;
+      lost)      note="	(no server-side log — re-dispatch)" ;;
+    esac
+    printf '%s\t%s%s\n' "${status}" "${leaf}" "${note}"
   done
   [ "${any}" -eq 0 ] && echo "(no run records)"
   return 0
@@ -421,10 +520,10 @@ cmd_list() {
 [ $# -ge 1 ] || usage
 sub="$1"; shift
 case "${sub}" in
-  start) cmd_start "$@" ;;
-  check) cmd_check "$@" ;;
-  list)  cmd_list "$@" ;;
-  __exec) cmd_exec "$@" ;;
+  start)  cmd_start "$@" ;;
+  check)  cmd_check "$@" ;;
+  list)   cmd_list "$@" ;;
+  cancel) cmd_cancel "$@" ;;
   -h|--help|help) usage ;;
   *) usage ;;
 esac

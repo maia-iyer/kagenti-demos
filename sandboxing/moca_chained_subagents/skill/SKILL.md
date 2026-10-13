@@ -1,6 +1,6 @@
 ---
 name: moca-dispatch
-description: Dispatch a subagent to the MOCA serverless harness as an isolated leaf. Use this skill whenever the operator asks you to "use a subagent", "delegate", "run this remotely", "fan out", or anything else that would ordinarily go through the Task tool — Task is denied in this session, so this is the only subagent path. Dispatch detach-executes a synchronous MOCA turn: a start call forks a detached worker and returns immediately, and a separate check call returns the result when the leaf finishes. The operator can quit Claude between those two steps and resume later.
+description: Dispatch a subagent to the MOCA harness as an isolated leaf. Use this skill whenever the operator asks you to "use a subagent", "delegate", "run this remotely", "fan out", or anything else that would ordinarily go through the Task tool — Task is denied in this session, so this is the only subagent path. Dispatch starts a detachable MOCA turn: a start call returns immediately and a separate check call collects the result by reattaching. The operator can quit Claude, or reboot, between those two steps and resume later.
 ---
 
 # MOCA dispatch
@@ -14,10 +14,10 @@ to lift the deny.
 **Do not shell out to `curl` against MOCA directly.** The scratch dir
 ships a `moca` CLI (on `PATH`) that wraps dispatch, result collection,
 and record-keeping. Using the CLI keeps permission prompts short and
-readable (`moca start …` instead of a many-flag `curl` line), and
-guarantees run records on disk are shaped the way a resumed session
-expects. If the operator asks you to use `curl` directly, surface that
-the CLI exists and prefer it.
+readable (`moca start …` instead of a many-flag `curl` line), handles
+token minting, and guarantees run records on disk are shaped the way a
+resumed session expects. If the operator asks you to use `curl`
+directly, surface that the CLI exists and prefer it.
 
 This skill is **mechanism only**. It tells you how to run and collect
 one leaf. It does **not** tell you how many leaves to run, in what
@@ -26,172 +26,150 @@ request. If the operator asks for one leaf, run one. If they ask for a
 chain, start them in sequence and feed outputs forward as they
 describe.
 
-## No workload catalog on this install
+## Dispatch is a detachable turn
 
-This MOCA install exposes **no workload selector**. `moca start` sends
-`kind:"prompt"` only — there is no `workload`, `workspaceRef`, or
-`readOnly` field in the envelope. If the operator says "dispatch to
-the read-only workload" or "use the read-write workload", that
-phrasing is historical: just dispatch, and encode any
-posture/behavior rules (e.g. "do not modify files") inside the leaf
-prompt text itself. Do **not** stop to ask which workload to target —
-there is only one path.
+`moca start` POSTs to the harness's `/v1/turn` with `detachable: true`,
+reads the response stream only long enough to learn the turn's id, and
+then **walks away**. MOCA does not abort a detachable turn when its
+client disconnects — it writes every frame of the turn to a server-side
+log instead. The leaf keeps running cluster-side with nothing held open
+on the operator's machine.
 
-## Dispatch is a detached synchronous turn
+`moca check` collects by **reattaching**: it re-opens the turn's stream,
+replays it from the beginning, and follows it if it is still running.
 
-This install uses MOCA's **synchronous** run path: `POST /runs` with no
-`async` field blocks until the leaf finishes and returns the answer in
-the same response. MOCA's async queue (`async:true` + polling) is
-**not** used here.
+This means durability is entirely the server's job. There is no local
+background process to keep alive, and the result survives the operator
+quitting Claude Code, closing the laptop, or rebooting. A finished
+turn stays collectable for **24 hours**.
 
-A blocking HTTP call would normally pin your turn open and die with the
-session. So `moca start` **detach-executes**: it forks a local
-background process (via `nohup`, fully redirected and disowned) that
-owns the blocking call and writes the response to disk when it
-returns. `moca start` returns as soon as that process is forked.
+You do not need to manage any of this — just don't wrap `moca start` in
+anything that waits on it.
 
-This local process is called the **courier** in this skill. It is just
-a detached `curl` on the operator's laptop holding one HTTP
-connection — it does no agent work. All the actual work happens
-cluster-side inside MOCA. (Don't confuse it with MOCA's `leaf-worker`
-ScaledJob pods, which belong to MOCA's async queue and never appear on
-this sync path.)
+## One session, one workspace, one turn at a time
 
-The courier is outside Claude Code's process group, so **the run
-continues if the operator quits Claude.** Two independent things
-protect the result:
+Every leaf in this chain is a turn in the **same** MOCA session (its id
+is in `MOCA.md`). That session has one sandbox workspace, so every leaf
+sees the same files — which is what lets a fix leaf work on the files a
+diagnose leaf examined. Three consequences that matter to you:
 
-1. The courier outlives the session and writes `.result.json`.
-2. MOCA persists the leaf's result cluster-side *before* it writes the
-   sync response, so if the courier is killed **after the leaf
-   finished**, the result is recoverable via `/runs/status` for 24h.
-
-`moca check` uses (1) and falls back to (2). You do not need to
-manage any of this — just don't wrap `moca start` in anything that
-waits on it.
-
-Caveat on (2): it only covers a leaf that ran to completion. If
-Knative's request timeout cuts a leaf off mid-run, MOCA persisted
-nothing and the work is genuinely lost.
+- **Leaves must run sequentially.** A session runs one turn at a time.
+  Dispatching a second leaf while one is still running is refused with
+  `turn_in_progress` (HTTP 409) and nothing starts. Collect the leaf in
+  flight first.
+- **Leaves are not isolated from each other.** The isolation boundary
+  is this chain versus everything else, not leaf versus leaf. Don't
+  tell the operator a leaf is sandboxed *from its siblings*.
+- **Leaf labels are local names, not session ids.** You pass `moca` a
+  short label (`diagnose`, `fix`) that names records in `.moca-runs/`.
+  MOCA generates the session id itself; you never construct one.
 
 ## The CLI
 
-The scratch dir contains `MOCA.md` (base URL, host header, run-id,
-workspace path) and a `moca` binary. Run it from the scratch dir —
-it reads `MOCA.md` from the current working directory.
+The scratch dir contains `MOCA.md` (the two URLs, the session id, the
+workspace path) and a `moca` binary. Run it from the scratch dir — it
+reads `MOCA.md` from the current working directory.
 
-Three subcommands:
+Four subcommands:
 
-- `moca start <session-id> <prompt-file>` — dispatch a leaf. Writes a
-  record file in `.moca-runs/` and forks the detached worker. Returns
-  immediately.
-- `moca check <session-id>` — collect a leaf. If done, prints the
-  leaf's answer text to stdout. If the worker is still holding the
-  call, says so. If the worker was lost, recovers the result from
-  MOCA.
-- `moca list` — show every run record, its status, and whether its
-  detached worker is still alive.
+- `moca start <leaf-label> <prompt-file>` — dispatch a leaf. Writes a
+  record in `.moca-runs/` and returns as soon as the turn is running.
+- `moca check <leaf-label>` — collect a leaf by reattaching. If done,
+  prints the leaf's answer text to stdout. If still running, says so.
+- `moca list` — show every run record and its status.
+- `moca cancel <leaf-label>` — cancel a leaf still in flight. Only use
+  this when the operator asks.
 
-There is a fourth subcommand, `moca __exec`, which is the detached
-worker body. **Never call it yourself** — `moca start` calls it.
-
-Session ids are `<run-id>.<leaf-label>`, e.g. `review-123.diagnose`.
-Reuse `<run-id>` from `MOCA.md` across leaves in the same operator
-request so they share a run identity. `<leaf-label>` is a short
-identifier within the run (e.g. `diagnose`, `fix`, `review`).
-
-**MOCA validates session ids server-side:** alphanumerics plus `-`,
-`_`, `.` only, and the first and last character must be alphanumeric.
-Use `.` as the run/leaf separator — a `/` is rejected at the API
-boundary before the leaf runs. The CLI checks this locally too, so an
-illegal id fails at `start` without consuming the leaf label.
+Labels must be alphanumerics plus `-`, `_`, `.`. The CLI validates
+locally, so a bad label fails at `start` without consuming anything.
 
 ## Procedure 1: start a leaf
 
 1. Write the leaf's prompt text to a file in the scratch dir — e.g.
-   `.moca-runs/<run-id>-<leaf-label>.prompt.txt`. (Prompts can be
+   `.moca-runs/<leaf-label>.prompt.txt`. (Prompts can be
    multi-paragraph; passing them as a file keeps the shell command
    short and makes the permission prompt readable.)
 2. Run:
 
    ```bash
-   moca start "<run-id>.<leaf-label>" .moca-runs/<run-id>-<leaf-label>.prompt.txt
+   moca start "<leaf-label>" .moca-runs/<leaf-label>.prompt.txt
    ```
 
-3. On success the CLI prints
-   `dispatched <session-id> (sync turn, detached pid N)` and the path
-   to the record file it wrote. Report the session id to the operator
-   and stop.
+3. On success the CLI prints `dispatched '<label>' as a detachable
+   turn` along with the session id, the turn id, and the record path.
+   Report to the operator that the leaf is running and stop.
 
-**Do not block or poll inside this turn.** `moca start` returns as
-soon as the detached worker is forked; collection is a separate turn.
-In particular, do not sleep-and-retry `moca check` in a loop to wait
-for the leaf — hand control back to the operator instead.
+**Do not block or poll inside this turn.** `moca start` returns as soon
+as the turn is running cluster-side; collection is a separate turn. In
+particular, do not sleep-and-retry `moca check` in a loop to wait for
+the leaf — hand control back to the operator instead.
 
-Because the HTTP call is now owned by the detached worker, dispatch
-errors that used to surface at `start` time (saturation, auth) now
-surface at `check` time instead. `moca start` only fails for local
-reasons:
+`moca start` failure modes:
 
 - `cannot find MOCA.md` → you are not in the scratch dir. `cd` first.
 - `prompt file not found` → write the prompt file first.
-- `invalid session id` → you used a character MOCA rejects (most
-  likely `/`). Rebuild the id as `<run-id>.<leaf-label>` and retry
-  under the **same** leaf label — nothing was dispatched.
-- `record already exists for <session-id>` → that leaf was already
-  dispatched. Use `moca check <session-id>` instead.
-
-The worker's own stderr goes to `.moca-runs/<run>-<leaf>.log`. Read
-that file if a leaf fails in a way `check` can't explain.
+- `invalid leaf label` → use alphanumerics plus `-`, `_`, `.`. Nothing
+  was dispatched; retry with a legal label.
+- `record already exists for '<label>'` → that leaf was already
+  dispatched. Use `moca check <label>` instead.
+- `status=refused (HTTP 409 turn_in_progress)` → another leaf of this
+  chain is still running. Run `moca list`, collect the running leaf
+  with `moca check`, then dispatch this one again. **Nothing started**,
+  so this is not a failure of the leaf you were asked to run.
+- `status=saturated (HTTP 503)` → no capacity right now and nothing
+  ran. Retryable; surface it and stop.
 
 ## Procedure 2: check a leaf
 
 ```bash
-moca check "<run-id>.<leaf-label>"
+moca check "<leaf-label>"
 ```
 
 Outcomes:
 
 - `status=done` with the leaf's answer printed on stdout → surface the
   answer to the operator, or embed it verbatim in a follow-up leaf's
-  prompt. (`status=done (recovered via /runs/status …)` means the same
-  thing; the worker was lost but MOCA still had the result.)
-- `status=running` → the detached worker is still holding the sync
-  call. Tell the operator it's not ready and stop. Do not loop.
-- `status=failed` → surface the printed reason (and `message` if
-  shown). Do not auto-redispatch.
-- `status=saturated` → MOCA's sandbox pool was full and **nothing
-  ran**. Retryable. Surface it and stop; re-dispatch only if the
-  operator asks, under a new leaf label.
-- `status=paused` → the leaf hit an approval gate. Surface the gate
-  summary; this demo has no resume path.
-- `status=gateway-error` → the HTTP request died in the gateway
-  (usually Knative's 300s `activator request timeout`) and the
-  response wasn't even JSON. The CLI automatically tries
-  `/runs/status` next and prints that outcome too. Report this as an
-  **infrastructure timeout, not a finding about the code under test** —
-  the leaf may have done no work at all.
-- `status=lost` → MOCA holds no result for that sessionId. Surface it;
-  re-dispatch only if the operator asks, and use a **new leaf label**
-  (the old record still occupies the old one).
+  prompt.
+- `status=running` → the leaf is still working. Tell the operator it's
+  not ready and stop. **Do not loop.** Reattaching does not disturb the
+  leaf, so checking again later is free.
+- `status=failed` → surface the printed `stopReason` / `message`. If an
+  `abortReason` is shown, the CLI explains it in plain language;
+  reproduce that explanation rather than inventing one. Do not
+  auto-redispatch.
+- `status=lost` → MOCA holds no turn log for this session: the turn
+  never started, or its log aged out after 24h. The answer is not
+  recoverable. Surface it; re-dispatch only if the operator asks, under
+  a **new label**.
+- `status=saturated` / `status=refused` → nothing ran, so there is
+  nothing to collect.
 
-When a leaf fails for an infrastructure reason — invalid session id,
-gateway timeout, saturation — say so explicitly and do **not** present
-it as a diagnosis. The operator asked about their code; a dispatch
-that never ran tells them nothing about it.
+### Infrastructure outcomes are not findings
 
-Note that **HTTP 200 from MOCA does not mean the leaf succeeded** —
-failed, aborted, and paused leaves all come back 200 with the real
-outcome in `.status`. The CLI already branches on that for you; don't
-re-interpret the raw result file as success just because it exists.
+Some failures say nothing at all about the operator's code:
 
-The CLI writes the full response body to the record's `.result.json`
-sibling once the leaf is terminal; use `Read` on that file if you need
-more than the answer text (e.g. `usage` counters). Note `usage` is
-only present when the result came back through the sync response, not
-when it was recovered via `/runs/status`.
+- `abortReason: unwatched` — the turn ran 30 minutes with nobody
+  attached, so MOCA aborted it. Running `moca check` counts as
+  attaching and resets that clock, so the fix is to check sooner.
+- `abortReason: restarting` — MOCA's supervisor restarted mid-turn.
+- `abortReason: lease_lost` / `owner_lost` — MOCA lost ownership of
+  the turn.
+- `status=lost`, `saturated`, `refused` — nothing ran, or no log
+  survives.
 
-## Procedure 3: list pending runs
+When a leaf ends this way, **say so explicitly and do not present it as
+a diagnosis.** The operator asked about their code; a dispatch that
+never completed tells them nothing about it.
+
+Also note a `note: MOCA trimmed this turn's log` line: the transcript is
+partial, so the answer may be missing its beginning. Say so rather than
+presenting a fragment as the whole finding.
+
+The CLI writes the full SSE transcript next to the record (`.sse`) and
+the extracted answer (`.answer.txt`). Use `Read` on the transcript if
+you need the leaf's tool calls rather than just its prose.
+
+## Procedure 3: list runs
 
 At the start of a turn, before accepting the operator's next request
 at face value, run:
@@ -200,61 +178,65 @@ at face value, run:
 moca list
 ```
 
-Each line is `<status><tab><sessionId>`, and a `pending` record is
-annotated with whether its detached worker is still alive
-(`(worker alive)`) or not (`(worker gone — check to recover)`). If
-there are records with status `pending`, they are leaves from an
-earlier turn (or an earlier Claude session). Options:
+Each line is `<status><tab><leaf-label>` plus a short note. A `running`
+record is a leaf from an earlier turn (or an earlier Claude session)
+that is still working or waiting to be collected. Options:
 
-- If the operator's request references them ("check on that subagent"
-  / "did it finish?"), run procedure 2 against them.
-- If the request is unrelated, note them briefly ("you have N pending
-  leaves from an earlier dispatch; want me to check on them?") and
-  proceed.
+- If the operator's request references it ("check on that subagent" /
+  "did it finish?"), run procedure 2 against it.
+- If the request is unrelated, note it briefly ("you have N leaves from
+  an earlier dispatch; want me to check on them?") and proceed.
+- If you are about to dispatch a new leaf, check first that no other
+  leaf is `running` — otherwise the dispatch is refused with 409.
 
-Don't silently discard pending records — they represent cluster-side
-work the operator paid for.
+Don't silently discard records — they represent cluster-side work the
+operator paid for.
 
 ## Writing the leaf prompt
 
-The leaf has no memory of the parent session and does not see other
-leaves' output. Everything it needs must be in its prompt. In
-particular:
+The leaf is a turn in a shared session, but you should still write its
+prompt as if it were self-contained: state the task, the deliverable,
+and any finding it builds on. In particular:
 
 - **State the workspace path explicitly.** Tell the leaf where its
-  files live (the `workspaceRef` from `MOCA.md`, e.g.
-  `/workspace/<run-id>/repo`).
-- **Pass forward anything the leaf needs from earlier leaves.** If
-  this leaf is building on another leaf's finding, embed that finding
-  verbatim in the prompt (read it out of the earlier leaf's
-  `.result.json`, or paste the stdout of `moca check`). There is no
-  shared memory to pull it from.
+  files live (the `Workspace` path from `MOCA.md`, which is
+  `/workspace/<session-id>`). It is also the leaf's working directory.
+- **Pass forward anything the leaf needs from earlier leaves.** Embed
+  the earlier finding verbatim in the prompt (paste the stdout of
+  `moca check`, or read the `.answer.txt`). Although leaves share a
+  session, do not rely on the leaf inferring context — give it the
+  finding in writing.
 - **Describe the deliverable.** Tell the leaf what the response text
-  should contain (a diagnosis, a diff, a test outcome, etc.) and in
-  what shape.
+  should contain (a diagnosis, a diff, a test outcome) and in what
+  shape.
+- **Encode posture rules in the prompt.** There is no `readOnly` flag
+  or workload selector on this install. If a leaf must not modify
+  files, say so in its prompt text.
 
 ## Chaining leaves
 
 MOCA has no "on complete, trigger X" primitive. If the operator asks
 for a chain (A then B), you do the sequencing:
 
-1. Write leaf 1's prompt to a file; `moca start` leaf 1. Record is
-   written. Return to operator.
+1. Write leaf 1's prompt to a file; `moca start` leaf 1. Return to the
+   operator.
 2. On a later turn (same session or resumed), `moca check` leaf 1. If
    done, capture the printed answer.
-3. Write leaf 2's prompt to a file, embedding leaf 1's result
-   verbatim.
-4. `moca start` leaf 2. Record is written.
+3. Write leaf 2's prompt to a file, embedding leaf 1's result verbatim.
+4. `moca start` leaf 2 — only after leaf 1 is terminal, or the dispatch
+   is refused with 409.
 5. `moca check` leaf 2 when the operator wants the final result.
 
-Do **not** parallelize leaves whose prompts depend on each other.
-Do **not** fan out beyond what the operator asked for.
+Do **not** parallelize leaves on this install — the shared session
+permits one turn at a time. Do **not** fan out beyond what the operator
+asked for.
 
 ## What this skill does not do
 
-- Does not provision workspaces. Setup owns that (seeds files into
-  sandbox pods at `/workspace/<run-id>/repo` via `kubectl cp`).
-- Does not block the turn on a leaf finishing. The sync call is held by
-  a detached worker, not by your turn; collection happens later.
+- Does not provision workspaces. Setup owns that: it creates the
+  session and seeds the fixture into `/workspace/<session-id>` with a
+  bootstrap turn.
+- Does not block the turn on a leaf finishing. The turn runs
+  cluster-side; collection happens later, by reattaching.
 - Does not prescribe an orchestration shape. The operator's request
   drives how many leaves run and in what order.
