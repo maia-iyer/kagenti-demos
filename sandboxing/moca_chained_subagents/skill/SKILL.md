@@ -234,8 +234,8 @@ asked for.
 ## What this skill does not do
 
 - Does not provision workspaces. Setup owns that: it creates the
-  session and seeds the fixture into `/workspace/<session-id>` with a
-  bootstrap turn.
+  session and seeds the fixture into `/workspace/<session-id>` on every
+  sandbox pod via `kubectl cp`.
 - Does not block the turn on a leaf finishing. The turn runs
   cluster-side; collection happens later, by reattaching.
 - Does not prescribe an orchestration shape. The operator's request

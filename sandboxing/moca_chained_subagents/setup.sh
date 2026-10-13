@@ -6,9 +6,9 @@
 # This script does the demo-specific setup:
 #   1. Obtain an API token (via mocactl) and check an inference credential exists.
 #   2. Create ONE session for the chain; every leaf is a turn in it.
-#   3. Seed example_repo/ into that session's sandbox workspace with a
-#      bootstrap turn, and widen the workspace idle timeout so a paused demo
-#      does not lose its files.
+#   3. Seed example_repo/ into that session's workspace on every sandbox
+#      pod via kubectl cp, and widen the workspace idle timeout so a paused
+#      demo does not lose its files.
 #   4. Stage settings and skill into a scratch directory for a Claude session.
 #
 # This script does NOT stand up MOCA. See the demo README prerequisites.
@@ -19,6 +19,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MOCA_NS="${MOCA_NS:-moca}"
 SANDBOX_NS="${SANDBOX_NS:-moca-sandbox}"
+# Sandbox pods are matched by label (the moca-sandbox StatefulSet's template
+# label) so the fixture lands on every pod that could serve the session.
+SANDBOX_POD_SELECTOR="${SANDBOX_POD_SELECTOR:-app=moca-sandbox}"
 # The control plane tells clients where the harness is, and deploy/k8s
 # advertises it as http://127.0.0.1:8080 — so the supervisor's port-forward
 # must use local port 8080 specifically.
@@ -35,7 +38,7 @@ WORKSPACE_IDLE="${WORKSPACE_IDLE:-8h}"
 
 echo "==> Prerequisite checks..."
 
-for bin in kubectl curl jq tar base64; do
+for bin in kubectl curl jq; do
   if ! command -v "${bin}" >/dev/null 2>&1; then
     echo "    missing required binary: ${bin}" >&2
     exit 1
@@ -55,7 +58,7 @@ if ! kubectl -n "${SANDBOX_NS}" get statefulset moca-sandbox >/dev/null 2>&1; th
   exit 1
 fi
 
-echo "    ok: kubectl, curl, jq, tar, base64 on PATH"
+echo "    ok: kubectl, curl, jq on PATH"
 echo "    ok: namespaces ${MOCA_NS} and ${SANDBOX_NS} exist"
 
 echo "==> Checking both port-forwards are up..."
@@ -177,93 +180,55 @@ if [ "${http_code}" != "200" ] && [ "${http_code}" != "201" ]; then
 fi
 SESSION_ID="$(printf '%s' "${body}" | jq -r '.sessionId // empty')"
 [ -n "${SESSION_ID}" ] || { echo "    control plane returned no sessionId. body: ${body}" >&2; exit 1; }
+# The session token that comes back is only a sanity check here — the moca
+# CLI mints a fresh one immediately before every harness call, so setup has
+# no use for it beyond confirming the session is usable.
 SESSION_TOKEN="$(printf '%s' "${body}" | jq -r '.token // empty')"
 [ -n "${SESSION_TOKEN}" ] || { echo "    control plane returned no session token." >&2; exit 1; }
-SESS_HDR="${AUTH_DIR}/session.hdr"
-( umask 077; printf 'Authorization: Bearer %s\n' "${SESSION_TOKEN}" >"${SESS_HDR}" )
 unset SESSION_TOKEN
 echo "    ok: session ${SESSION_ID}"
 WORKSPACE="/workspace/${SESSION_ID}"
 
-echo "==> Seeding example_repo/ into ${WORKSPACE} via a bootstrap turn..."
-# The workspace is created lazily on the session's first tool call, and which
-# sandbox pod serves the session is not decided until then either — so there is
-# nothing to 'kubectl cp' into yet. Instead the agent writes the fixture
-# itself, which creates the workspace, pins the sandbox and seeds the files in
-# one step.
-#
-# The payload is a base64 tarball, not a list of files to retype: the fixture's
-# whole value is one specific planted bug, and a model asked to reproduce
-# source files from a prompt may silently normalise or "fix" it while typing.
-# Decoding is deterministic; transcription is not.
-PAYLOAD="$(cd "${SCRIPT_DIR}" && tar czf - example_repo | base64 | tr -d '\n')"
-SENTINEL=".moca-fixture-seeded"
-
-BOOTSTRAP_PROMPT="$(cat <<EOF
-Run exactly these commands in your current working directory and report the
-output of the last two. Do not modify, reformat, or "fix" any file you extract
-— the repository contains a deliberate bug that a later task must diagnose.
-
-cat > /tmp/fixture.b64 <<'PAYLOAD_EOF'
-${PAYLOAD}
-PAYLOAD_EOF
-base64 -d /tmp/fixture.b64 > /tmp/fixture.tgz
-tar xzf /tmp/fixture.tgz --strip-components=1
-touch ${SENTINEL}
-rm -f /tmp/fixture.b64 /tmp/fixture.tgz
-pwd && hostname
-ls -la
-EOF
-)"
-
-boot_sse="${AUTH_DIR}/bootstrap.sse"
-# A plain (non-detachable) SSE turn: setup should wait for seeding to finish.
-boot_code="$(curl -sN --max-time 300 \
-  -X POST -H @"${SESS_HDR}" \
-  -H 'Accept: text/event-stream' -H 'Content-Type: application/json' \
-  -o "${boot_sse}" -w '%{http_code}' \
-  -d "$(jq -n --arg s "${SESSION_ID}" --arg p "${BOOTSTRAP_PROMPT}" \
-        '{sessionId:$s, prompt:$p}')" \
-  "${HARNESS_URL}/v1/turn" 2>/dev/null)" || boot_code='000'
-
-if [ "${boot_code}" != "200" ]; then
-  echo "    bootstrap turn failed (HTTP ${boot_code})." >&2
-  echo "    transcript: ${boot_sse}" >&2
+echo "==> Seeding example_repo/ into every sandbox pod at ${WORKSPACE}..."
+# The sandbox worker creates a session's workspace with mkdir semantics on
+# the session's first tool call — a directory that already exists is used
+# as-is, never wiped — and MOCA's idle sweeper only reclaims workspaces
+# that have actually run a tool call. So kubectl can put the fixture in
+# place before any turn runs. Every pod gets it because a session pins to
+# a sandbox only on its FIRST turn; until then any pod can serve it.
+SANDBOX_PODS="$(kubectl -n "${SANDBOX_NS}" get pods \
+  -l "${SANDBOX_POD_SELECTOR}" \
+  --field-selector=status.phase=Running \
+  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+if [ -z "${SANDBOX_PODS}" ]; then
+  echo "    no Running sandbox pods matched selector '${SANDBOX_POD_SELECTOR}' in '${SANDBOX_NS}'." >&2
+  echo "    Did deploy/k8s/setup.sh finish?" >&2
   exit 1
 fi
+for pod in ${SANDBOX_PODS}; do
+  kubectl -n "${SANDBOX_NS}" wait --for=condition=Ready "pod/${pod}" --timeout=90s >/dev/null
+done
 
-boot_term="$(sed -n 's/^data: //p' "${boot_sse}" \
-  | jq -c 'select(.type == "done" or .type == "error")' 2>/dev/null | tail -1 || true)"
-if [ -z "${boot_term}" ] || [ "$(printf '%s' "${boot_term}" | jq -r '.type')" != "done" ]; then
-  echo "    the bootstrap turn did not complete successfully." >&2
-  echo "    transcript: ${boot_sse}" >&2
-  [ -n "${boot_term}" ] && printf '    %s\n' "$(printf '%s' "${boot_term}" | jq -c .)" >&2
-  exit 1
-fi
+for pod in ${SANDBOX_PODS}; do
+  echo "    - ${pod}"
+  kubectl -n "${SANDBOX_NS}" exec "${pod}" -c sandbox -- sh -c "mkdir -p '${WORKSPACE}'"
+  # Clean any previous seeding so re-runs are idempotent.
+  kubectl -n "${SANDBOX_NS}" exec "${pod}" -c sandbox -- \
+    sh -c "rm -rf '${WORKSPACE}'/* '${WORKSPACE}'/.[!.]* 2>/dev/null; true"
+  kubectl -n "${SANDBOX_NS}" cp -c sandbox "${SCRIPT_DIR}/example_repo/." "${pod}:${WORKSPACE}"
+done
 
-# Confirm the fixture actually landed, rather than trusting the model's prose.
-SANDBOX_POD="$(kubectl -n "${SANDBOX_NS}" get pods -o jsonpath='{.items[*].metadata.name}' 2>/dev/null \
-  | tr ' ' '\n' | while read -r p; do
-      [ -n "${p}" ] || continue
-      if kubectl -n "${SANDBOX_NS}" exec "${p}" -c sandbox -- \
-           test -f "${WORKSPACE}/${SENTINEL}" >/dev/null 2>&1; then
-        echo "${p}"; break
-      fi
-    done || true)"
-
-if [ -z "${SANDBOX_POD}" ]; then
-  echo "    could not verify the fixture on any sandbox pod." >&2
-  echo "    Expected ${WORKSPACE}/${SENTINEL} to exist." >&2
-  echo "    transcript: ${boot_sse}" >&2
-  exit 1
-fi
-if ! kubectl -n "${SANDBOX_NS}" exec "${SANDBOX_POD}" -c sandbox -- \
-       test -f "${WORKSPACE}/package.json" >/dev/null 2>&1; then
-  echo "    the sentinel exists on ${SANDBOX_POD} but package.json does not —" >&2
-  echo "    the archive did not extract as expected. transcript: ${boot_sse}" >&2
-  exit 1
-fi
-echo "    ok: fixture verified on ${SANDBOX_POD} at ${WORKSPACE}"
+echo "==> Verifying the fixture landed..."
+for pod in ${SANDBOX_PODS}; do
+  for f in package.json src/index.js; do
+    if ! kubectl -n "${SANDBOX_NS}" exec "${pod}" -c sandbox -- \
+         test -f "${WORKSPACE}/${f}" >/dev/null 2>&1; then
+      echo "    ${WORKSPACE}/${f} is missing on ${pod} — the kubectl cp did not land there." >&2
+      exit 1
+    fi
+  done
+done
+echo "    ok: fixture verified on: ${SANDBOX_PODS}"
 
 echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
 
@@ -299,7 +264,7 @@ Control plane URL:  ${CP_URL}
 Harness URL:        ${HARNESS_URL}
 Session id:         ${SESSION_ID}
 Workspace:          ${WORKSPACE}
-Sandbox pod:        ${SANDBOX_POD}
+Sandbox pods:       ${SANDBOX_PODS}
 Sandbox namespace:  ${SANDBOX_NS}
 
 ## How dispatch works
@@ -335,6 +300,17 @@ the files a diagnose leaf examined. Two consequences:
 The workspace is reclaimed after ${WORKSPACE_IDLE} with no tool call, and is
 lost outright if the sandbox pod restarts (it is container-local, with no
 volume). The turn log in Redis is unaffected by either.
+
+## Which sandbox pod?
+
+The fixture was seeded into every pod listed above, because a session pins
+to a sandbox only on its first turn. After a leaf has run, find the serving
+pod by listing the workspace on each — the serving one shows the leaf's
+changes, the others only the seeded fixture:
+
+  for p in ${SANDBOX_PODS}; do
+    kubectl -n ${SANDBOX_NS} exec "\$p" -c sandbox -- ls -la ${WORKSPACE}
+  done
 
 ## Timeouts worth knowing
 
@@ -382,9 +358,11 @@ echo "       tests, and report the diff and outcome. Check on it when it's done.
 echo ""
 echo "  4. Watch the work land in the sandbox:"
 echo ""
-echo "       kubectl -n ${SANDBOX_NS} exec ${SANDBOX_POD} -c sandbox -- \\"
-echo "         ls -la ${WORKSPACE}"
+echo "       for p in ${SANDBOX_PODS}; do"
+echo "         kubectl -n ${SANDBOX_NS} exec \"\$p\" -c sandbox -- ls -la ${WORKSPACE}"
+echo "       done"
 echo ""
 echo "     The harness runs in the moca-supervisor pod (namespace ${MOCA_NS});"
-echo "     the agent's tool calls execute in ${SANDBOX_POD} (namespace"
-echo "     ${SANDBOX_NS}). Both are warm — nothing scales to zero."
+echo "     the agent's tool calls execute in a sandbox pod (namespace"
+echo "     ${SANDBOX_NS}) — the session pins to one of the seeded pods on its"
+echo "     first turn. Both are warm — nothing scales to zero."

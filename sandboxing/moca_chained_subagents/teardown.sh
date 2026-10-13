@@ -11,6 +11,7 @@ set -euo pipefail
 
 MOCA_NS="${MOCA_NS:-moca}"
 SANDBOX_NS="${SANDBOX_NS:-moca-sandbox}"
+SANDBOX_POD_SELECTOR="${SANDBOX_POD_SELECTOR:-app=moca-sandbox}"
 CP_PORT="${CP_PORT:-8090}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
@@ -44,11 +45,30 @@ else
   esac
 fi
 
-echo "==> Sandbox workspace..."
-# Nothing to clean by hand: the workspace at /workspace/<session-id> is
-# container-local (no volume) and MOCA reclaims it once it goes idle past
-# SH_WORKSPACE_IDLE. It also disappears whenever the sandbox pod restarts.
-echo "    (reclaimed automatically once idle; no action needed)"
+echo "==> Removing the seeded workspace from the sandbox pods..."
+# setup.sh kubectl-cps the fixture into /workspace/<session-id> on every
+# sandbox pod. MOCA's idle sweeper only reclaims a workspace after a turn
+# has run in it, so a seeded-but-never-used directory would sit there until
+# the pod restarts — remove it by hand.
+if [[ -z "${SESSION_ID}" ]]; then
+  echo "    (no session id in ${MOCA_MD}; nothing to clean)"
+else
+  pods="$(kubectl -n "${SANDBOX_NS}" get pods -l "${SANDBOX_POD_SELECTOR}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+  if [[ -z "${pods}" ]]; then
+    echo "    (no Running sandbox pods matched '${SANDBOX_POD_SELECTOR}'; nothing to clean)"
+  else
+    for pod in ${pods}; do
+      if kubectl -n "${SANDBOX_NS}" exec "${pod}" -c sandbox -- \
+           rm -rf "/workspace/${SESSION_ID}" >/dev/null 2>&1; then
+        echo "    removed /workspace/${SESSION_ID} from ${pod}"
+      else
+        echo "    (could not clean ${pod} — pod gone or restarting?)"
+      fi
+    done
+  fi
+fi
 
 echo "==> Restoring the sandbox workspace idle timeout..."
 # setup.sh widens SH_WORKSPACE_IDLE so a paused demo keeps its files. Undo

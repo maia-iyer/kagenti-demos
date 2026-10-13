@@ -70,8 +70,8 @@ Four pieces cooperate:
    is being dispatched to MOCA, not run locally.
 4. **One session, seeded at setup** — `setup.sh` creates a single MOCA
    session for the whole chain and seeds `example_repo/` into that
-   session's sandbox workspace with a bootstrap turn. The skill only
-   dispatches turns; it never touches `/workspace` at runtime.
+   session's workspace on every sandbox pod via `kubectl cp`. The skill
+   only dispatches turns; it never touches `/workspace` at runtime.
 
 Run records live in `.moca-runs/` in the scratch dir — one JSON file
 per dispatched leaf, plus its `.prompt.txt`, the raw `.sse` transcript,
@@ -123,12 +123,14 @@ Three consequences:
 
 ## How state flows
 
-- **Setup time.** `setup.sh` creates the session, then runs a bootstrap
-  turn that extracts `example_repo/` into the session's workspace. The
-  fixture is cluster-side before Claude ever starts. (It is seeded by
-  the agent rather than `kubectl cp` because the workspace doesn't
-  exist, and the sandbox pod isn't chosen, until the session's first
-  tool call.)
+- **Setup time.** `setup.sh` creates the session, then `kubectl cp`s
+  `example_repo/` into `/workspace/<session-id>` on every sandbox pod.
+  The fixture is cluster-side before Claude ever starts. (Seeding
+  directly is safe: the sandbox worker creates a session's workspace
+  with `mkdir` semantics — a directory that already exists is used
+  as-is — and MOCA's idle sweeper only reclaims workspaces that have
+  run a tool call. Seeding every pod covers the fact that a session
+  pins to a sandbox only on its first turn.)
 - **Dispatch.** The only state going from the laptop to MOCA at
   dispatch time is the prompt text and the session id. The parent
   embeds any output from prior leaves into the next leaf's prompt as
@@ -159,9 +161,17 @@ kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
 
 Three things to keep in mind:
 
-- **`setup.sh` tells you which pod** — it verifies the fixture and
-  records the pod name in `MOCA.md`. A session stays on the sandbox
-  that served its previous turn, so that pod stays correct.
+- **Every sandbox pod is seeded; the session pins to one on its first
+  turn.** `MOCA.md` lists the seeded pods. To find the serving pod
+  after a leaf has run, list the workspace on each — the serving pod
+  is the one showing the leaf's changes, the others only the fixture:
+
+  ```bash
+  for POD in moca-sandbox-0 moca-sandbox-1; do
+    kubectl -n moca-sandbox exec "$POD" -c sandbox -- \
+      ls -la /workspace/<session-id>
+  done
+  ```
 - **`-c sandbox` is required**, and the namespace is `moca-sandbox`,
   not `moca`.
 - **The fixture is not a git repo**, so `git diff` won't work in the
@@ -229,7 +239,7 @@ cat .moca-runs/<leaf>.sse              # raw frames, incl. tool calls
   > them silently removes the boundary rather than failing loudly.
 
 - `kubectl` configured for that cluster.
-- `curl`, `jq`, `tar`, `base64` on your `PATH`.
+- `curl` and `jq` on your `PATH`.
 - [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
   (needs Node 22+), for login and credentials:
 
@@ -295,8 +305,8 @@ This:
 4. Widens the sandbox workspace idle timeout to 8h, so a paused demo
    doesn't lose its files.
 5. Creates **one** session for the chain and seeds `example_repo/` into
-   `/workspace/<session-id>` with a bootstrap turn, then verifies the
-   files landed and records which sandbox pod served it.
+   `/workspace/<session-id>` on every sandbox pod via `kubectl cp`,
+   then verifies the files landed on each.
 6. Stages `.claude/settings.json`, `.claude/skills/moca-dispatch/`,
    and `bin/moca` into `~/tmp/moca-chained-scratch/`, and patches
    `settings.json` so the scratch `bin/` is on `$PATH`.
@@ -307,6 +317,8 @@ Environment overrides (set before running):
 
 - `MOCA_NS` / `SANDBOX_NS` — namespaces (default `moca` /
   `moca-sandbox`).
+- `SANDBOX_POD_SELECTOR` — label selector matching the sandbox pods
+  (default `app=moca-sandbox`).
 - `HARNESS_PORT` / `CP_PORT` — local port-forward ports (default
   `8080` / `8090`). Changing `HARNESS_PORT` breaks discovery.
 - `MOCA_API_TOKEN` — use this token instead of calling `mocactl`.
@@ -457,7 +469,7 @@ transport changed:
 | `-H "Host: serverless-harness…"` via Kourier | Two port-forwards, no Host header |
 | Unauthenticated | API token + per-session token, both required |
 | Operator-chosen ids (`review-1.diagnose`) | Server-generated session id + local labels |
-| A fixture on every pool pod at `/workspace/<run-id>/repo` | One workspace at `/workspace/<session-id>` |
+| A fixture on every pool pod at `/workspace/<run-id>/repo` | A fixture on every sandbox pod at `/workspace/<session-id>` — still `kubectl cp` |
 | Local `nohup` worker holding a blocking call | Server-side detachable turn, 24h replay |
 | Raise Knative's 300s `timeoutSeconds` | No request cap to raise |
 | Scale-to-zero; `leaf-worker` ScaledJob | Warm supervisor and sandbox pods |
@@ -501,10 +513,9 @@ The upstream deprecation notice and full mapping is in
 - **The fixture is gone from the workspace.** The sandbox pod restarted
   (the workspace has no volume), or it sat idle past the timeout. Run
   `./teardown.sh && ./setup.sh` for a fresh session.
-- **`setup.sh` says it "could not verify the fixture".** The bootstrap
-  turn didn't extract the archive. Read the transcript it names
-  (`<scratch>/.moca-auth/bootstrap.sse`) to see what the agent actually
-  did.
+- **`setup.sh` says the fixture is missing on a pod.** The `kubectl cp`
+  into that pod failed, or the pod rolled mid-seed. Re-run
+  `./setup.sh` — it creates a fresh session and re-seeds every pod.
 - **Claude tries `Task` and gets denied, then stops.** The skill wasn't
   found. Confirm
   `~/tmp/moca-chained-scratch/.claude/skills/moca-dispatch/SKILL.md`
@@ -548,7 +559,7 @@ In the scratch dir after `setup.sh`:
 │   └── skills/moca-dispatch/      Copied from skill/
 ├── bin/
 │   └── moca                       CLI the skill invokes
-├── .moca-auth/                    API token (0600) + bootstrap transcript
+├── .moca-auth/                    API token (0600)
 ├── .moca-runs/                    Run records (+ *.prompt.txt / *.sse / *.answer.txt)
 └── MOCA.md                        URLs, session id, workspace path, sandbox pod
 ```
@@ -629,8 +640,15 @@ Confirm the fix landed cluster-side, not locally:
 
 ```bash
 SID="$(grep -E '^Session id:' MOCA.md | sed -E 's/^Session id:[[:space:]]+//')"
-POD="$(grep -E '^Sandbox pod:' MOCA.md | sed -E 's/^Sandbox pod:[[:space:]]+//')"
-kubectl -n moca-sandbox exec "$POD" -c sandbox -- cat "/workspace/${SID}/src/index.js"
+for POD in $(grep -E '^Sandbox pods:' MOCA.md | sed -E 's/^Sandbox pods:[[:space:]]+//'); do
+  echo "-- ${POD}"
+  kubectl -n moca-sandbox exec "$POD" -c sandbox -- \
+    grep -n 'lib\.' "/workspace/${SID}/src/index.js"
+done
+```
+
+The serving pod shows `lib.newName`; the pods the session never landed
+on still hold the seeded `lib.oldName`.
 ```
 
 Inspect a failed leaf:
