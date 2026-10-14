@@ -236,7 +236,10 @@ cat leaves/<sessionId>.text       # the collected result
 ## Prerequisites
 
 - A kind cluster with [MOCA](https://github.com/rossoctl/moca) deployed
-  via `deploy/k8s/setup.sh`. From a MOCA checkout:
+  via `deploy/k8s/setup.sh`. From a MOCA checkout (clone with
+  `--recurse-submodules`, or run `git submodule update --init --recursive`
+  before building — otherwise the Docker build fails at `npm ci` inside
+  the empty `pi-fork/` dir):
 
   ```bash
   cd deploy/k8s
@@ -288,6 +291,17 @@ one). If it reports none, store your Anthropic key:
 printf %s "$ANTHROPIC_API_KEY" | mocactl credentials add anthropic \
   --host api.anthropic.com --kind api-key \
   --endpoint https://api.anthropic.com
+```
+
+For an Anthropic-compatible proxy (e.g. a LiteLLM gateway) that expects
+`Authorization: Bearer`, use `--kind bearer` and point `--host` /
+`--endpoint` at the proxy. `--kind api-key` is only validated against
+`api.anthropic.com`:
+
+```bash
+printf %s "$PROXY_TOKEN" | mocactl credentials add anthropic \
+  --host <proxy-host> --kind bearer \
+  --endpoint https://<proxy-host>
 ```
 
 ## Setup
