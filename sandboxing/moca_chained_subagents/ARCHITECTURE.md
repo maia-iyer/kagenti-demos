@@ -78,36 +78,36 @@ sequenceDiagram
   participant W as detached worker
   participant SV as MOCA supervisor
   participant SB as sandbox pod
-  participant FS as scratch leaves/
+  participant FS as scratch leaves dir
 
   OP->>CC: "Dispatch a subagent to diagnose…"
-  CC->>FS: write leaves/<label>.prompt.txt
-  CC->>MC: mocactl spawn "$(cat …)" --kind prompt --tag $TAG --json
+  CC->>FS: write leaves/LABEL.prompt.txt
+  CC->>MC: mocactl spawn --kind prompt --tag TAG --json
   Note over CC,MC: permission prompt = operator's visual confirmation
   MC->>SV: create session
   SV-->>MC: sessionId
   MC->>W: fork (detached)
-  MC-->>CC: {"type":"session","sessionId":…,"pid":…}
-  CC->>FS: write leaves/<label>.json (label→sessionId note)
+  MC-->>CC: stdout — type=session, sessionId, pid
+  CC->>FS: write leaves/LABEL.json (label to sessionId note)
   W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
-  CC->>SB: kubectl cp example_repo/. → /workspace/<sessionId> (every pod)
-  CC-->>OP: "dispatched, sessionId=…" then STOPS (no polling)
+  CC->>SB: kubectl cp example_repo into workspace/SID (every pod)
+  CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
-  Note over SV,SB: leaf runs server-side; session pins to one pod on first turn
-  SV->>SB: leaf tool calls, cwd = /workspace/<sessionId>
-  Note over SB: leaf waits for package.json if seed hasn't landed
+  Note over SV,SB: leaf runs server-side — session pins to one pod on first turn
+  SV->>SB: leaf tool calls, cwd = workspace/SID
+  Note over SB: leaf waits for package.json if seed has not landed
   SB-->>SV: final message
   SV->>SV: persist result BEFORE responding (24h TTL)
   SV-->>W: 200 (worker may already be dead — irrelevant)
 
-  Note over OP,CC: minutes / hours later — may be a brand-new Claude session
+  Note over OP,CC: minutes or hours later — may be a brand-new Claude session
   OP->>CC: "Check on that subagent."
-  CC->>MC: mocactl get <sessionId> --out leaves --json
+  CC->>MC: mocactl get SID --out leaves --json
   MC->>SV: fetch result
-  SV-->>MC: status: queued | responded | failed | paused
-  MC->>FS: write leaves/<sessionId>.text (when responded)
+  SV-->>MC: status — queued, responded, failed or paused
+  MC->>FS: write leaves/SID.text (when responded)
   CC->>FS: read result
-  CC-->>OP: surface diagnosis (or "still running", and stop)
+  CC-->>OP: surface diagnosis (or still running, and stop)
 ```
 
 ## Chaining: context flows as prompt text only
