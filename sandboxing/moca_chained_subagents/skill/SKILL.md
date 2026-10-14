@@ -136,7 +136,7 @@ and prompts are never overwritten.
    Both orderings — seed landing before or after the leaf boots — are
    safe: the sandbox worker creates a session's workspace with mkdir
    "use as-is" semantics, and the leaf's prompt tells it to wait for
-   `package.json`. One caveat: a leaf quick enough to edit files while
+   `tests/`. One caveat: a leaf quick enough to edit files while
    the copy is still landing can have those edits clobbered by the
    extraction — hence "seed immediately".
 5. **Stop.** Report the label and session id to the operator. Do not
@@ -156,7 +156,7 @@ Failure modes at dispatch:
 **Manual fallback.** If kubectl is not available to you (or the
 operator prefers it), report the session id and the step-4 seed loop
 verbatim for the operator to paste. The wait-for-fixture clause makes
-seeding untimed — the leaf waits for `package.json` no matter when
+seeding untimed — the leaf waits for `tests/` no matter when
 the copy lands. The primary path is you-do-it.
 
 ## Procedure 2: check a leaf
@@ -229,7 +229,7 @@ for a chain (A then B), you do the sequencing:
 4. Spawn, note, seed leaf 2 the same way; collect on a later turn.
 
 Posture rules for this demo's fixture: the diagnose leaf is read-only
-by prompt; the fix leaf edits `src/` and never `node_modules/`. Keep
+by prompt; the fix leaf edits `src/` and never `vendor/`. Keep
 the demo a sequential chain unless the operator explicitly asks for
 fan-out.
 
@@ -271,21 +271,21 @@ posture rules, final-message-is-the-deliverable.
 
 ```text
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Node.js
-project is being copied into your workspace right now: if package.json is not
+directory is your private workspace — do not cd elsewhere. A small Python
+project is being copied into your workspace right now: if tests/ is not
 present yet, wait for it (re-check every few seconds; it arrives within a
 minute or two).
 
-The project's tests currently fail. Run the test suite (npm test), read the
-relevant code and the docs under docs/upstream-refs/, and report:
+The project's tests currently fail. Run the test suite
+(`python3 -m unittest discover -s tests`), read the relevant code and the
+docs under docs/upstream-refs/, and report:
 1. The exact failing assertion and the test command that exercises it.
 2. The root cause, with file paths and line references.
 3. The minimal change that would fix it, described precisely — another agent
    will apply it on a fresh copy of this project.
 
-If node/npm are not installed in the sandbox, do NOT install or download
-anything — no package manager, no Node tarball. Diagnose from the source
-and docs alone, and say in your report that the suite could not be run.
+The project is stdlib-only; do NOT install or download anything (no `pip`,
+no package manager). Diagnose from the source and docs alone.
 
 Do NOT edit any files: this is a diagnosis-only task. End your turn with the
 full diagnosis as your final message.
@@ -295,8 +295,8 @@ full diagnosis as your final message.
 
 ```text
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Node.js
-project is being copied into your workspace right now: if package.json is not
+directory is your private workspace — do not cd elsewhere. A small Python
+project is being copied into your workspace right now: if tests/ is not
 present yet, wait for it (re-check every few seconds; it arrives within a
 minute or two).
 
@@ -306,14 +306,13 @@ A prior agent diagnosed a test failure in a fresh copy of this project:
 <PASTE leaves/<diagnose sessionId>.text VERBATIM HERE>
 ------------------------------------------------------------------------
 
-Apply the fix in your workspace copy — edit src/, never node_modules — then
-run npm test to confirm the suite passes. If node/npm are not installed in
-the sandbox, do NOT install or download anything — no package manager, no
-Node tarball: say so in your report, and verify the fix by re-reading the
-changed code against the test's assertion instead. Report:
+Apply the fix in your workspace copy — edit src/, never vendor/ — then run
+`python3 -m unittest discover -s tests` to confirm the suite passes. The
+project is stdlib-only; do NOT install or download anything (no `pip`, no
+package manager). Report:
 1. The exact change you made (file, line, before/after).
-2. The test output after your change — or, if the suite could not be run,
-   the reason and your inspection-based verification.
+2. The full test output after your change (verbatim, including the
+   `Ran N tests` and `OK` / `FAILED` lines).
 
 End your turn with the full report as your final message.
 ```

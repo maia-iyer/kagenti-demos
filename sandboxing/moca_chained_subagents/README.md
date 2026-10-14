@@ -128,7 +128,7 @@ Three consequences:
   after the leaf boots — both orderings are safe: the sandbox worker
   creates a session's workspace with mkdir "use as-is" semantics, and
   every leaf prompt carries a wait-for-fixture clause ("if
-  package.json is not present yet, wait for it"). Then the parent
+  tests/ is not present yet, wait for it"). Then the parent
   **stops** — no waiting, no polling.
 - **Execution.** The detached worker holds the synchronous
   `POST /v1/runs`; the server runs the leaf to completion and stores
@@ -156,7 +156,7 @@ kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
 
 # Did the fixer's change land?
 kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
-  cat /workspace/<sessionId>/src/index.js
+  cat /workspace/<sessionId>/src/greet.py
 ```
 
 Things to keep in mind:
@@ -589,21 +589,21 @@ TAG="$(sed -nE 's/^Demo tag:[[:space:]]+//p' MOCA.md)"
 ```bash
 cat > leaves/diagnose.prompt.txt <<'EOF'
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Node.js
-project is being copied into your workspace right now: if package.json is not
+directory is your private workspace — do not cd elsewhere. A small Python
+project is being copied into your workspace right now: if tests/ is not
 present yet, wait for it (re-check every few seconds; it arrives within a
 minute or two).
 
-The project's tests currently fail. Run the test suite (npm test), read the
-relevant code and the docs under docs/upstream-refs/, and report:
+The project's tests currently fail. Run the test suite
+(`python3 -m unittest discover -s tests`), read the relevant code and the
+docs under docs/upstream-refs/, and report:
 1. The exact failing assertion and the test command that exercises it.
 2. The root cause, with file paths and line references.
 3. The minimal change that would fix it, described precisely — another agent
    will apply it on a fresh copy of this project.
 
-If node/npm are not installed in the sandbox, do NOT install or download
-anything — no package manager, no Node tarball. Diagnose from the source
-and docs alone, and say in your report that the suite could not be run.
+The project is stdlib-only; do NOT install or download anything (no `pip`,
+no package manager). Diagnose from the source and docs alone.
 
 Do NOT edit any files: this is a diagnosis-only task. End your turn with the
 full diagnosis as your final message.
@@ -631,7 +631,7 @@ EOF
 **4 — seed the leaf's workspace.** Every pod, because the session pins
 to one only on its first turn. Both orderings (seed-before-boot,
 seed-after-boot) boot the leaf correctly — its prompt tells it to wait
-for `package.json` — with one caveat: a leaf quick enough to edit files
+for `tests/` — with one caveat: a leaf quick enough to edit files
 while the copy is still landing can have those edits overwritten by it
 (this happened once in testing; the leaf noticed and re-applied its
 work). Seed right after spawn and the window is small:
@@ -668,11 +668,11 @@ calls both of them `done`:
 cat leaves/"$SID".text
 ```
 
-The diagnosis should name the renamed API: `src/index.js` calls
-`lib.oldName` while the vendored `node_modules/lib` (v2.0.0) exports
-only `newName`. (If the sandbox image has no node/npm, the leaf reports
-this from source without running the suite — expected, and its prompt
-tells it not to work around that.)
+The diagnosis should name the renamed API: `src/greet.py` calls
+`lib.old_name` while the vendored `vendor/lib/__init__.py` (v2.0.0)
+exports only `new_name`. The sandbox image ships `python3` but no
+`pip`; the fixture is stdlib-only, so `python3 -m unittest` runs
+directly.
 
 **6 — chain the fix leaf.** Author its prompt with the diagnosis
 inlined **verbatim** (never point one leaf at another leaf's files —
@@ -682,8 +682,8 @@ each leaf has a fresh workspace):
 DIAG="$(cat leaves/"$SID".text)"
 cat > leaves/fix.prompt.txt <<EOF
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Node.js
-project is being copied into your workspace right now: if package.json is not
+directory is your private workspace — do not cd elsewhere. A small Python
+project is being copied into your workspace right now: if tests/ is not
 present yet, wait for it (re-check every few seconds; it arrives within a
 minute or two).
 
@@ -693,14 +693,13 @@ A prior agent diagnosed a test failure in a fresh copy of this project:
 $DIAG
 ------------------------------------------------------------------------
 
-Apply the fix in your workspace copy — edit src/, never node_modules — then
-run npm test to confirm the suite passes. If node/npm are not installed in
-the sandbox, do NOT install or download anything — no package manager, no
-Node tarball: say so in your report, and verify the fix by re-reading the
-changed code against the test's assertion instead. Report:
+Apply the fix in your workspace copy — edit src/, never vendor/ — then run
+\`python3 -m unittest discover -s tests\` to confirm the suite passes. The
+project is stdlib-only; do NOT install or download anything (no \`pip\`, no
+package manager). Report:
 1. The exact change you made (file, line, before/after).
-2. The test output after your change — or, if the suite could not be run,
-   the reason and your inspection-based verification.
+2. The full test output after your change (verbatim, including the
+   \`Ran N tests\` and \`OK\` / \`FAILED\` lines).
 
 End your turn with the full report as your final message.
 EOF
@@ -731,7 +730,7 @@ mocactl get "$FIX_SID" --out leaves --json
 cat leaves/"$FIX_SID".text
 ```
 
-The report should say `src/index.js` changed (`oldName` → `newName`) and
+The report should say `src/greet.py` changed (`old_name` → `new_name`) and
 that the tests pass — or, if the sandbox has no node/npm, that the fix was
 verified by inspection.
 
@@ -752,7 +751,7 @@ its last tool call; the fix leaf's should show the change):
 
 ```bash
 kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
-  cat /workspace/$FIX_SID/src/index.js
+  cat /workspace/$FIX_SID/src/greet.py
 ```
 
 **8 — tear down:**
