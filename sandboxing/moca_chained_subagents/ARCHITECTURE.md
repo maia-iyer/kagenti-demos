@@ -95,7 +95,7 @@ sequenceDiagram
 
   Note over SV,SB: leaf runs server-side — session pins to one pod on first turn
   SV->>SB: leaf tool calls, cwd = workspace/SID
-  Note over SB: leaf waits for package.json if seed has not landed
+  Note over SB: leaf waits for tests/ if seed has not landed
   SB-->>SV: final message
   SV->>SV: persist result BEFORE responding (24h TTL)
   SV-->>W: 200 (worker may already be dead — irrelevant)

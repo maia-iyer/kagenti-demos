@@ -2,10 +2,11 @@
 
 ## v2.0.0
 
-**Breaking:** `oldName(name)` has been renamed to `newName(name)`. The
+**Breaking:** `old_name(name)` has been renamed to `new_name(name)`. The
 behavior is unchanged; only the exported identifier differs. Callers must
 update to the new name. There is no deprecation shim — importing
-`oldName` from v2.x will produce `TypeError: lib.oldName is not a function`.
+`old_name` from v2.x will produce
+`AttributeError: module 'vendor.lib' has no attribute 'old_name'`.
 
 ## v1.4.1
 
@@ -13,4 +14,4 @@ update to the new name. There is no deprecation shim — importing
 
 ## v1.4.0
 
-- Introduced `oldName(name)`.
+- Introduced `old_name(name)`.

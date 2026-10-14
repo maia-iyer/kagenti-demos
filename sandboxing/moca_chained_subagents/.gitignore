@@ -1,0 +1,4 @@
+# Python bytecode (fixture tests may be run in-tree during verification)
+__pycache__/
+*.pyc
+*.pyo
