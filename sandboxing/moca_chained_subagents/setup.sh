@@ -118,6 +118,15 @@ cp "${SCRIPT_DIR}/skill/SKILL.md" \
 # source at dispatch time).
 cp -R "${SCRIPT_DIR}/example_repo" "${SCRATCH_DIR}/example_repo"
 
+# Purge any Python bytecode left in the fixture from a prior in-tree test run
+# (e.g. verifying the fixture locally). A .pyc file is tagged with the Python
+# version that produced it (e.g. greet.cpython-311.pyc); the sandbox's Python
+# may be a different minor version and would ignore or reject it, and leaf
+# prompts assume a clean fixture.
+find "${SCRATCH_DIR}/example_repo" \
+  \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
+  -prune -exec rm -rf {} +
+
 # One demo tag per scratch dir. mocactl's subagent ledger is machine-global;
 # the tag is what scopes listing and teardown to this demo instance.
 TAG="chained-$(date +%Y%m%d-%H%M%S)"
