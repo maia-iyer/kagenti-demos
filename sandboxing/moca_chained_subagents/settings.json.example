@@ -9,11 +9,8 @@
       "Bash(mocactl get*)",
       "Bash(mocactl subagents*)",
       "Bash(mocactl sessions*)",
-      "Bash(kubectl -n moca-sandbox get pods*)",
-      "Bash(kubectl -n moca-sandbox wait*)",
-      "Bash(kubectl -n moca-sandbox exec*)",
-      "Bash(kubectl -n moca-sandbox cp*)",
-      "Bash(kubectl -n moca-sandbox logs*)"
+      "Bash(mocactl workloads get*)",
+      "Bash(mocactl workloads delete*)"
     ]
   }
 }

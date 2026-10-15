@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Tear down the demo-specific resources created by setup.sh.
 #
-# Does NOT touch the MOCA install or the kind cluster. Those are
-# prerequisites, not owned by this demo. Your mocactl login and stored
-# credentials are also yours — not touched.
+# Does NOT touch the MOCA install, Context Service, or the kind cluster.
+# Those are prerequisites, not owned by this demo. Your mocactl login and
+# stored credentials are also yours — not touched.
 #
 # Run this AFTER collecting every leaf you care about: deleting a session
 # makes its stored result unreachable, so any uncollected answer is lost.
@@ -11,9 +11,6 @@
 set -euo pipefail
 
 MOCA_NS="${MOCA_NS:-moca}"
-SANDBOX_NS="${SANDBOX_NS:-moca-sandbox}"
-SANDBOX_POD_SELECTOR="${SANDBOX_POD_SELECTOR:-app=moca-sandbox}"
-SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-sandbox}"
 HARNESS_PORT="${HARNESS_PORT:-8080}"
 CP_PORT="${CP_PORT:-8090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
@@ -21,7 +18,8 @@ CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
 MOCA_MD="${SCRATCH_DIR}/MOCA.md"
 
-# mocactl needs the port-forwards to list and delete sessions.
+# mocactl needs the port-forwards to list sessions, delete sessions, and
+# delete the workload.
 export SH_CONTROL_PLANE_URL="${CP_URL}"
 export SH_HARNESS_URL="${HARNESS_URL}"
 
@@ -29,9 +27,12 @@ echo "==> Collecting this demo's leaf sessions..."
 # The demo tag (written to MOCA.md by setup.sh) scopes the machine-global
 # mocactl subagent ledger to this run.
 TAG=""
+WORKLOAD_ID=""
 if [[ -f "${MOCA_MD}" ]]; then
   TAG="$(grep -E '^Demo tag:' "${MOCA_MD}" 2>/dev/null \
     | sed -E 's/^Demo tag:[[:space:]]+//' | head -1 || true)"
+  WORKLOAD_ID="$(grep -E '^Workload id:' "${MOCA_MD}" 2>/dev/null \
+    | sed -E 's/^Workload id:[[:space:]]+//' | head -1 || true)"
 fi
 
 SESSION_IDS=""
@@ -69,26 +70,18 @@ else
   done
 fi
 
-echo "==> Removing leaf workspaces from the sandbox pods..."
-# Each leaf worked in /workspace/<sessionId>. The idle sweeper would reclaim
-# them within 30 minutes anyway — removing them here just makes it immediate.
-if [[ -z "${SESSION_IDS}" ]]; then
-  echo "    (no session ids known; nothing to clean)"
+echo "==> Deleting the workload..."
+# The workload's shared read-only cache and any per-run writable copies are
+# released by DELETE /workloads/{id}. Writable per-run copies are already
+# discarded when their runs end (nothing persists across runs in phase 1).
+if [[ -z "${WORKLOAD_ID}" ]]; then
+  echo "    (no workload id in MOCA.md; nothing to delete)"
 else
-  pods="$(kubectl -n "${SANDBOX_NS}" get pods -l "${SANDBOX_POD_SELECTOR}" \
-    --field-selector=status.phase=Running \
-    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
-  if [[ -z "${pods}" ]]; then
-    echo "    (no Running sandbox pods matched '${SANDBOX_POD_SELECTOR}'; nothing to clean)"
+  if mocactl workloads delete "${WORKLOAD_ID}" >/dev/null 2>&1; then
+    echo "    deleted workload ${WORKLOAD_ID}"
   else
-    for sid in ${SESSION_IDS}; do
-      for pod in ${pods}; do
-        if kubectl -n "${SANDBOX_NS}" exec "${pod}" -c "${SANDBOX_CONTAINER}" -- \
-             rm -rf "/workspace/${sid}" >/dev/null 2>&1; then
-          echo "    removed /workspace/${sid} from ${pod}"
-        fi
-      done
-    done
+    echo "    could not delete workload ${WORKLOAD_ID} (already gone?)" >&2
+    echo "      delete it later with:  mocactl workloads delete ${WORKLOAD_ID}" >&2
   fi
 fi
 
@@ -104,7 +97,8 @@ echo ""
 echo "Teardown complete."
 echo ""
 echo "Not touched by this script (deliberately — they're prerequisites or yours):"
-echo "  - MOCA install in namespaces ${MOCA_NS} and ${SANDBOX_NS}"
+echo "  - MOCA install in namespace ${MOCA_NS}"
+echo "  - Context Service install"
 echo "  - the kind cluster"
 echo "  - your mocactl login and stored credentials"
 echo "  - the machine-global subagent ledger (~/.local/state/mocactl/subagents.jsonl)"
