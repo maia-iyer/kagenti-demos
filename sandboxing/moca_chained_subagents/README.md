@@ -9,14 +9,14 @@ delegates instead through a skill that dispatches an isolated leaf to
 official client, **`mocactl`** — which is already installed on your
 `PATH`; this demo stages no CLI of its own.
 
-Dispatch is **`mocactl spawn`**. It creates a **new session** for the
-leaf, prints the session id immediately, and forks a **detached local
-worker** that holds a synchronous `POST /v1/runs`. The server runs the
-leaf to completion and **persists the result before responding** —
-and, unlike a normal turn, `/v1/runs` has **no client-disconnect
-abort**. So the leaf keeps running with nothing held open on your
-laptop: you can quit Claude Code, close the laptop, or reboot, and the
-result is still there.
+Dispatch is **`mocactl spawn --workload <id>`**. It creates a **new
+session** for the leaf, prints the session id immediately, and forks
+a **detached local worker** that holds a synchronous `POST /v1/runs`.
+The server runs the leaf to completion and **persists the result
+before responding** — and, unlike a normal turn, `/v1/runs` has
+**no client-disconnect abort**. The leaf keeps running with nothing
+held open on your laptop: you can quit Claude Code, close the laptop,
+or reboot, and the result is still there.
 
 Collection is **`mocactl get`**: it writes the leaf's final message to
 `leaves/<sessionId>.text`. Results live server-side for **24 hours** —
@@ -26,11 +26,12 @@ The orchestration shape is the **operator's**, not the skill's. For
 this demo the operator issues prompts in sequence:
 
 1. *"Dispatch a subagent to diagnose the failing test."* The parent
-   writes the leaf's prompt, spawns it, seeds its workspace, and
-   returns. Operator can walk away.
+   writes the leaf's prompt, spawns it against the shared workload,
+   and returns. Operator can walk away.
 2. Later: *"Check on that subagent and report the diagnosis."* The
    parent collects the result and surfaces the diagnosis.
-3. *"Dispatch a fixer with that diagnosis."* Repeat the pattern.
+3. *"Dispatch a fixer with that diagnosis."* Repeat the pattern, this
+   time with `--writable` so the fix leaf can edit and test.
 
 MOCA does not know about the chain; from its perspective each leaf is
 an independent, self-contained session. The skill does not know about
@@ -45,37 +46,40 @@ Three pieces cooperate:
 
 1. **A skill (`moca-dispatch`)** — the mechanism contract. Tells
    Claude how to invoke `mocactl spawn` / `get` / `subagents`, how to
-   compose leaf prompts (cwd-is-your-workspace, wait-for-fixture,
-   read-only vs apply, "end your turn with the full report"), and how
-   to chain leaves by inlining the previous leaf's collected text
-   verbatim into the next prompt. Does **not** prescribe how many
-   leaves to run or in what order — that comes from the operator's
-   prompts.
+   compose leaf prompts (project-is-at-your-cwd, read-only vs
+   writable, "end your turn with the full report"), and how to chain
+   leaves by inlining the previous leaf's collected text verbatim
+   into the next prompt. Does **not** prescribe how many leaves to
+   run or in what order — that comes from the operator's prompts.
 2. **`mocactl`** — the official MOCA client, on your `PATH` (never
    staged or wrapped by the demo). It owns **all** auth (see below).
    The subagent commands it provides: `spawn` (new session per leaf +
    detached worker + a row in the machine-global ledger at
    `~/.local/state/mocactl/subagents.jsonl`), `get` (writes result
    files), `subagents` (lists the ledger joined with live state).
-   These commands are marked **Preview** upstream.
+   The `workloads create / get / delete` subcommands manage the
+   context-service bundle both leaves mount.
 3. **A denied `Task` tool** — `.claude/settings.json` denies the
    built-in subagent tool, so the model has to route through the skill
    instead of forking in-process. The permission prompt on each
    `mocactl spawn …` is the operator's visual confirmation that the
    leaf is being dispatched to MOCA, not run locally.
 
-Setup stages a scratch dir (fixture copy, `leaves/`, `MOCA.md` runtime
-facts including the demo **tag**, Claude settings) but no longer
-creates a session — every session is created at dispatch time by
+Setup packs `./example_repo` with `contextctl ctx pack --type workspace`,
+creates one **workload** from the bundle (shared by both leaves), and
+stages a scratch dir (`leaves/`, `MOCA.md` runtime facts including the
+demo **tag** and the **workload id**, Claude settings). It does not
+create a session — every session is created at dispatch time by
 `spawn`.
 
 Leaf bookkeeping lives in `leaves/` in the scratch dir, written by the
 parent:
 
 - `leaves/<label>.prompt.txt` — the prompt that was sent.
-- `leaves/<label>.json` — a note: `{label, sessionId, kind,
-  promptFile, dispatchedAt}`. Status is never stored; it is always
-  derived fresh from `subagents` / `get` at read time.
+- `leaves/<label>.json` — a note:
+  `{label, sessionId, kind, writable, promptFile, dispatchedAt}`.
+  Status is never stored; it is always derived fresh from
+  `subagents` / `get` at read time.
 - `leaves/<sessionId>.text` — the collected result, written by
   `mocactl get --out leaves`.
 
@@ -91,96 +95,70 @@ token — no `.moca-auth/` directory, no `MOCA_API_TOKEN`, no header
 files, no re-minting logic. If auth breaks, fix it with `mocactl
 login` / `mocactl doctor`; there is nothing demo-side to repair.
 
-## One leaf, one session, one fresh workspace
+## One shared workload, one session per leaf
 
-Every leaf is its **own** MOCA session, so its own sandbox workspace
-at `/workspace/<sessionId>`. Right after `spawn` returns, the parent
-seeds a fresh copy of `example_repo/` into that workspace on every
-sandbox pod via `kubectl cp` (a session pins to a pod only on its
-first turn, and the parent cannot know which — so every pod gets it).
+Setup packs `./example_repo` into a workspace `.context` bundle and
+creates one workload from it. Both leaves of this demo share that
+workload — its id is in `MOCA.md`. Each dispatch creates its own
+session; the workload is what the session mounts, not something the
+session owns.
 
 Three consequences:
 
-- **Leaves are isolated from each other by construction.** The fix
-  leaf does not work on "the same files" the diagnose leaf saw — it
-  gets a fresh fixture copy plus the diagnosis as prompt text. The
-  isolation boundary is now substrate-enforced (one session, one
-  workspace, one fresh fixture), not a promise in a prompt. Context
-  flows leaf→leaf via prompt text only.
-- **No turn sequencing.** Each leaf is a single turn in its own
-  session, so there is no `409 turn_in_progress` to dodge; leaves
-  *could* run concurrently (fan-out is possible) — this demo
-  deliberately stays a sequential chain.
-- **Session ids are server-generated** (`spawn` prints them). The
-  parent keeps short local labels (`diagnose`, `fix`) that name the
-  files in `leaves/`.
+- **No fixture-seeding step.** Context Service serves the frozen
+  revision into whichever sandbox the leaf lands on, mounted at the
+  leaf's cwd. The parent runs no `kubectl cp`.
+- **Read-only by default.** The diagnose leaf dispatches with just
+  `--workload $WORKLOAD_ID`; the mount is a read-only view of the
+  revision.
+- **Opt-in writable.** The fix leaf dispatches with
+  `--workload $WORKLOAD_ID --writable` and gets its own **per-run
+  copy** of the files. Edits land in that copy; the copy is
+  **discarded when the run ends.** Nothing persists across runs —
+  durable, shared, mutable storage is phase-2 workloads
+  ([rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476)),
+  not shipped. Whatever the fix leaf wants to return — a diff, test
+  output — must be inlined in its final message.
+
+Session ids are server-generated (`spawn` prints them). The parent
+keeps short local labels (`diagnose`, `fix`) that name the files in
+`leaves/`.
 
 ## How state flows
 
 - **Setup time.** `mocactl login` + an inference credential (verified
-  end-to-end by `mocactl doctor`), then a staged scratch dir. Nothing
-  lands in the cluster at setup time — no session, no fixture.
+  end-to-end by `mocactl doctor`); `contextctl ctx pack --type workspace`
+  on the fixture; `mocactl workloads create --context` on the bundle;
+  a staged scratch dir. One workload lives on the cluster after setup;
+  no session, no per-pod seeding.
 - **Dispatch.** The parent authors `leaves/<label>.prompt.txt`, runs
   `mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt
-  --tag "$TAG" --json` (quote-substitution keeps the command legible
-  in the permission prompt), writes the note file, then seeds the
-  workspace with the kubectl cp loop. The seed can land before or
-  after the leaf boots — both orderings are safe: the sandbox worker
-  creates a session's workspace with mkdir "use as-is" semantics, and
-  every leaf prompt carries a wait-for-fixture clause ("if
-  tests/ is not present yet, wait for it"). Then the parent
-  **stops** — no waiting, no polling.
+  --workload "$WORKLOAD_ID" [--writable] --tag "$TAG" --json`, writes
+  the note file, and **stops** — no waiting, no polling, no seeding.
 - **Execution.** The detached worker holds the synchronous
   `POST /v1/runs`; the server runs the leaf to completion and stores
   the result **before** responding, with no client-disconnect abort.
-  The leaf's bash cwd is its workspace (`/workspace/<sessionId>` —
-  the sandbox always advertises the `workspace-subdir` capability), so
-  leaf prompts never need to contain a path.
+  The leaf's bash cwd is the workload's view (read-only) or its own
+  writable copy — the project is at `./`, so leaf prompts never need
+  to contain a path.
 - **Return.** The result — the leaf's final message — is stored
   server-side for 24h. `mocactl get <sid> --out leaves` writes
-  `leaves/<sid>.text`. Files the leaf wrote stay on the sandbox pod
-  and do **not** come back to the laptop; if you want to see a diff
-  or a test log, the leaf's prompt must ask for it as text.
+  `leaves/<sid>.text`. In a writable run, the per-run copy is already
+  gone by the time you collect; if you want a diff or a test log, the
+  leaf's prompt must have asked for it as text.
 
 ## Inspecting state in the sandbox
 
-Files a leaf writes stay on the sandbox pod, under that leaf's
-`/workspace/<sessionId>`. To see what actually changed, go look
-(substitute the session id from `leaves/<label>.json` and the pod
-name):
+Writable runs discard their copies when the run ends, and read-only
+runs do not write to the mount at all, so there is nothing in the
+sandbox to inspect after a leaf finishes. The leaf's final message is
+the only record of what it did — if you want a diff or test output,
+the prompt must ask for it as text (the templates in `skill/SKILL.md`
+already do).
 
-```bash
-# Which workspaces exist (one per leaf of this demo)
-kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
-  ls -la /workspace/
-
-# Did the fixer's change land?
-kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
-  cat /workspace/<sessionId>/src/greet.py
-```
-
-Things to keep in mind:
-
-- **A leaf's workspace survives until the idle sweeper reclaims it**
-  (30 minutes with no tool call, by default) or teardown removes it —
-  so the "inspect the sandbox" story works within that window after
-  the leaf's last activity.
-- **Every sandbox pod was seeded for that leaf; the session pinned to
-  one on its first turn.** To find the serving pod, list the workspace
-  on each — the serving one shows the leaf's changes, the others only
-  the seeded fixture:
-
-  ```bash
-  for POD in moca-sandbox-0 moca-sandbox-1; do
-    kubectl -n moca-sandbox exec "$POD" -c sandbox -- \
-      ls -la /workspace/<sessionId>
-  done
-  ```
-- **`-c sandbox` is required**, and the namespace is `moca-sandbox`,
-  not `moca`.
-- **The fixture is not a git repo**, so `git diff` won't work in the
-  sandbox. If you want a diff, have the leaf's prompt ask for one as
-  text.
+If you need to inspect a workload's frozen revision before dispatching
+anything, read `MOCA.md` for the workload id and use
+`mocactl workloads get <workloadId>`.
 
 Local leaf state lives in `leaves/` in the scratch dir:
 
@@ -193,15 +171,20 @@ cat leaves/<sessionId>.text       # the collected result
 
 ## What's honest and what isn't
 
-**What the mocactl migration gained:**
+**What the workloads migration gained:**
 
-- **Leaf isolation is substrate-enforced.** One session, one
-  workspace, one fresh fixture per leaf. A leaf physically cannot see
-  another leaf's files (within the sandbox's own limits, below).
+- **Fixture delivery is a service, not a hack.** Context Service
+  mounts the frozen revision at the leaf's cwd; the parent runs no
+  `kubectl cp`, and the demo needs no cluster-admin access on the
+  sandbox namespace.
+- **Writes are per-run.** The fix leaf's edits are isolated to its
+  own copy and discarded when the run ends; a second fix run on the
+  same workload starts from the frozen revision again, not from the
+  previous run's edits.
 - **No token plumbing.** mocactl owns all auth; the demo touches no
   token and stores no secret.
-- **No local CLI.** The ~500-line `bin/moca` is gone; the demo is
-  prompt templates and shell snippets over the official client.
+- **No local CLI.** The demo is prompt templates and shell snippets
+  over the official clients (`mocactl`, `contextctl`).
 - **Durability is server-side.** `/v1/runs` completes and stores the
   result regardless of any local process — quit Claude, reboot, it
   doesn't matter (collect within 24h).
@@ -209,26 +192,31 @@ cat leaves/<sessionId>.text       # the collected result
 **What it lost:**
 
 - **Cancel.** There is no server-side cancel for `/v1/runs` and no
-  headless cancel command. A dispatched leaf runs to completion; if it
-  went wrong, let it finish and ignore it, or re-dispatch a fresh
+  headless cancel command. A dispatched leaf runs to completion; if
+  it went wrong, let it finish and ignore it, or re-dispatch a fresh
   leaf.
 - **The streamed transcript.** Results are the leaf's final text
-  only — there is no tool-call log (the old `.sse` files are gone).
-  If you need the leaf's reasoning, ask for it in the prompt.
+  only — there is no tool-call log. If you need the leaf's reasoning
+  or the diff it applied, ask for it in the prompt.
 
 **Standing caveats:**
 
-- **`spawn` / `subagents` / `get` are Preview** upstream, not Stable.
-- **`/workspace/<sessionId>` is not a security boundary.** Every
-  session's directory sits under the same `/workspace` root, owned by
-  the same user, in the same container. A leaf that runs `cd ..` can
-  read another session's files.
-- **The workspace is not durable.** It is container-local with no
-  volume, so a sandbox pod restart destroys it. The *result text* is
-  unaffected — it lives server-side.
+- **`spawn` / `subagents` / `get` / `workloads` are Preview** upstream,
+  not Stable.
+- **The sandbox is not a security boundary between users.** Workloads
+  are per-user, but the sandboxes themselves are shared. Tasks from
+  different users can run on the same sandbox, as the same Linux
+  user, one after another. Per-workload sandboxes are
+  [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476)
+  (phase-2).
+- **Workload content is not durable storage.** The workload's frozen
+  revision is read-only, and writable per-run copies are discarded on
+  completion. There is no cross-run shared state in phase-1 workloads.
 - **Every leaf gets the same tools.** The read-only diagnose leaf is
-  read-only by prompt, not by capability; there is no per-leaf tool
-  allowlist on this install.
+  read-only because the mount is read-only AND the prompt says so;
+  the fix leaf is writable only because `--writable` was passed and
+  the prompt says to edit. There is no per-leaf tool allowlist on
+  this install.
 - **Chaining is parent-side.** MOCA has no "on complete, trigger X"
   primitive; the parent Claude session does the sequencing between
   the operator's prompts.
@@ -254,25 +242,45 @@ cat leaves/<sessionId>.text       # the collected result
   > everything else is enforced by NetworkPolicy; a CNI that ignores
   > them silently removes the boundary rather than failing loudly.
 
+- [Context Service](https://github.com/rossoctl/context-service)
+  deployed to the same cluster, and MOCA configured to use it via the
+  `moca-context-service` ConfigMap + Secret in the `moca` namespace
+  (see MOCA's
+  [`docs/context-service.md`](https://github.com/rossoctl/moca/blob/main/docs/context-service.md)).
+  Context Service's **public URL** must be reachable from this host
+  (a port-forward is the simplest path on kind).
+
 - `kubectl` configured for that cluster, and `jq` on your `PATH`.
 - [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
-  (needs Node 22+), **≥ `edge-a02b9db` with the subagent commands**.
-  Probe your install: `mocactl spawn` with no arguments must complain
-  `spawn needs a prompt` (an old build says `unknown command`):
+  (needs Node 22+), **with the `workloads` subcommand** (added by
+  [rossoctl/moca#520](https://github.com/rossoctl/moca/pull/520),
+  [#532](https://github.com/rossoctl/moca/pull/532), and
+  [#534](https://github.com/rossoctl/moca/pull/534)). Probe your
+  install: `mocactl workloads` must complain
+  `workloads needs create, get or delete` (an old build says
+  `unknown command`):
 
   ```bash
   curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | sh
   ```
 
+- [`contextctl`](https://github.com/rossoctl/context-service) on
+  `PATH`, with the `ctx pack` subcommand (added by
+  [rossoctl/context-service#56](https://github.com/rossoctl/context-service/pull/56)).
+
 - Claude Code CLI.
 
-### Start both port-forwards
+### Start the port-forwards
 
-In two other terminals. The harness **must** be on local port 8080:
+In three other terminals. The MOCA harness **must** be on local port
+8080; Context Service's public URL is whatever `moca-context-service`'s
+`public-url` names (`http://127.0.0.1:9090` on kind is a common
+choice):
 
 ```bash
 kubectl port-forward -n moca svc/moca-supervisor 8080:8080
 kubectl port-forward -n moca svc/moca-control-plane 8090:8080
+kubectl port-forward -n context-service svc/context-service 9090:8080
 ```
 
 ### Log in (once per machine)
@@ -314,37 +322,34 @@ From this directory:
 
 This:
 
-1. Verifies the tooling (`kubectl`, `jq`, `mocactl` — including a
-   probe that `mocactl` has the subagent commands) and that both
-   namespaces exist.
+1. Verifies the tooling (`kubectl`, `jq`, `contextctl`, `mocactl` —
+   including a probe that `mocactl` has the `workloads` subcommand)
+   and that the `moca` namespace exists.
 2. Runs `mocactl doctor` against the port-forwards — reachability,
    login, credential, harness, and an end-to-end scratch session.
-   This replaces all the old hand-rolled health/token/credential
-   probes.
-3. Stages the scratch dir at `~/tmp/moca-chained-scratch/`:
-   `.claude/settings.json` (with the port-forward URLs injected as env and
-   the kubectl allow patterns rewritten for the sandbox namespace), the
-   `moca-dispatch` skill, a copy of `example_repo/`, an empty `leaves/`,
-   and `MOCA.md` with the runtime facts and this run's demo tag.
+3. Packs the fixture into a workspace `.context` bundle, creates one
+   workload from it, and records the workload id in `MOCA.md`.
+4. Stages the scratch dir at `~/tmp/moca-chained-scratch/`:
+   `.claude/settings.json` (with the port-forward URLs injected as env),
+   the `moca-dispatch` skill, a copy of `example_repo/`, an empty
+   `leaves/`, and `MOCA.md` with the runtime facts, this run's demo
+   tag, and the workload id.
 
-Setup creates **no session and seeds nothing into the cluster** —
-every session is created by `mocactl spawn` at dispatch time, and
-every leaf's workspace is seeded right after its spawn.
+Setup creates **no session and seeds nothing per pod** — every session
+is created by `mocactl spawn --workload <id>` at dispatch time, and
+Context Service serves the workload's frozen revision into whichever
+sandbox the run lands on.
 
 Environment overrides (set before running):
 
-- `MOCA_NS` / `SANDBOX_NS` — namespaces (default `moca` /
-  `moca-sandbox`).
-- `SANDBOX_POD_SELECTOR` — label selector matching the sandbox pods
-  (default `app=moca-sandbox`).
-- `SANDBOX_CONTAINER` — sandbox container name (default `sandbox`).
+- `MOCA_NS` — namespace (default `moca`).
 - `HARNESS_PORT` / `CP_PORT` — local port-forward ports (default
   `8080` / `8090`). Changing `HARNESS_PORT` breaks discovery.
 - `SCRATCH_DIR` — scratch dir path.
 
-> **Re-running setup discards the previous scratch dir** (the demo
-> tag is per-run, so old notes would be orphaned). Collect any
-> results you care about first.
+> **Re-running setup discards the previous scratch dir and workload**
+> (the demo tag and workload are per-run, so old notes would be
+> orphaned). Collect any results you care about first.
 
 ## Run a session
 
@@ -358,22 +363,21 @@ not encode the flow; you drive it.
 **Prompt 1 — start the diagnosis.** Paste something like:
 
 > Dispatch a subagent to diagnose why the fixture project's tests are
-> failing. Tell the leaf it's read-only — do not modify files.
+> failing. The leaf is read-only — do not modify files.
 
 Claude should:
 
-1. Read the `moca-dispatch` skill and `MOCA.md` (tag, namespace,
-   selector, fixture path).
+1. Read the `moca-dispatch` skill and `MOCA.md` (tag, workload id).
 2. **Not** invoke `Task` — if it tries, the deny fires and it
    re-routes through the skill.
 3. Write the leaf's prompt to `leaves/diagnose.prompt.txt` and run
    `mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind prompt
-   --tag "$TAG" --json`. The permission prompt shows a legible
-   command — clearly a dispatch, not a local execution.
-4. Write the note `leaves/diagnose.json`, seed the leaf's workspace
-   (`kubectl cp` of `example_repo/.` into `/workspace/<sessionId>` on
-   every sandbox pod), report the session id, and **stop**. The leaf
-   is now running on the cluster; this turn is over.
+   --workload "$WORKLOAD_ID" --tag "$TAG" --json`. The permission
+   prompt shows a legible command — clearly a dispatch, not a local
+   execution.
+4. Write the note `leaves/diagnose.json`, report the session id, and
+   **stop**. The leaf is now running on the cluster; this turn is
+   over.
 
 **Prompt 2 — collect the diagnosis.** When you're ready (seconds to
 hours later, same session or a resumed one):
@@ -390,21 +394,22 @@ on the printed `status`: `queued` → report "still running" and stop
 > Good. Dispatch another subagent to apply that fix, run the tests,
 > and report the change and outcome.
 
-Claude dispatches a second leaf — a **fresh session and fresh fixture
-copy** — with the diagnosis from Prompt 2 embedded verbatim in the
-new leaf's prompt, then seeds its workspace the same way.
+Claude dispatches a second leaf against the same workload, **with
+`--writable`**, with the diagnosis from Prompt 2 embedded verbatim in
+the new leaf's prompt. No seeding — the writable copy is served by
+Context Service into the sandbox automatically.
 
 **Prompt 4 — collect the fix result.**
 
 > Check on it.
 
-Claude collects and surfaces the change and test outcome.
+Claude collects and surfaces the change and test outcome. The fix
+leaf's final message is the only record of its edits — the writable
+copy is discarded when the run ends.
 
-> **Note on isolation.** Each leaf is its own session with its own
-> workspace and a fresh fixture copy; what flows between leaves is
-> prompt text only. The diagnose leaf's "don't modify files" contract
-> lives in its prompt, not in the substrate — see "What's honest and
-> what isn't".
+> **Note on isolation.** Each leaf is its own session; the diagnose
+> leaf's mount is read-only, and the fix leaf's writable copy is
+> isolated to that run. What flows between leaves is prompt text only.
 
 While leaves run, in another terminal:
 
@@ -448,8 +453,7 @@ ledger). Nothing lives in the Claude Code session identifier.
 | Wait past 24h | No — the stored result is gone |
 | Port-forwards down mid-leaf | Yes — the leaf still completes; restore the port-forward to collect |
 | Supervisor restarts mid-leaf | Possibly never — `subagents` shows `unknown`; re-dispatch |
-| Sandbox pod restarts | Result yes, **workspace files no** |
-| `./teardown.sh` | No — deletes the sessions |
+| `./teardown.sh` | No — deletes the sessions and the workload |
 
 **Caveats.**
 
@@ -467,9 +471,9 @@ ledger). Nothing lives in the Claude Code session identifier.
   `failed: fetch failed` at the five-minute mark while the run keeps
   going server-side — and stays collectable with `get`. Trust `get`,
   not the ledger state.
-- **Delete the sessions last.** `teardown.sh` deletes them, which
-  makes their stored results unreachable. Collect what you care
-  about first.
+- **Delete the sessions last.** `teardown.sh` deletes them and the
+  workload, which makes their stored results unreachable. Collect what
+  you care about first.
 
 ## Teardown
 
@@ -479,24 +483,38 @@ ledger). Nothing lives in the Claude Code session identifier.
 
 This deletes every leaf session of this demo's tag
 (`mocactl subagents --tag` → `mocactl sessions delete` for each),
-removes each leaf's `/workspace/<sessionId>` from the sandbox pods
-(the idle sweeper would get them within 30 minutes anyway), and
-removes the scratch directory. It does **not** touch MOCA, your
+deletes the workload (`mocactl workloads delete`), and removes the
+scratch directory. It does **not** touch MOCA, Context Service, your
 cluster, or your `mocactl` login. If the port-forwards are still
 running, `Ctrl-C` them.
 
 ## Troubleshooting
 
 - **`mocactl` can't reach the control plane / connection refused.**
-  A port-forward isn't running. You need **both** — the harness on
-  8080 and the control plane on 8090 — and `SH_CONTROL_PLANE_URL` /
-  `SH_HARNESS_URL` exported (or the staged settings' env block, in a
-  Claude session).
+  A port-forward isn't running. You need all three — MOCA harness on
+  8080, MOCA control plane on 8090, Context Service's public URL (as
+  configured in `moca-context-service`) — and
+  `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` exported (or the staged
+  settings' env block, in a Claude session).
 - **`setup.sh` fails at doctor.** Follow the fix doctor prints for
   each failing check — it covers reachability, login, credentials,
   and the harness.
 - **`setup.sh` says this mocactl is too old.** Your `mocactl` predates
-  the subagent commands. Install ≥ `edge-a02b9db`.
+  the `workloads` subcommand. Install from the install script in the
+  Prerequisites section (needs
+  [rossoctl/moca#520](https://github.com/rossoctl/moca/pull/520) /
+  [#532](https://github.com/rossoctl/moca/pull/532) /
+  [#534](https://github.com/rossoctl/moca/pull/534)).
+- **`setup.sh` fails at `contextctl ctx pack`.** Your `contextctl`
+  predates workspace bundles. Install from the install script in
+  [rossoctl/context-service](https://github.com/rossoctl/context-service)
+  (needs
+  [rossoctl/context-service#56](https://github.com/rossoctl/context-service/pull/56)).
+- **`workloads create` fails with "Context Service refused the
+  upload".** Context Service's public URL may not be reachable from
+  this host, or the Context Service version may predate workspace
+  bundles. Check the `moca-context-service` ConfigMap and that your
+  port-forward (or whatever makes `public-url` reachable) is up.
 - **`get` says "has not finished yet" forever, and `subagents` shows
   `unknown`.** The detached worker died before the server recorded
   anything — typically the port-forward was down at dispatch, or the
@@ -511,19 +529,14 @@ running, `Ctrl-C` them.
   eventually printing `responded` means all is well (only the ledger
   state is wrong, and it is sticky). If `get` stays `queued` well past
   that, the run itself never finished server-side — re-dispatch under a
-  fresh label. Leaves that outrun five minutes are usually working
-  around the sandbox image's missing node/npm; the prompt templates
-  forbid that.
+  fresh label.
 - **`get` says `no session`.** Wrong session id, or the session was
   deleted / aged out past 24h.
-- **A leaf reports the fixture never arrived.** The seed race went
-  bad (e.g. kubectl cp failed on every pod). Check the seed loop ran
-  (`kubectl exec … ls /workspace/<sid>`), then re-dispatch under a
-  new label.
-- **The fixture is gone from a workspace you wanted to inspect.** The
-  sandbox pod restarted, or the workspace sat idle past 30 minutes
-  and the sweeper reclaimed it. The collected result text is
-  unaffected.
+- **A fix leaf reports edits but you can't find them.** Writable
+  per-run copies are **discarded when the run ends.** The leaf's
+  final message is the only record. If a prompt forgot to ask for the
+  diff and test output verbatim, re-dispatch under a fresh label with
+  a prompt that does.
 - **Claude tries `Task` and gets denied, then stops.** The skill
   wasn't found. Confirm
   `~/tmp/moca-chained-scratch/.claude/skills/moca-dispatch/SKILL.md`
@@ -547,11 +560,11 @@ PLAN-mocactl.md            Implementation plan for the mocactl migration (this R
 README.md                  This file
 skill/SKILL.md             Skill Claude reads to dispatch leaves to MOCA via mocactl
 settings.json.example      Permission policy staged into the scratch dir: denies Task and
-                           reading mocactl's config dir, allows the mocactl dispatch and
-                           kubectl seed commands
-setup.sh                   Verifies prereqs via mocactl doctor, stages the scratch dir
-teardown.sh                Deletes the demo's leaf sessions + workspaces, removes the scratch dir
-example_repo/              Vendored fixture — Node.js project with a renamed-API bug
+                           reading mocactl's config dir, allows the mocactl dispatch commands
+setup.sh                   Verifies prereqs via mocactl doctor, packs the fixture, creates the
+                           workload, stages the scratch dir
+teardown.sh                Deletes the demo's leaf sessions and workload, removes the scratch dir
+example_repo/              Vendored fixture — Python project with a renamed-API bug
 ```
 
 In the scratch dir after `setup.sh`:
@@ -562,9 +575,10 @@ In the scratch dir after `setup.sh`:
 │   ├── settings.json      Permission policy + port-forward env for mocactl
 │   └── skills/
 │       └── moca-dispatch/SKILL.md   The dispatch skill Claude reads
-├── example_repo/          Fixture copy the parent seeds every leaf from
+├── example_repo/          Fixture copy packed into the workload (kept for reference)
+├── example_repo.context   The workspace .context bundle uploaded to Context Service
 ├── leaves/                Leaf prompts, notes (*.json), and collected results (<sid>.text)
-└── MOCA.md                Runtime facts: tag, URLs, namespace/selector/container
+└── MOCA.md                Runtime facts: tag, URLs, workload id
 ```
 
 ## Appendix: running the flow by hand
@@ -582,6 +596,7 @@ export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
 export SH_HARNESS_URL=http://127.0.0.1:8080
 
 TAG="$(sed -nE 's/^Demo tag:[[:space:]]+//p' MOCA.md)"
+WORKLOAD_ID="$(sed -nE 's/^Workload id:[[:space:]]+//p' MOCA.md)"
 ```
 
 **1 — author the diagnose leaf's prompt:**
@@ -589,10 +604,8 @@ TAG="$(sed -nE 's/^Demo tag:[[:space:]]+//p' MOCA.md)"
 ```bash
 cat > leaves/diagnose.prompt.txt <<'EOF'
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Python
-project is being copied into your workspace right now: if tests/ is not
-present yet, wait for it (re-check every few seconds; it arrives within a
-minute or two).
+directory is this run's view of a small Python project — do not cd elsewhere.
+The files are mounted read-only.
 
 The project's tests currently fail. Run the test suite
 (`python3 -m unittest discover -s tests`), read the relevant code and the
@@ -600,21 +613,24 @@ docs under docs/upstream-refs/, and report:
 1. The exact failing assertion and the test command that exercises it.
 2. The root cause, with file paths and line references.
 3. The minimal change that would fix it, described precisely — another agent
-   will apply it on a fresh copy of this project.
+   will apply it on its own writable copy of this project.
 
 The project is stdlib-only; do NOT install or download anything (no `pip`,
 no package manager). Diagnose from the source and docs alone.
 
-Do NOT edit any files: this is a diagnosis-only task. End your turn with the
-full diagnosis as your final message.
+Do NOT edit any files: this is a diagnosis-only task, and the mount is
+read-only anyway. End your turn with the full diagnosis as your final
+message.
 EOF
 ```
 
-**2 — dispatch it.** `--json` prints one line on stdout
+**2 — dispatch it.** Read-only, so just `--workload` (no `--writable`).
+`--json` prints one line on stdout
 (`{"type":"session","sessionId":"…","pid":…}`); diagnostics go to stderr:
 
 ```bash
-mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind prompt --tag "$TAG" --json
+mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind prompt \
+  --workload "$WORKLOAD_ID" --tag "$TAG" --json
 SID="<paste the sessionId from that line>"
 ```
 
@@ -622,36 +638,19 @@ SID="<paste the sessionId from that line>"
 
 ```bash
 cat > leaves/diagnose.json <<EOF
-{"label":"diagnose","sessionId":"$SID","kind":"prompt",
+{"label":"diagnose","sessionId":"$SID","kind":"prompt","writable":false,
  "promptFile":"leaves/diagnose.prompt.txt",
  "dispatchedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
 ```
 
-**4 — seed the leaf's workspace.** Every pod, because the session pins
-to one only on its first turn. Both orderings (seed-before-boot,
-seed-after-boot) boot the leaf correctly — its prompt tells it to wait
-for `tests/` — with one caveat: a leaf quick enough to edit files
-while the copy is still landing can have those edits overwritten by it
-(this happened once in testing; the leaf noticed and re-applied its
-work). Seed right after spawn and the window is small:
-
-```bash
-for POD in $(kubectl -n moca-sandbox get pods -l app=moca-sandbox -o name); do
-  POD="${POD#pod/}"
-  kubectl -n moca-sandbox wait --for=condition=Ready "pod/$POD" --timeout=90s >/dev/null
-  kubectl -n moca-sandbox exec "$POD" -c sandbox -- sh -c "mkdir -p '/workspace/$SID'"
-  kubectl -n moca-sandbox cp -c sandbox example_repo/. "$POD:/workspace/$SID"
-done
-```
-
 Then **stop**. The leaf is durable server-side; there is nothing to
 babysit. Durability spot-check (worth doing once): Ctrl-C the
 supervisor's port-forward while the leaf runs, restore it, and
-collect anyway — step 5 still works, because the server finishes the
+collect anyway — step 4 still works, because the server finishes the
 run no matter what your laptop did.
 
-**5 — collect** (later; re-run every minute or so until done — each
+**4 — collect** (later; re-run every minute or so until done — each
 check is free and does not disturb the leaf):
 
 ```bash
@@ -674,18 +673,17 @@ exports only `new_name`. The sandbox image ships `python3` but no
 `pip`; the fixture is stdlib-only, so `python3 -m unittest` runs
 directly.
 
-**6 — chain the fix leaf.** Author its prompt with the diagnosis
+**5 — chain the fix leaf.** Author its prompt with the diagnosis
 inlined **verbatim** (never point one leaf at another leaf's files —
-each leaf has a fresh workspace):
+each leaf has its own view / writable copy):
 
 ```bash
 DIAG="$(cat leaves/"$SID".text)"
 cat > leaves/fix.prompt.txt <<EOF
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Python
-project is being copied into your workspace right now: if tests/ is not
-present yet, wait for it (re-check every few seconds; it arrives within a
-minute or two).
+directory is this run's own writable copy of a small Python project — do not
+cd elsewhere. The copy is discarded when this run ends, so anything you want
+to return must be in your final message.
 
 A prior agent diagnosed a test failure in a fresh copy of this project:
 
@@ -693,7 +691,7 @@ A prior agent diagnosed a test failure in a fresh copy of this project:
 $DIAG
 ------------------------------------------------------------------------
 
-Apply the fix in your workspace copy — edit src/, never vendor/ — then run
+Apply the fix — edit src/, never vendor/ — then run
 \`python3 -m unittest discover -s tests\` to confirm the suite passes. The
 project is stdlib-only; do NOT install or download anything (no \`pip\`, no
 package manager). Report:
@@ -701,40 +699,34 @@ package manager). Report:
 2. The full test output after your change (verbatim, including the
    \`Ran N tests\` and \`OK\` / \`FAILED\` lines).
 
-End your turn with the full report as your final message.
+End your turn with the full report as your final message. There will be no
+other record of your edits — the writable copy will be gone.
 EOF
 ```
 
-Dispatch it exactly like the diagnose leaf, then collect **later** — the
-fix leaf takes minutes, and `get` exit 1 with "has not finished yet"
-just means still running:
+Dispatch it with `--writable`, then collect later. `get` exit 1 with
+"has not finished yet" just means still running:
 
 ```bash
-mocactl spawn "$(cat leaves/fix.prompt.txt)" --kind prompt --tag "$TAG" --json
+mocactl spawn "$(cat leaves/fix.prompt.txt)" --kind prompt \
+  --workload "$WORKLOAD_ID" --writable --tag "$TAG" --json
 FIX_SID="<paste the sessionId>"
 
 cat > leaves/fix.json <<EOF
-{"label":"fix","sessionId":"$FIX_SID","kind":"prompt",
+{"label":"fix","sessionId":"$FIX_SID","kind":"prompt","writable":true,
  "promptFile":"leaves/fix.prompt.txt",
  "dispatchedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
-
-for POD in $(kubectl -n moca-sandbox get pods -l app=moca-sandbox -o name); do
-  POD="${POD#pod/}"
-  kubectl -n moca-sandbox wait --for=condition=Ready "pod/$POD" --timeout=90s >/dev/null
-  kubectl -n moca-sandbox exec "$POD" -c sandbox -- sh -c "mkdir -p '/workspace/$FIX_SID'"
-  kubectl -n moca-sandbox cp -c sandbox example_repo/. "$POD:/workspace/$FIX_SID"
-done
 
 mocactl get "$FIX_SID" --out leaves --json
 cat leaves/"$FIX_SID".text
 ```
 
 The report should say `src/greet.py` changed (`old_name` → `new_name`) and
-that the tests pass — or, if the sandbox has no node/npm, that the fix was
-verified by inspection.
+that the tests pass. There is no "inspect the sandbox" fallback: the
+writable copy is gone when the run ends.
 
-**7 — see the whole chain:**
+**6 — see the whole chain:**
 
 ```bash
 mocactl subagents --tag "$TAG"
@@ -746,15 +738,7 @@ a long leaf shows up here as `failed` / `fetch failed` even though it
 completed server-side (see Troubleshooting). `mocactl get` is the source
 of truth: `responded` means it finished.
 
-Inspect a leaf's workspace while it survives (within ~30 minutes of
-its last tool call; the fix leaf's should show the change):
-
-```bash
-kubectl -n moca-sandbox exec moca-sandbox-0 -c sandbox -- \
-  cat /workspace/$FIX_SID/src/greet.py
-```
-
-**8 — tear down:**
+**7 — tear down:**
 
 ```bash
 cd -   # back to the demo dir
@@ -762,15 +746,16 @@ cd -   # back to the demo dir
 mocactl sessions   # the demo's leaf sessions are gone
 ```
 
-Re-dispatch after a failure (fresh label, fresh session, fresh
-fixture — copy the prompt file and edit as needed):
+Re-dispatch after a failure (fresh label, fresh session, same shared
+workload — copy the prompt file and edit as needed):
 
 ```bash
 cp leaves/fix.prompt.txt leaves/fix2.prompt.txt
-mocactl spawn "$(cat leaves/fix2.prompt.txt)" --kind prompt --tag "$TAG" --json
+mocactl spawn "$(cat leaves/fix2.prompt.txt)" --kind prompt \
+  --workload "$WORKLOAD_ID" --writable --tag "$TAG" --json
 ```
 
-Start a completely fresh chain (new tag, fresh scratch):
+Start a completely fresh chain (new tag, new workload, fresh scratch):
 
 ```bash
 ./teardown.sh && ./setup.sh

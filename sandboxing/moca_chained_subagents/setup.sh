@@ -50,8 +50,10 @@ if ! command -v mocactl >/dev/null 2>&1; then
   exit 1
 fi
 # Capability probe: mocactl must have the subagent commands AND the workloads
-# subcommand (added by rossoctl/moca#520 / #532 / #534). An old mocactl
-# answers 'unknown command' here instead.
+# subcommand (added by https://github.com/rossoctl/moca/pull/520 ,
+# https://github.com/rossoctl/moca/pull/532 and
+# https://github.com/rossoctl/moca/pull/534). An old mocactl answers
+# 'unknown command' here instead.
 spawn_probe="$(mocactl spawn 2>&1 || true)"
 if ! printf '%s' "${spawn_probe}" | grep -q 'spawn needs a prompt'; then
   echo "    this mocactl has no working 'spawn' subagent command — too old." >&2
@@ -61,7 +63,8 @@ fi
 workloads_probe="$(mocactl workloads 2>&1 || true)"
 if ! printf '%s' "${workloads_probe}" | grep -q 'workloads needs create, get or delete'; then
   echo "    this mocactl has no 'workloads' subcommand — too old." >&2
-  echo "    Reinstall with the install script above (needs #520/#532/#534)." >&2
+  echo "    Reinstall with the install script above" >&2
+  echo "    (needs rossoctl/moca PRs 520, 532, 534)." >&2
   exit 1
 fi
 echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + subagent commands present)"
@@ -136,7 +139,8 @@ contextctl ctx pack "${SCRATCH_DIR}/example_repo" --type workspace \
 echo "==> Creating the shared workload..."
 # One workload per demo run, shared by both leaves: the diagnose leaf mounts
 # it read-only, the fix leaf gets its own writable per-run copy via --writable.
-# Writes do NOT persist across runs (that is phase-2 workloads, #476).
+# Writes do NOT persist across runs (that is phase-2 workloads,
+# https://github.com/rossoctl/moca/issues/476).
 WORKLOAD_JSON="$(SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" \
   mocactl workloads create --context "${CONTEXT_BUNDLE}" --json)"
 WORKLOAD_ID="$(printf '%s' "${WORKLOAD_JSON}" | jq -r '.workloadId')"
