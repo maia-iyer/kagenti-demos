@@ -20,12 +20,12 @@ leaf bookkeeping shaped the way a resumed session expects. If the
 operator asks you to use `curl` directly, surface that mocactl is the
 supported path and prefer it.
 
-This skill is **mechanism only**. It tells you how to dispatch, seed,
-and collect one leaf. It does **not** tell you how many leaves to run,
-in what order, or with what prompts — those decisions come from the
-operator's request. If the operator asks for one leaf, run one. If
-they ask for a chain, start them in sequence and feed outputs forward
-as they describe.
+This skill is **mechanism only**. It tells you how to dispatch and
+collect one leaf against this demo's shared workload. It does **not**
+tell you how many leaves to run, in what order, or with what prompts —
+those decisions come from the operator's request. If the operator asks
+for one leaf, run one. If they ask for a chain, start them in sequence
+and feed outputs forward as they describe.
 
 ## Dispatch is a durable server-side run
 
@@ -46,34 +46,45 @@ own HTTP request dies at the five-minute mark, so `subagents` may show
 a long-running leaf as `failed: fetch failed` while the run continues
 server-side. Trust `get`, not the ledger (see the mechanism appendix).
 
-## One leaf, one session, one fresh workspace
+## One shared workload, one session per leaf
 
-Every leaf is its **own** MOCA session, so its own sandbox workspace
-at `/workspace/<sessionId>` — and, because you seed it right after
-spawn, a fresh copy of the fixture. Three consequences that matter to
-you:
+Setup packed `./example_repo` into a workspace `.context` bundle and
+created one **workload** from it. Both leaves of this demo share that
+workload — its id lives in `MOCA.md`. Each dispatch creates its own
+session; the workload is what the session mounts, not something the
+session owns.
 
-- **Leaves are isolated from each other by construction.** A fix leaf
-  does not see the files a diagnose leaf saw — it gets a fresh fixture
-  plus whatever you inline in its prompt. Never reference one leaf's
-  file paths or workspace in another leaf's prompt.
-- **No turn sequencing.** Each leaf is a single turn in its own
-  session; there is no `409 turn_in_progress` to dodge. Leaves
-  *could* run concurrently — fan out only if the operator asks.
-- **Session ids are server-generated** (`spawn` prints them). You keep
-  short local labels (`diagnose`, `fix`) that name the files in
-  `leaves/`.
+Three consequences that matter to you:
+
+- **Fixture seeding is done.** Context Service serves the workload's
+  frozen revision into whichever sandbox the leaf lands on, mounted at
+  the leaf's cwd. You do not run `kubectl cp`, nor any seed loop; the
+  leaf's `pwd` is already the project.
+- **Read-only by default.** Diagnose-shaped leaves pass just
+  `--workload <id>`; the mount is a read-only view of the revision.
+- **Opt-in writable.** A fix-shaped leaf passes `--workload <id>
+  --writable` and gets its **own per-run copy** of the workload's
+  files. Edits land in that copy; the copy is **discarded when the
+  run ends.** Nothing persists across runs — durable, shared,
+  mutable storage is the phase-2 workloads design
+  ([rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476)),
+  not shipped. Whatever the fix leaf wants to return — a diff, test
+  output — must be inlined in its final message.
+
+Session ids are server-generated (`spawn` prints them). You keep
+short local labels (`diagnose`, `fix`) that name the files in
+`leaves/`.
 
 ## Environment
 
 Read `MOCA.md` in the scratch dir first. It holds this run's facts:
-the **demo tag**, the sandbox **namespace / pod selector /
-container**, the **fixture path** (`./example_repo`), and the
-**leaves dir** (`./leaves`). Pull the tag into a shell variable once
-per turn:
+the **demo tag**, the **workload id**, the **context bundle** path,
+and the **leaves dir** (`./leaves`). Pull them into shell variables
+once per turn:
 
 ```bash
 TAG="$(sed -nE 's/^Demo tag:[[:space:]]+//p' MOCA.md)"
+WORKLOAD_ID="$(sed -nE 's/^Workload id:[[:space:]]+//p' MOCA.md)"
 ```
 
 The port-forward URLs (`SH_CONTROL_PLANE_URL`, `SH_HARNESS_URL`) are
@@ -85,9 +96,9 @@ Bookkeeping, all in `leaves/`:
 
 - `leaves/<label>.prompt.txt` — the prompt you sent.
 - `leaves/<label>.json` — a note you write right after spawn:
-  `{label, sessionId, kind, promptFile, dispatchedAt}`. Status is
-  never stored — it is always derived fresh from `subagents` / `get`
-  at read time.
+  `{label, sessionId, kind, writable, promptFile, dispatchedAt}`.
+  Status is never stored — it is always derived fresh from
+  `subagents` / `get` at read time.
 - `leaves/<sessionId>.text` — the collected result, written by
   `mocactl get --out leaves`.
 
@@ -99,47 +110,33 @@ and prompts are never overwritten.
 
 1. Author the leaf's prompt and write it to
    `leaves/<label>.prompt.txt`. Start from a template (below). The
-   invariant clauses are not optional: cwd-is-your-private-workspace
-   and "do not cd elsewhere"; the wait-for-fixture clause; read-only
-   vs apply instructions; and "end your turn with the full report as
-   your final message" — the collected result is exactly that text.
-   Pass anything the leaf needs from earlier leaves **inline,
-   verbatim**.
-2. Dispatch:
+   invariant clauses are not optional: cwd-is-the-project-root and
+   "do not cd elsewhere"; read-only vs apply instructions; and "end
+   your turn with the full report as your final message" — the
+   collected result is exactly that text. Pass anything the leaf
+   needs from earlier leaves **inline, verbatim**.
+2. Dispatch. For a **read-only** leaf (diagnose, inspection):
 
    ```bash
    mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt \
-     --tag "$TAG" --json
+     --workload "$WORKLOAD_ID" --tag "$TAG" --json
+   ```
+
+   For a **writable** leaf (fix, build, anything that edits files),
+   add `--writable`:
+
+   ```bash
+   mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt \
+     --workload "$WORKLOAD_ID" --writable --tag "$TAG" --json
    ```
 
    Quote-substitution keeps the permission prompt legible. `--json`
    prints one line on stdout —
    `{"type":"session","sessionId":"…","pid":…}` — with diagnostics on
    stderr; take the `sessionId` from the stdout line.
-3. Write the note `leaves/<label>.json` (shape above).
-4. Seed the leaf's workspace, right after spawn — keep the
-   dispatch-to-seed window as small as you can:
-
-   ```bash
-   SID="<sessionId>"
-   for POD in $(kubectl -n moca-sandbox get pods -l app=moca-sandbox -o name); do
-     POD="${POD#pod/}"
-     kubectl -n moca-sandbox wait --for=condition=Ready "pod/$POD" --timeout=90s >/dev/null
-     kubectl -n moca-sandbox exec "$POD" -c sandbox -- sh -c "mkdir -p '/workspace/$SID'"
-     kubectl -n moca-sandbox cp -c sandbox example_repo/. "$POD:/workspace/$SID"
-   done
-   ```
-
-   (Namespace, selector, and container are this run's values from
-   `MOCA.md`; defaults shown.) Every pod gets a copy because a session
-   pins to a pod only on its first turn and you cannot know which.
-   Both orderings — seed landing before or after the leaf boots — are
-   safe: the sandbox worker creates a session's workspace with mkdir
-   "use as-is" semantics, and the leaf's prompt tells it to wait for
-   `tests/`. One caveat: a leaf quick enough to edit files while
-   the copy is still landing can have those edits clobbered by the
-   extraction — hence "seed immediately".
-5. **Stop.** Report the label and session id to the operator. Do not
+3. Write the note `leaves/<label>.json` (shape above; include
+   `"writable": true` when you passed `--writable`).
+4. **Stop.** Report the label and session id to the operator. Do not
    wait, do not poll, do not sleep-and-check — collection is a later
    turn's job.
 
@@ -147,17 +144,15 @@ Failure modes at dispatch:
 
 - `spawn needs a prompt` → the prompt argument came out empty; check
   the prompt file path.
+- `--writable needs --workload ID` → `--writable` only applies to
+  workload runs; make sure `$WORKLOAD_ID` is set from `MOCA.md`.
 - An immediate connection error → the port-forwards are down (or
   mocactl logged out). `mocactl doctor` says which. Nothing ran; fix
   and retry.
+- A workload-not-ready / workload-not-found error → setup did not
+  finish, or the workload was deleted. Surface it; don't retry blind.
 - Prompt over 64 KiB → `spawn` refuses it. The diagnosis is small;
   inline freely, but trim if you hit the cap.
-
-**Manual fallback.** If kubectl is not available to you (or the
-operator prefers it), report the session id and the step-4 seed loop
-verbatim for the operator to paste. The wait-for-fixture clause makes
-seeding untimed — the leaf waits for `tests/` no matter when
-the copy lands. The primary path is you-do-it.
 
 ## Procedure 2: check a leaf
 
@@ -185,8 +180,10 @@ five-minute HTTP timeout — it is still running server-side. Keep
 checking on later turns; `get` is the source of truth.
 
 Note what a result **is**: the leaf's final message only. There is no
-tool-call transcript. If you need the leaf's reasoning or a diff, ask
-for it in the prompt.
+tool-call transcript, and in a writable run the per-run copy is
+already gone by the time you collect — so if the operator wants a
+diff or the test output, the leaf's prompt must have asked for it as
+part of the final message.
 
 ## Procedure 3: list leaves
 
@@ -219,19 +216,22 @@ if the operator wants that work done.
 MOCA has no "on complete, trigger X" primitive. If the operator asks
 for a chain (A then B), you do the sequencing:
 
-1. Write leaf 1's prompt; spawn, note, seed (procedure 1). Return to
-   the operator.
+1. Write leaf 1's prompt; spawn, note (procedure 1). Return to the
+   operator.
 2. On a later turn (same session or resumed), check leaf 1 with
    procedure 2. If `responded`, Read `leaves/<sessionId>.text`.
 3. Write leaf 2's prompt with leaf 1's result **inlined verbatim** —
-   never a file path; leaf 2 has a fresh workspace and cannot see
-   leaf 1's files.
-4. Spawn, note, seed leaf 2 the same way; collect on a later turn.
+   never a file path, never a sessionId; leaf 2 is an independent
+   session with its own view and cannot see leaf 1's files.
+4. Spawn, note; collect on a later turn.
 
 Posture rules for this demo's fixture: the diagnose leaf is read-only
-by prompt; the fix leaf edits `src/` and never `vendor/`. Keep
-the demo a sequential chain unless the operator explicitly asks for
-fan-out.
+(dispatch without `--writable`); the fix leaf is writable (dispatch
+with `--writable`) and edits `src/` only, never `vendor/`. The fix
+leaf's prompt must ask for the diff and the test output as part of
+its final message, because its writable copy is discarded when the
+run ends. Keep the demo a sequential chain unless the operator
+explicitly asks for fan-out.
 
 ## There is no cancel
 
@@ -256,25 +256,19 @@ When a leaf ends this way, **say so explicitly and do not present it
 as a diagnosis.** The operator asked about their code; a dispatch
 that never completed tells them nothing about it.
 
-A leaf that reports "the fixture never arrived" is the same category:
-the seed race went bad (the copy failed on every pod). Check that the
-seed loop ran (`kubectl exec … ls /workspace/<sid>`), then re-dispatch
-under a new label.
-
 ## Leaf prompt templates
 
 Templates for this demo's two-leaf chain. Adapt wording as needed,
-but keep the invariant clauses: private workspace, wait-for-fixture,
-posture rules, final-message-is-the-deliverable.
+but keep the invariant clauses: project-is-at-your-cwd, posture
+rules, final-message-is-the-deliverable (and, for writable leaves,
+the diff and test output must be in that message).
 
 ### Diagnose (read-only)
 
 ```text
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Python
-project is being copied into your workspace right now: if tests/ is not
-present yet, wait for it (re-check every few seconds; it arrives within a
-minute or two).
+directory is this run's view of a small Python project — do not cd elsewhere.
+The files are mounted read-only.
 
 The project's tests currently fail. Run the test suite
 (`python3 -m unittest discover -s tests`), read the relevant code and the
@@ -282,23 +276,23 @@ docs under docs/upstream-refs/, and report:
 1. The exact failing assertion and the test command that exercises it.
 2. The root cause, with file paths and line references.
 3. The minimal change that would fix it, described precisely — another agent
-   will apply it on a fresh copy of this project.
+   will apply it on its own writable copy of this project.
 
 The project is stdlib-only; do NOT install or download anything (no `pip`,
 no package manager). Diagnose from the source and docs alone.
 
-Do NOT edit any files: this is a diagnosis-only task. End your turn with the
-full diagnosis as your final message.
+Do NOT edit any files: this is a diagnosis-only task, and the mount is
+read-only anyway. End your turn with the full diagnosis as your final
+message.
 ```
 
 ### Fix (apply, then verify)
 
 ```text
 You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is your private workspace — do not cd elsewhere. A small Python
-project is being copied into your workspace right now: if tests/ is not
-present yet, wait for it (re-check every few seconds; it arrives within a
-minute or two).
+directory is this run's own writable copy of a small Python project — do not
+cd elsewhere. The copy is discarded when this run ends, so anything you want
+to return must be in your final message.
 
 A prior agent diagnosed a test failure in a fresh copy of this project:
 
@@ -306,7 +300,7 @@ A prior agent diagnosed a test failure in a fresh copy of this project:
 <PASTE leaves/<diagnose sessionId>.text VERBATIM HERE>
 ------------------------------------------------------------------------
 
-Apply the fix in your workspace copy — edit src/, never vendor/ — then run
+Apply the fix — edit src/, never vendor/ — then run
 `python3 -m unittest discover -s tests` to confirm the suite passes. The
 project is stdlib-only; do NOT install or download anything (no `pip`, no
 package manager). Report:
@@ -314,7 +308,8 @@ package manager). Report:
 2. The full test output after your change (verbatim, including the
    `Ran N tests` and `OK` / `FAILED` lines).
 
-End your turn with the full report as your final message.
+End your turn with the full report as your final message. There will be no
+other record of your edits — the writable copy will be gone.
 ```
 
 ## Mechanism appendix
@@ -322,10 +317,9 @@ End your turn with the full report as your final message.
 What `spawn` does under the hood, for when something surprises you:
 
 - **New session per leaf.** There is no `--session` flag; `spawn`
-  always creates one. The leaf's bash cwd is its workspace,
-  `/workspace/<sessionId>` (the sandbox always advertises the
-  `workspace-subdir` capability), so prompts never need to contain
-  the path.
+  always creates one. With `--workload`, the leaf's bash cwd is the
+  workload's view (read-only) or writable copy (`--writable`), so the
+  project is at `./` — prompts never need to contain the mount path.
 - **The detached worker** — forked by `spawn`, its log at
   `~/.local/state/mocactl/spawn-<sessionId>.log` — holds the
   synchronous `POST /v1/runs`. The server runs the leaf to completion
@@ -348,8 +342,8 @@ What `spawn` does under the hood, for when something surprises you:
 ## What this skill does not do
 
 - Does not stand up the substrate. Setup owns the scratch dir, the
-  demo tag, and `MOCA.md`; teardown deletes the leaf sessions, their
-  workspaces, and the scratch dir.
+  demo tag, the workload, and `MOCA.md`; teardown deletes the leaf
+  sessions, the workload, and the scratch dir.
 - Does not block the turn on a leaf finishing. The run is durable
   server-side; collection happens later, on a later turn.
 - Does not prescribe an orchestration shape. The operator's request
