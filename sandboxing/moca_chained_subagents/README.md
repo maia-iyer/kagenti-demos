@@ -252,21 +252,23 @@ cat leaves/<sessionId>.text       # the collected result
 
 - `kubectl` configured for that cluster, and `jq` on your `PATH`.
 - [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
-  (needs Node 22+), **with the `workloads` subcommand** (added by
-  [rossoctl/moca#520](https://github.com/rossoctl/moca/pull/520),
-  [#532](https://github.com/rossoctl/moca/pull/532), and
-  [#534](https://github.com/rossoctl/moca/pull/534)). Probe your
-  install: `mocactl workloads` must complain
-  `workloads needs create, get or delete` (an old build says
-  `unknown command`):
+  (needs Node 22+), **with the `workloads` subcommand**. The install
+  script pulls the `edge` release, which always contains the workloads
+  CLI:
 
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | MOCACTL_VERSION=edge sh
   ```
 
+  Probe: `mocactl workloads` must complain
+  `workloads needs create, get or delete` (an old build says
+  `unknown command`).
+
 - [`contextctl`](https://github.com/rossoctl/context-service) on
-  `PATH`, with the `ctx pack` subcommand (added by
-  [rossoctl/context-service#56](https://github.com/rossoctl/context-service/pull/56)).
+  `PATH`, with the `ctx pack` subcommand. Build from
+  [`rossoctl/context-service`](https://github.com/rossoctl/context-service)
+  main (`make build`); a tagged release including workspace bundles
+  isn't out yet.
 
 - Claude Code CLI.
 
@@ -500,16 +502,12 @@ running, `Ctrl-C` them.
   each failing check — it covers reachability, login, credentials,
   and the harness.
 - **`setup.sh` says this mocactl is too old.** Your `mocactl` predates
-  the `workloads` subcommand. Install from the install script in the
-  Prerequisites section (needs
-  [rossoctl/moca#520](https://github.com/rossoctl/moca/pull/520) /
-  [#532](https://github.com/rossoctl/moca/pull/532) /
-  [#534](https://github.com/rossoctl/moca/pull/534)).
+  the `workloads` subcommand. Reinstall from the install script with
+  `MOCACTL_VERSION=edge` (see the Prerequisites section).
 - **`setup.sh` fails at `contextctl ctx pack`.** Your `contextctl`
-  predates workspace bundles. Install from the install script in
-  [rossoctl/context-service](https://github.com/rossoctl/context-service)
-  (needs
-  [rossoctl/context-service#56](https://github.com/rossoctl/context-service/pull/56)).
+  predates workspace bundles. Rebuild from
+  [`rossoctl/context-service`](https://github.com/rossoctl/context-service)
+  main (`make build`).
 - **`workloads create` fails with "Context Service refused the
   upload".** Context Service's public URL may not be reachable from
   this host, or the Context Service version may predate workspace
