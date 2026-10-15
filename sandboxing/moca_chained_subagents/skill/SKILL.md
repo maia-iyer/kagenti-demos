@@ -85,7 +85,16 @@ once per turn:
 ```bash
 TAG="$(sed -nE 's/^Demo tag:[[:space:]]+//p' MOCA.md)"
 WORKLOAD_ID="$(sed -nE 's/^Workload id:[[:space:]]+//p' MOCA.md)"
+DIGEST_PUBLIC="$(sed -nE 's/^Config digest public:[[:space:]]+//p' MOCA.md)"
+DIGEST_FULL="$(sed -nE 's/^Config digest full:[[:space:]]+//p' MOCA.md)"
 ```
+
+The two digests name promoted **config bundles** (skills + commands —
+not CLAUDE.md). The diagnose leaf runs with `$DIGEST_PUBLIC`, which
+carries a public-posture research skill. The fix leaf runs with
+`$DIGEST_FULL`, which carries a skill with the organization's testing
+conventions. Each child's identity is the triple **(configRef digest,
+workload revision, sessionId)** — three sha256-pinned handles.
 
 The port-forward URLs (`SH_CONTROL_PLANE_URL`, `SH_HARNESS_URL`) are
 already injected into your environment by the staged
@@ -115,27 +124,31 @@ and prompts are never overwritten.
    your turn with the full report as your final message" — the
    collected result is exactly that text. Pass anything the leaf
    needs from earlier leaves **inline, verbatim**.
-2. Dispatch. For a **read-only** leaf (diagnose, inspection):
+2. Dispatch. For the **diagnose** leaf (read-only, public posture):
 
    ```bash
    mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt \
+     --config "$DIGEST_PUBLIC" \
      --workload "$WORKLOAD_ID" --tag "$TAG" --json
    ```
 
-   For a **writable** leaf (fix, build, anything that edits files),
-   add `--writable`:
+   For the **fix** leaf (writable, full-access posture):
 
    ```bash
    mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt \
+     --config "$DIGEST_FULL" \
      --workload "$WORKLOAD_ID" --writable --tag "$TAG" --json
    ```
 
-   Quote-substitution keeps the permission prompt legible. `--json`
-   prints one line on stdout —
+   The two leaves pair different skill bundles with the **same**
+   workload: the project files are shared, but the leaf's instructions
+   and posture are not. Quote-substitution keeps the permission
+   prompt legible. `--json` prints one line on stdout —
    `{"type":"session","sessionId":"…","pid":…}` — with diagnostics on
    stderr; take the `sessionId` from the stdout line.
 3. Write the note `leaves/<label>.json` (shape above; include
-   `"writable": true` when you passed `--writable`).
+   `"writable": true` when you passed `--writable`, and the `config`
+   digest you dispatched with).
 4. **Stop.** Report the label and session id to the operator. Do not
    wait, do not poll, do not sleep-and-check — collection is a later
    turn's job.
@@ -146,6 +159,8 @@ Failure modes at dispatch:
   the prompt file path.
 - `--writable needs --workload ID` → `--writable` only applies to
   workload runs; make sure `$WORKLOAD_ID` is set from `MOCA.md`.
+- `a bundle digest is sha256:<64 lowercase hex>` → `$DIGEST_PUBLIC`
+  or `$DIGEST_FULL` is empty; re-read `MOCA.md`.
 - An immediate connection error → the port-forwards are down (or
   mocactl logged out). `mocactl doctor` says which. Nothing ran; fix
   and retry.
@@ -225,13 +240,42 @@ for a chain (A then B), you do the sequencing:
    session with its own view and cannot see leaf 1's files.
 4. Spawn, note; collect on a later turn.
 
-Posture rules for this demo's fixture: the diagnose leaf is read-only
-(dispatch without `--writable`); the fix leaf is writable (dispatch
-with `--writable`) and edits `src/` only, never `vendor/`. The fix
-leaf's prompt must ask for the diff and the test output as part of
-its final message, because its writable copy is discarded when the
-run ends. Keep the demo a sequential chain unless the operator
-explicitly asks for fan-out.
+Posture rules for this demo's fixture: the diagnose leaf dispatches
+with `--config "$DIGEST_PUBLIC"` and no `--writable` (read-only, public
+posture); the fix leaf dispatches with `--config "$DIGEST_FULL"
+--writable` (writable, full-access posture) and edits `src/` only,
+never `vendor/`. The fix leaf's prompt must ask for the diff and the
+test output as part of its final message, because its writable copy
+is discarded when the run ends. Keep the demo a sequential chain
+unless the operator explicitly asks for fan-out.
+
+## The chain receipt
+
+When the operator asks for "the receipt" or "proof of the chain" (or
+anything about which bundle / workload / session a leaf ran against),
+read `MOCA.md` and `leaves/*.json`, then surface the triples:
+
+```text
+Parent session: <current Claude session>
+Child A (diagnose):
+  config:   <DIGEST_PUBLIC>
+  workload: <WORKLOAD_ID>  (read-only)
+  session:  <sidA>
+Child B (fix):
+  config:   <DIGEST_FULL>
+  workload: <WORKLOAD_ID>  (writable per-run copy)
+  session:  <sidB>
+
+# Reproduce either child's full report:
+mocactl get <sidA> --out leaves
+mocactl get <sidB> --out leaves
+```
+
+The point is that each child's identity — what instructions it ran
+with, what files it saw, and the session that recorded it — is three
+sha256-pinned handles, all server-held. The operator can walk back
+from any triple on their own (or hand them to someone else) and get
+the exact text back as long as the 24h result TTL hasn't lapsed.
 
 ## There is no cancel
 
@@ -263,12 +307,15 @@ but keep the invariant clauses: project-is-at-your-cwd, posture
 rules, final-message-is-the-deliverable (and, for writable leaves,
 the diff and test output must be in that message).
 
-### Diagnose (read-only)
+### Diagnose (read-only, public-posture skill)
 
 ```text
-You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is this run's view of a small Python project — do not cd elsewhere.
-The files are mounted read-only.
+You are a subagent leaf running inside a MOCA sandbox. You have the
+`public-research` skill loaded — follow its posture: cite only what the
+project itself ships, do not assume insider conventions.
+
+Your current working directory is this run's view of a small Python project
+— do not cd elsewhere. The files are mounted read-only.
 
 The project's tests currently fail. Run the test suite
 (`python3 -m unittest discover -s tests`), read the relevant code and the
@@ -286,13 +333,16 @@ read-only anyway. End your turn with the full diagnosis as your final
 message.
 ```
 
-### Fix (apply, then verify)
+### Fix (apply, then verify — full-access skill)
 
 ```text
-You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is this run's own writable copy of a small Python project — do not
-cd elsewhere. The copy is discarded when this run ends, so anything you want
-to return must be in your final message.
+You are a subagent leaf running inside a MOCA sandbox. You have the
+`full-access-fix` skill loaded — follow its posture: apply the diagnosed fix
+and verify against the organization's testing conventions.
+
+Your current working directory is this run's own writable copy of a small
+Python project — do not cd elsewhere. The copy is discarded when this run
+ends, so anything you want to return must be in your final message.
 
 A prior agent diagnosed a test failure in a fresh copy of this project:
 
@@ -316,6 +366,12 @@ other record of your edits — the writable copy will be gone.
 
 What `spawn` does under the hood, for when something surprises you:
 
+- **Three sha256-pinned handles per leaf.** `--config` names a config
+  bundle (skills + commands, promoted via `mocactl promote`);
+  `--workload` names a workload (project files, uploaded via
+  `mocactl workloads create`); the server mints the sessionId. Each
+  handle is content-addressed, server-held, and reconstructable from
+  `MOCA.md` + the ledger.
 - **New session per leaf.** There is no `--session` flag; `spawn`
   always creates one. With `--workload`, the leaf's bash cwd is the
   workload's view (read-only) or writable copy (`--writable`), so the
