@@ -2,7 +2,8 @@
 
 How the pieces of this demo fit together: a local Claude Code session
 (the **parent**) dispatches isolated **leaves** to MOCA on a kind
-cluster via `mocactl`, and collects their results later.
+cluster via `mocactl`, against a workload Context Service holds the
+files for, and collects their results later.
 
 ## Components
 
@@ -17,13 +18,13 @@ flowchart LR
       SKILL["skill: moca-dispatch<br/>(mechanism contract)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/<br/>leaves/*.prompt.txt · *.json · *.text<br/>.claude/settings.json")]
+    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · example_repo.context<br/>leaves/*.prompt.txt · *.json · *.text<br/>.claude/settings.json")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
+    CTXCTL["contextctl<br/>(ctx pack @ setup time)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
     WORKER["detached worker per leaf<br/>holds sync POST /v1/runs"]
     AUTH[("~/.config/mocactl<br/>tokens — Read DENIED")]:::denied
-    KUBECTL["kubectl"]
-    PF{{"port-forwards<br/>8080 harness · 8090 control plane"}}
+    PF{{"port-forwards<br/>8080 harness · 8090 control plane · 9090 context-service"}}
   end
 
   subgraph cluster["kind cluster"]
@@ -33,6 +34,10 @@ flowchart LR
       SUP["supervisor / harness"]
       REDIS[("Redis")]
       RESULTS[("session + result store<br/>24h TTL")]
+    end
+    subgraph nsctx["namespace: context-service"]
+      CS["Context Service"]
+      REV[("frozen revision<br/>sha256-pinned")]
     end
     subgraph nssb["namespace: moca-sandbox"]
       POD0["moca-sandbox-0<br/>container: sandbox"]
@@ -44,22 +49,24 @@ flowchart LR
   cc -.->|"re-routes to"| SKILL
   SKILL --> BASH
   BASH --> MOCACTL
-  BASH --> KUBECTL
+  CTXCTL -->|"setup only"| SCRATCH
   cc <--> SCRATCH
   MOCACTL --- AUTH
   MOCACTL --> LEDGER
+  MOCACTL -->|"workloads create: upload bundle"| PF
   MOCACTL -->|"spawn: forks"| WORKER
   MOCACTL -->|"create session"| PF
-  WORKER -->|"POST /v1/runs"| PF
+  WORKER -->|"POST /v1/runs (--workload)"| PF
   MOCACTL -->|"get / subagents"| PF
   PF --> CP
   PF --> SUP
+  PF --> CS
   CP --- REDIS
   SUP --- RESULTS
-  SUP -->|"runs leaf turn,<br/>tools execute in sandbox"| POD0
+  CS --- REV
+  SUP -->|"fetch frozen revision<br/>(read-only or writable copy)"| CS
+  SUP -->|"mount workload view at<br/>/workspace/.moca-context/runs/&lt;sid&gt;"| POD0
   SUP --> POD1
-  KUBECTL -->|"seed example_repo/ into<br/>/workspace/&lt;sessionId&gt; on EVERY pod"| POD0
-  KUBECTL --> POD1
 
   classDef denied stroke-dasharray: 4 3,color:#b00,stroke:#b00
 ```
@@ -77,12 +84,13 @@ sequenceDiagram
   participant MC as mocactl
   participant W as detached worker
   participant SV as MOCA supervisor
+  participant CS as Context Service
   participant SB as sandbox pod
   participant FS as scratch leaves dir
 
   OP->>CC: "Dispatch a subagent to diagnose…"
   CC->>FS: write leaves/LABEL.prompt.txt
-  CC->>MC: mocactl spawn --kind prompt --tag TAG --json
+  CC->>MC: mocactl spawn --kind prompt --workload WLID [--writable] --tag TAG --json
   Note over CC,MC: permission prompt = operator's visual confirmation
   MC->>SV: create session
   SV-->>MC: sessionId
@@ -90,12 +98,13 @@ sequenceDiagram
   MC-->>CC: stdout — type=session, sessionId, pid
   CC->>FS: write leaves/LABEL.json (label to sessionId note)
   W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
-  CC->>SB: kubectl cp example_repo into workspace/SID (every pod)
   CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
   Note over SV,SB: leaf runs server-side — session pins to one pod on first turn
-  SV->>SB: leaf tool calls, cwd = workspace/SID
-  Note over SB: leaf waits for tests/ if seed has not landed
+  SV->>CS: fetch frozen revision (lazy; cached per user+revision)
+  CS-->>SV: bundle bytes (streamed, sha256-verified)
+  SV->>SB: mount view at /workspace/.moca-context/runs/sid<br/>(read-only, or writable per-run copy)
+  SV->>SB: leaf tool calls, cwd = that mount
   SB-->>SV: final message
   SV->>SV: persist result BEFORE responding (24h TTL)
   SV-->>W: 200 (worker may already be dead — irrelevant)
@@ -116,12 +125,12 @@ The parent does the sequencing — MOCA has no "on complete, trigger X"
 primitive, and neither leaf knows a chain exists.
 
 ```
-                leaf 1 "diagnose"                     leaf 2 "fix"
+                leaf 1 "diagnose"                      leaf 2 "fix"
          ┌──────────────────────────┐          ┌──────────────────────────┐
          │ session A                │          │ session B                │
-         │ /workspace/<sidA>        │          │ /workspace/<sidB>        │
-         │ fresh copy of fixture    │          │ fresh copy of fixture    │
-         │ read-only (by prompt)    │          │ edits src/, runs tests   │
+         │ workload WLID            │          │ workload WLID (same)     │
+         │   mounted READ-ONLY      │          │   WRITABLE per-run copy  │
+         │ runs tests, reports      │          │ edits src/, runs tests   │
          └────────────┬─────────────┘          └────────────┬─────────────┘
                       │ final message                       │ final message
                       ▼                                     ▼
@@ -130,12 +139,16 @@ primitive, and neither leaf knows a chain exists.
                       │  parent inlines VERBATIM             │
                       └────────► leaves/fix.prompt.txt       └──► report to operator
 
-   No shared filesystem between leaves. No file paths cross the boundary.
+   Both leaves share one workload. The writable copy is per-run and
+   discarded on completion — nothing persists across runs (that is
+   phase-2 workloads, https://github.com/rossoctl/moca/issues/476).
+   No file paths cross the leaf boundary.
 ```
 
-Isolation is substrate-enforced at the session level (one session → one
-workspace → one fresh fixture), so leaves *could* fan out concurrently;
-this demo deliberately stays a sequential chain.
+Isolation is substrate-enforced at the session level (each session
+gets its own view, and each writable run gets its own per-run copy),
+so leaves *could* fan out concurrently; this demo deliberately stays
+a sequential chain.
 
 ## Trust and durability boundaries
 
@@ -143,16 +156,10 @@ this demo deliberately stays a sequential chain.
 | --- | --- | --- |
 | `Task` denied + `moca-dispatch` skill | Subagent work cannot run in-process on the laptop | — |
 | `mocactl` owns auth (`~/.config/mocactl`, Read-denied) | Demo stores no secret; no token plumbing | — |
-| One session per leaf → own `/workspace/<sessionId>` | Leaves don't see each other's files by construction | **Not a security boundary** — same user, same container; `cd ..` reaches other sessions |
+| Workload mount read-only (diagnose leaf) | The diagnose leaf cannot alter the shared revision | — |
+| Writable per-run copy (fix leaf) | Edits are isolated to that run and discarded on completion | **Not durable** — nothing survives to the next run; that is [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |
 | Server persists result before responding to `/v1/runs` | Quit Claude, close the laptop, reboot — result survives | Nothing: there is **no cancel** |
 | Server-side result store | Collectable for **24h** | Past 24h, or after `teardown.sh`, it's gone |
-| Sandbox workspace (container-local, no volume) | Survives until the 30-min idle sweeper or teardown | Pod restart destroys it; files never return to the laptop |
+| Context Service frozen revision | Sha256-pinned, immutable upload; later uploads to the same workload are rejected | — |
+| Shared sandbox pool | Workloads and sandbox caches are per user | **Not a security boundary** between users — tasks share the sandbox as the same Linux user. Per-workload sandboxes are [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |
 | NetworkPolicy between `moca-sandbox` and everything else | Sandbox network isolation | Requires a NetworkPolicy-enforcing CNI (kind ≥ 0.24.0) |
-| Per-leaf tool restrictions | — | None: "read-only" is a prompt, not a capability |
-
-Two local states lie, and `mocactl get` is the tiebreaker:
-
-- `subagents` → `failed: fetch failed` at exactly 5 minutes is the
-  worker's own Node HTTP timeout, not the run. The run continues.
-- `subagents` → `unknown` means the worker died before the server
-  recorded anything. That result never lands; re-dispatch.
