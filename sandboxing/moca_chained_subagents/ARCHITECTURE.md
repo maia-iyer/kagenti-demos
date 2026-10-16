@@ -96,33 +96,33 @@ sequenceDiagram
   OP->>CC: "Dispatch a subagent to diagnose…"
   CC->>FS: write leaves/LABEL.prompt.txt
   CC->>MC: mocactl spawn --kind prompt --config DIGEST<br/>--workload WLID [--writable] --tag TAG --json
-  Note over CC,MC: permission prompt = operator's visual confirmation<br/>(digest + workload id visible on the command line)
-  MC->>SV: create session (configRef=DIGEST, workloadId=WLID)
+  Note over CC,MC: permission prompt = operator's visual confirmation<br/>digest and workload id visible on the command line
+  MC->>SV: create session; configRef=DIGEST, workloadId=WLID
   SV-->>MC: sessionId
-  MC->>W: fork (detached)
+  MC->>W: fork detached worker
   MC-->>CC: stdout — type=session, sessionId, pid
-  CC->>FS: write leaves/LABEL.json (label, config, workload, writable)
-  W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
-  CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
+  CC->>FS: write leaves/LABEL.json — label, config, workload, writable
+  W->>SV: POST /v1/runs — synchronous, no disconnect-abort
+  CC-->>OP: dispatched, sessionId=… then STOPS, no polling
 
   Note over SV,SB: leaf runs server-side — session pins to one pod on first turn
-  SV->>SB: apply config overlay (skills and commands from DIGEST)
-  SV->>CS: fetch frozen revision (lazy; cached per user and revision)
-  CS-->>SV: bundle bytes (streamed, sha256-verified)
-  SV->>SB: mount view at /workspace/.moca-context/runs/sid<br/>(read-only, or writable per-run copy)
+  SV->>SB: apply config overlay — skills and commands from DIGEST
+  SV->>CS: fetch frozen revision lazily, cached per user and revision
+  CS-->>SV: bundle bytes streamed, sha256-verified
+  SV->>SB: mount view at /workspace/.moca-context/runs/sid<br/>read-only, or writable per-run copy
   SV->>SB: leaf tool calls, cwd = that mount
   SB-->>SV: final message
-  SV->>SV: persist result BEFORE responding (24h TTL)
-  SV-->>W: 200 (worker may already be dead — irrelevant)
+  SV->>SV: persist result BEFORE responding, 24h TTL
+  SV-->>W: 200 — worker may already be dead, irrelevant
 
   Note over OP,CC: minutes or hours later — may be a brand-new Claude session
   OP->>CC: "Check on that subagent."
   CC->>MC: mocactl get SID --out leaves --json
   MC->>SV: fetch result
   SV-->>MC: status — queued, responded, failed or paused
-  MC->>FS: write leaves/SID.text (when responded)
+  MC->>FS: write leaves/SID.text when responded
   CC->>FS: read result
-  CC-->>OP: surface diagnosis (or still running, and stop)
+  CC-->>OP: surface diagnosis, or still running and stop
 ```
 
 ## Chaining: context flows as prompt text only
