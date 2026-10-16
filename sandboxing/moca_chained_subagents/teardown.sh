@@ -28,11 +28,17 @@ echo "==> Collecting this demo's leaf sessions..."
 # mocactl subagent ledger to this run.
 TAG=""
 WORKLOAD_ID=""
+DIGEST_PUBLIC=""
+DIGEST_FULL=""
 if [[ -f "${MOCA_MD}" ]]; then
   TAG="$(grep -E '^Demo tag:' "${MOCA_MD}" 2>/dev/null \
     | sed -E 's/^Demo tag:[[:space:]]+//' | head -1 || true)"
   WORKLOAD_ID="$(grep -E '^Workload id:' "${MOCA_MD}" 2>/dev/null \
     | sed -E 's/^Workload id:[[:space:]]+//' | head -1 || true)"
+  DIGEST_PUBLIC="$(grep -E '^Config digest public:' "${MOCA_MD}" 2>/dev/null \
+    | sed -E 's/^Config digest public:[[:space:]]+//' | head -1 || true)"
+  DIGEST_FULL="$(grep -E '^Config digest full:' "${MOCA_MD}" 2>/dev/null \
+    | sed -E 's/^Config digest full:[[:space:]]+//' | head -1 || true)"
 fi
 
 SESSION_IDS=""
@@ -84,6 +90,25 @@ else
     echo "      delete it later with:  mocactl workloads delete ${WORKLOAD_ID}" >&2
   fi
 fi
+
+echo "==> Deleting the config bundles..."
+# Config bundles promoted at setup time; delete them to free the budget.
+delete_bundle() {
+  local digest="$1"
+  local label="$2"
+  if [[ -z "${digest}" ]]; then
+    echo "    (no ${label} digest in MOCA.md; nothing to delete)"
+    return
+  fi
+  if mocactl bundles delete "${digest}" >/dev/null 2>&1; then
+    echo "    deleted ${label}  ${digest}"
+  else
+    echo "    could not delete ${label}  ${digest} (already gone?)" >&2
+    echo "      delete it later with:  mocactl bundles delete ${digest}" >&2
+  fi
+}
+delete_bundle "${DIGEST_PUBLIC}" public-only
+delete_bundle "${DIGEST_FULL}"   full
 
 echo "==> Removing scratch directory ${SCRATCH_DIR}..."
 if [[ -d "${SCRATCH_DIR}" ]]; then

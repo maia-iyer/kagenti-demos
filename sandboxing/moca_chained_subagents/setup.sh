@@ -148,6 +148,31 @@ if [[ -z "${WORKLOAD_ID}" || "${WORKLOAD_ID}" == "null" ]]; then
 fi
 echo "    created workload ${WORKLOAD_ID}"
 
+echo "==> Promoting the two config bundles..."
+# Config bundles carry each leaf's skills + commands (NOT CLAUDE.md). They
+# travel server-held and content-addressed, picked up at dispatch time via
+# `mocactl spawn --config <digest>`. The diagnose leaf runs with the
+# public-only posture; the fix leaf runs with the full-access posture.
+promote_bundle() {
+  local dir="$1"
+  local label="$2"
+  local json
+  json="$(SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" \
+    mocactl promote "${dir}" --json 2>/dev/null)"
+  local digest
+  digest="$(printf '%s' "${json}" | jq -r '.digest')"
+  if [[ -z "${digest}" || "${digest}" == "null" ]]; then
+    echo "    promote ${label} did not return a digest:" >&2
+    echo "    ${json}" >&2
+    exit 1
+  fi
+  printf '%s' "${digest}"
+}
+DIGEST_PUBLIC="$(promote_bundle "${SCRIPT_DIR}/bundles/public-only" public-only)"
+echo "    promoted public-only  ${DIGEST_PUBLIC}"
+DIGEST_FULL="$(promote_bundle "${SCRIPT_DIR}/bundles/full" full)"
+echo "    promoted full         ${DIGEST_FULL}"
+
 # One demo tag per scratch dir. mocactl's subagent ledger is machine-global;
 # the tag is what scopes listing and teardown to this demo instance.
 TAG="chained-$(date +%Y%m%d-%H%M%S)"
@@ -159,6 +184,8 @@ Control plane URL:     ${CP_URL}
 Harness URL:           ${HARNESS_URL}
 Demo tag:              ${TAG}
 Workload id:           ${WORKLOAD_ID}
+Config digest public:  ${DIGEST_PUBLIC}
+Config digest full:    ${DIGEST_FULL}
 Context bundle:        ./example_repo.context
 Leaves dir:            ./leaves
 
@@ -170,9 +197,13 @@ in the environment (the staged .claude/settings.json does this for Claude):
 
 Notes:
 - Both leaves share workload ${WORKLOAD_ID}. The diagnose leaf dispatches
-  with 'mocactl spawn ... --workload ${WORKLOAD_ID}' (read-only). The fix
-  leaf dispatches with '--workload ${WORKLOAD_ID} --writable' and gets its
-  own copy, discarded when the run ends.
+  with '--config ${DIGEST_PUBLIC} --workload ${WORKLOAD_ID}' (read-only).
+  The fix leaf dispatches with '--config ${DIGEST_FULL} --workload
+  ${WORKLOAD_ID} --writable' and gets its own copy, discarded when the run
+  ends.
+- Each child's identity is (config digest, workload revision, sessionId) —
+  three sha256-pinned handles, all server-held, all reconstructable from
+  this file + the mocactl ledger.
 - Leaf cwd is the workload's view (or writable copy): project files are
   immediately visible with 'pwd' / 'ls'. There is no fixture-seeding step.
 - There is no cancel; a dispatched leaf runs to completion. Results persist
@@ -200,6 +231,7 @@ echo ""
 echo "       cd ${SCRATCH_DIR}"
 echo "       export SH_CONTROL_PLANE_URL=${CP_URL} SH_HARNESS_URL=${HARNESS_URL}"
 echo "       mocactl spawn \"\$(cat leaves/diagnose.prompt.txt)\" \\"
+echo "         --config ${DIGEST_PUBLIC} \\"
 echo "         --kind prompt --workload ${WORKLOAD_ID} --tag ${TAG} --json"
 echo ""
 echo "  3. Or start Claude from the scratch dir and drive it with operator"
