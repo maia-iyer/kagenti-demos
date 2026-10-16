@@ -106,8 +106,8 @@ sequenceDiagram
   CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
   Note over SV,SB: leaf runs server-side — session pins to one pod on first turn
-  SV->>SB: apply config overlay (skills + commands from DIGEST)
-  SV->>CS: fetch frozen revision (lazy; cached per user+revision)
+  SV->>SB: apply config overlay (skills and commands from DIGEST)
+  SV->>CS: fetch frozen revision (lazy; cached per user and revision)
   CS-->>SV: bundle bytes (streamed, sha256-verified)
   SV->>SB: mount view at /workspace/.moca-context/runs/sid<br/>(read-only, or writable per-run copy)
   SV->>SB: leaf tool calls, cwd = that mount
