@@ -3,9 +3,7 @@
 # kind cluster. Idempotent: safe to re-run.
 #
 # What it does, in order:
-#   1. Create the kind cluster `moca` with proxy env vars scrubbed (podman
-#      on macOS otherwise bakes HTTPS_PROXY into containerd and in-cluster
-#      pulls fail).
+#   1. Create the kind cluster `moca`.
 #   2. Run MOCA's deploy/k8s/setup.sh --target kind --build.
 #   3. Point CoreDNS at public resolvers (podman's resolv.conf is flaky).
 #   4. Build the context-service image, load it into kind, and apply its
@@ -24,9 +22,17 @@
 
 set -euo pipefail
 
-# Inputs. Override by exporting before invocation.
-MOCA_DIR="${MOCA_DIR:-$HOME/workdir/agentic-platform/rossoctl/moca}"
-CONTEXT_SERVICE_DIR="${CONTEXT_SERVICE_DIR:-$HOME/workdir/agentic-platform/rossoctl/context-service}"
+# Inputs. CLONE_DIR is a convenience: if set, MOCA_DIR and CONTEXT_SERVICE_DIR
+# default to $CLONE_DIR/moca and $CLONE_DIR/context-service. Either checkout
+# can still be pointed elsewhere by exporting its own variable.
+if [[ -n "${CLONE_DIR:-}" ]]; then
+  MOCA_DIR="${MOCA_DIR:-${CLONE_DIR}/moca}"
+  CONTEXT_SERVICE_DIR="${CONTEXT_SERVICE_DIR:-${CLONE_DIR}/context-service}"
+fi
+
+: "${MOCA_DIR:?MOCA_DIR is required (or set CLONE_DIR so MOCA_DIR defaults to \$CLONE_DIR/moca)}"
+: "${CONTEXT_SERVICE_DIR:?CONTEXT_SERVICE_DIR is required (or set CLONE_DIR so it defaults to \$CLONE_DIR/context-service)}"
+
 KIND_CLUSTER="${KIND_CLUSTER:-moca}"
 KUBE_CONTEXT="kind-${KIND_CLUSTER}"
 
@@ -56,11 +62,7 @@ fi
 
 echo "==> 1/5 kind cluster ${KIND_CLUSTER}"
 if ! kind get clusters 2>/dev/null | grep -Fxq "${KIND_CLUSTER}"; then
-  # Scrub proxy env so containerd inside the node doesn't inherit a
-  # loopback proxy that points nowhere from its vantage point.
-  env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
-      -u NO_PROXY -u no_proxy \
-      kind create cluster --name "${KIND_CLUSTER}"
+  kind create cluster --name "${KIND_CLUSTER}"
 else
   echo "    cluster ${KIND_CLUSTER} already exists, reusing"
 fi
@@ -80,11 +82,8 @@ echo "==> 4/5 Context Service image + manifest"
 # Build and load; set imagePullPolicy: Never so the kubelet uses the
 # loaded tag instead of trying to pull.
 (cd "${CONTEXT_SERVICE_DIR}" && \
-  env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
-      -u NO_PROXY -u no_proxy \
-      docker build --load -t dev.local/context-service:local .)
-env -u HTTPS_PROXY -u https_proxy \
-    kind load docker-image dev.local/context-service:local --name "${KIND_CLUSTER}"
+  docker build --load -t dev.local/context-service:local .)
+kind load docker-image dev.local/context-service:local --name "${KIND_CLUSTER}"
 
 # Rewrite the namespace: the manifest ships `serverless-harness`, MOCA
 # requires `context-service`.

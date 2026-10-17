@@ -240,19 +240,23 @@ cat leaves/<sessionId>.text       # the collected result
 
 ### Checkouts
 
-Clone side-by-side; the install script defaults to `~/workdir/agentic-platform/rossoctl/{moca,context-service}`
-and takes `MOCA_DIR` / `CONTEXT_SERVICE_DIR` overrides. MOCA needs
-submodules:
+Clone MOCA and Context Service side-by-side. MOCA needs submodules:
 
 ```bash
 git clone --recurse-submodules https://github.com/rossoctl/moca
 git clone https://github.com/rossoctl/context-service
 ```
 
+Point the install script at them with either `CLONE_DIR` (used as a prefix
+for both) or `MOCA_DIR` / `CONTEXT_SERVICE_DIR` individually. There are
+no defaults — at least one must be set.
+
 ### Install the cluster-side pieces
 
 ```bash
-SH_GITHUB_CLIENT_ID=<your-oauth-client-id> ./prereqs-install.sh
+SH_GITHUB_CLIENT_ID=<your-oauth-client-id> \
+CLONE_DIR=<parent-of-both-checkouts> \
+  ./prereqs-install.sh
 ```
 
 The script creates a kind cluster `moca`, runs MOCA's `deploy/k8s/setup.sh`,
@@ -260,10 +264,9 @@ builds and loads the context-service image, and wires the two together.
 Idempotent; re-runnable. Three things it fixes along the way worth
 knowing about:
 
-- **Podman + proxies.** On macOS, `HTTPS_PROXY` in your shell leaks into
-  kind's containerd and in-cluster pulls fail. The script scrubs it before
-  `kind create`. It also points CoreDNS at `1.1.1.1` / `8.8.8.8` because
-  the Podman-network resolv.conf is flaky from pods.
+- **Flaky pod DNS on podman.** The Podman-network resolv.conf often
+  points at an unreachable IPv6 nameserver first; the script points
+  CoreDNS at `1.1.1.1` / `8.8.8.8` to work around it.
 - **Context Service image is private.** `ghcr.io/rossoctl/context-service:latest`
   returns 403 anonymously; the script builds locally and loads with
   `kind load docker-image`.
