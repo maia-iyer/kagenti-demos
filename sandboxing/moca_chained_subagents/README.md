@@ -24,6 +24,31 @@ and the model composes multi-leaf flows from the operator's requests.
 
 ## How state flows
 
+Three pieces cooperate:
+
+1. **A skill (`moca-dispatch`)** — the mechanism contract. Tells
+   Claude how to invoke `mocactl spawn` / `get` / `subagents`, how to
+   compose leaf prompts (project-is-at-your-cwd, read-only vs
+   writable, "end your turn with the full report"), and how to chain
+   leaves by inlining the previous leaf's collected text verbatim
+   into the next prompt. Does **not** prescribe how many leaves to
+   run or in what order — that comes from the operator's prompts.
+2. **`mocactl`** — the official MOCA client, on your `PATH` (never
+   staged or wrapped by the demo). It owns **all** auth: the GitHub
+   device-flow login, the API token, and the per-session tokens it
+   mints itself, all in `~/.config/mocactl` outside this demo. The
+   subagent commands it provides: `spawn` (new session per leaf +
+   detached worker + a row in the machine-global ledger at
+   `~/.local/state/mocactl/subagents.jsonl`), `get` (writes result
+   files), `subagents` (lists the ledger joined with live state).
+   The `workloads create / get / delete` subcommands manage the
+   context-service bundle both leaves mount.
+3. **A denied `Task` tool** — `.claude/settings.json` denies the
+   built-in subagent tool, so the model has to route through the skill
+   instead of forking in-process. The permission prompt on each
+   `mocactl spawn …` is the operator's visual confirmation that the
+   leaf is being dispatched to MOCA, not run locally.
+
 - **Setup time.** `mocactl login` + an inference credential (verified
   end-to-end by `mocactl doctor`); `contextctl ctx pack --type workspace`
   on the fixture; `mocactl workloads create --context` on the bundle;
