@@ -105,9 +105,13 @@ kubectl --context "${KUBE_CONTEXT}" -n context-service \
 kubectl --context "${KUBE_CONTEXT}" -n context-service \
   rollout status deployment/context-service --timeout=90s
 
-echo "==> 5/5 moca-context-service ConfigMap + Secret"
-# The token key is required by MOCA's config, but context-service in this
-# preview does not enforce it. Any value works for now.
+echo "==> 5/5 moca-context-service ConfigMap + Secret (both sides of the token)"
+# The supervisor sends this token as Bearer; context-service reads its expected
+# value from secret context-service/context-service-control-plane (key `token`).
+# If that secret is missing, context-service accepts no token and returns 401
+# on every /internal/v1 call — which the supervisor surfaces as a 502
+# context_service_error. Provision both sides with the same value.
+CS_TOKEN="demo-token-unchecked"
 kubectl --context "${KUBE_CONTEXT}" -n moca create configmap moca-context-service \
   --from-literal=enabled=1 \
   --from-literal=url=http://context-service.context-service.svc:8080 \
@@ -116,9 +120,15 @@ kubectl --context "${KUBE_CONTEXT}" -n moca create configmap moca-context-servic
   --dry-run=client -o yaml |
   kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
 kubectl --context "${KUBE_CONTEXT}" -n moca create secret generic moca-context-service \
-  --from-literal=token="demo-token-unchecked" \
+  --from-literal=token="${CS_TOKEN}" \
   --dry-run=client -o yaml |
   kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n context-service create secret generic context-service-control-plane \
+  --from-literal=token="${CS_TOKEN}" \
+  --dry-run=client -o yaml |
+  kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n context-service rollout restart deployment/context-service >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n context-service rollout status deployment/context-service --timeout=90s
 kubectl --context "${KUBE_CONTEXT}" -n moca rollout restart deployment/moca-supervisor >/dev/null
 kubectl --context "${KUBE_CONTEXT}" -n moca rollout status deployment/moca-supervisor --timeout=90s
 
