@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Install the MOCA + Context Service prerequisites for this demo on a local
+# kind cluster. Idempotent: safe to re-run.
+#
+# What it does, in order:
+#   1. Create the kind cluster `moca` with proxy env vars scrubbed (podman
+#      on macOS otherwise bakes HTTPS_PROXY into containerd and in-cluster
+#      pulls fail).
+#   2. Run MOCA's deploy/k8s/setup.sh --target kind --build.
+#   3. Point CoreDNS at public resolvers (podman's resolv.conf is flaky).
+#   4. Build the context-service image, load it into kind, and apply its
+#      manifest patched to live in the `context-service` namespace. The
+#      upstream manifest ships `serverless-harness`, but MOCA's supervisor
+#      egress NetworkPolicy only allows the namespace literally named
+#      `context-service` with pods labelled app.kubernetes.io/name=context-service.
+#   5. Create the moca-context-service ConfigMap + Secret, restart the
+#      supervisor.
+#
+# What it does NOT do (keep these as operator steps, see README):
+#   - Install mocactl / contextctl / kubectl / jq / kind / podman.
+#   - Start the three port-forwards.
+#   - mocactl login, credential add, doctor.
+#   - Run this demo's own setup.sh.
+
+set -euo pipefail
+
+# Inputs. Override by exporting before invocation.
+MOCA_DIR="${MOCA_DIR:-$HOME/workdir/agentic-platform/rossoctl/moca}"
+CONTEXT_SERVICE_DIR="${CONTEXT_SERVICE_DIR:-$HOME/workdir/agentic-platform/rossoctl/context-service}"
+KIND_CLUSTER="${KIND_CLUSTER:-moca}"
+KUBE_CONTEXT="kind-${KIND_CLUSTER}"
+
+if [[ -z "${SH_GITHUB_CLIENT_ID:-}" ]]; then
+  echo "SH_GITHUB_CLIENT_ID is required (GitHub OAuth app, device-flow enabled)." >&2
+  exit 1
+fi
+
+for d in "${MOCA_DIR}" "${CONTEXT_SERVICE_DIR}"; do
+  if [[ ! -d "${d}" ]]; then
+    echo "checkout not found: ${d}" >&2
+    exit 1
+  fi
+done
+
+for bin in kind kubectl docker jq; do
+  command -v "${bin}" >/dev/null 2>&1 || { echo "missing: ${bin}" >&2; exit 1; }
+done
+
+# A hard requirement upstream: without pi-fork populated the Docker build
+# dies at `npm ci` inside the empty submodule.
+if [[ -z "$(ls -A "${MOCA_DIR}/pi-fork" 2>/dev/null)" ]]; then
+  echo "MOCA pi-fork submodule is empty. Run:" >&2
+  echo "  (cd ${MOCA_DIR} && git submodule update --init --recursive)" >&2
+  exit 1
+fi
+
+echo "==> 1/5 kind cluster ${KIND_CLUSTER}"
+if ! kind get clusters 2>/dev/null | grep -Fxq "${KIND_CLUSTER}"; then
+  # Scrub proxy env so containerd inside the node doesn't inherit a
+  # loopback proxy that points nowhere from its vantage point.
+  env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+      -u NO_PROXY -u no_proxy \
+      kind create cluster --name "${KIND_CLUSTER}"
+else
+  echo "    cluster ${KIND_CLUSTER} already exists, reusing"
+fi
+
+echo "==> 2/5 MOCA deploy/k8s/setup.sh"
+(cd "${MOCA_DIR}" && ./deploy/k8s/setup.sh --target kind --build)
+
+echo "==> 3/5 CoreDNS -> 1.1.1.1 / 8.8.8.8 (podman resolv.conf workaround)"
+# Idempotent: if forward is already patched, this is a no-op apply.
+kubectl --context "${KUBE_CONTEXT}" -n kube-system get configmap coredns -o yaml |
+  sed 's#forward \. /etc/resolv.conf#forward . 1.1.1.1 8.8.8.8#' |
+  kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n kube-system rollout restart deployment/coredns >/dev/null
+
+echo "==> 4/5 Context Service image + manifest"
+# ghcr.io/rossoctl/context-service:latest is private (403 anonymous).
+# Build and load; set imagePullPolicy: Never so the kubelet uses the
+# loaded tag instead of trying to pull.
+(cd "${CONTEXT_SERVICE_DIR}" && \
+  env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+      -u NO_PROXY -u no_proxy \
+      docker build --load -t dev.local/context-service:local .)
+env -u HTTPS_PROXY -u https_proxy \
+    kind load docker-image dev.local/context-service:local --name "${KIND_CLUSTER}"
+
+# Rewrite the namespace: the manifest ships `serverless-harness`, MOCA
+# requires `context-service`.
+sed 's/namespace: serverless-harness/namespace: context-service/g' \
+    "${CONTEXT_SERVICE_DIR}/deploy/context-service.yaml" |
+  kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
+
+kubectl --context "${KUBE_CONTEXT}" -n context-service \
+  set image deployment/context-service \
+  context-service=dev.local/context-service:local >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n context-service \
+  patch deployment context-service \
+  -p '{"spec":{"template":{"spec":{"containers":[{"name":"context-service","imagePullPolicy":"Never"}]}}}}' \
+  >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n context-service \
+  rollout status deployment/context-service --timeout=90s
+
+echo "==> 5/5 moca-context-service ConfigMap + Secret"
+# The token key is required by MOCA's config, but context-service in this
+# preview does not enforce it. Any value works for now.
+kubectl --context "${KUBE_CONTEXT}" -n moca create configmap moca-context-service \
+  --from-literal=enabled=1 \
+  --from-literal=url=http://context-service.context-service.svc:8080 \
+  --from-literal=public-url=http://127.0.0.1:9090 \
+  --from-literal=namespace=context-service \
+  --dry-run=client -o yaml |
+  kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n moca create secret generic moca-context-service \
+  --from-literal=token="demo-token-unchecked" \
+  --dry-run=client -o yaml |
+  kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n moca rollout restart deployment/moca-supervisor >/dev/null
+kubectl --context "${KUBE_CONTEXT}" -n moca rollout status deployment/moca-supervisor --timeout=90s
+
+cat <<EOF
+
+Prereqs installed. Next, in three other terminals:
+
+  kubectl --context ${KUBE_CONTEXT} -n moca port-forward svc/moca-supervisor 8080:8080
+  kubectl --context ${KUBE_CONTEXT} -n moca port-forward svc/moca-control-plane 8090:8080
+  kubectl --context ${KUBE_CONTEXT} -n context-service port-forward svc/context-service 9090:8080
+
+Then, once per machine:
+
+  export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+  mocactl login
+  printf %s "\$ANTHROPIC_API_KEY" | mocactl credentials add anthropic \\
+    --host api.anthropic.com --kind api-key \\
+    --endpoint https://api.anthropic.com
+  mocactl doctor
+
+Then run this demo's ./setup.sh.
+EOF

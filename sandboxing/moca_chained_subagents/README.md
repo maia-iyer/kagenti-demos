@@ -223,96 +223,88 @@ cat leaves/<sessionId>.text       # the collected result
 
 ## Prerequisites
 
-- A kind cluster with [MOCA](https://github.com/rossoctl/moca) deployed
-  via `deploy/k8s/setup.sh`. From a MOCA checkout (clone with
-  `--recurse-submodules`, or run `git submodule update --init --recursive`
-  before building — otherwise the Docker build fails at `npm ci` inside
-  the empty `pi-fork/` dir):
+### Tools on your PATH
 
-  ```bash
-  cd deploy/k8s
-  SH_GITHUB_CLIENT_ID=<your-oauth-client-id> ./setup.sh --target kind --build
-  ```
-
-  This installs the supervisor, control plane, relay, Redis and the
-  sandbox StatefulSet into namespaces `moca` and `moca-sandbox`.
-
-  > **kind ≥ 0.24.0 with a NetworkPolicy-enforcing CNI is a hard
-  > requirement.** Isolation between the sandbox namespace and
-  > everything else is enforced by NetworkPolicy; a CNI that ignores
-  > them silently removes the boundary rather than failing loudly.
-
-- [Context Service](https://github.com/rossoctl/context-service)
-  deployed to the same cluster, and MOCA configured to use it via the
-  `moca-context-service` ConfigMap + Secret in the `moca` namespace
-  (see MOCA's
-  [`docs/context-service.md`](https://github.com/rossoctl/moca/blob/main/docs/context-service.md)).
-  Context Service's **public URL** must be reachable from this host
-  (a port-forward is the simplest path on kind).
-
-- `kubectl` configured for that cluster, and `jq` on your `PATH`.
+- `kind` ≥ 0.24.0 (NetworkPolicy-enforcing CNI is a hard requirement:
+  sandbox isolation **is** NetworkPolicy), `kubectl`, `docker` (or
+  podman's `docker` CLI), `jq`, Claude Code CLI.
 - [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
-  (needs Node 22+), **with the `workloads` subcommand**. The install
-  script pulls the `edge` release, which always contains the workloads
-  CLI:
-
+  (Node 22+), **with the `workloads` subcommand**:
   ```bash
   curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | MOCACTL_VERSION=edge sh
   ```
+  Probe: `mocactl workloads` must say `workloads needs create, get or delete`.
+- [`contextctl`](https://github.com/rossoctl/context-service) with the
+  `ctx pack` subcommand (build from main — `make build` — until a release
+  with workspace bundles ships).
 
-  Probe: `mocactl workloads` must complain
-  `workloads needs create, get or delete` (an old build says
-  `unknown command`).
+### Checkouts
 
-- [`contextctl`](https://github.com/rossoctl/context-service) on
-  `PATH`, with the `ctx pack` subcommand. Build from
-  [`rossoctl/context-service`](https://github.com/rossoctl/context-service)
-  main (`make build`); a tagged release including workspace bundles
-  isn't out yet.
-
-- Claude Code CLI.
-
-### Start the port-forwards
-
-In three other terminals. The MOCA harness **must** be on local port
-8080; Context Service's public URL is whatever `moca-context-service`'s
-`public-url` names (`http://127.0.0.1:9090` on kind is a common
-choice):
+Clone side-by-side; the install script defaults to `~/workdir/agentic-platform/rossoctl/{moca,context-service}`
+and takes `MOCA_DIR` / `CONTEXT_SERVICE_DIR` overrides. MOCA needs
+submodules:
 
 ```bash
-kubectl port-forward -n moca svc/moca-supervisor 8080:8080
-kubectl port-forward -n moca svc/moca-control-plane 8090:8080
-kubectl port-forward -n context-service svc/context-service 9090:8080
+git clone --recurse-submodules https://github.com/rossoctl/moca
+git clone https://github.com/rossoctl/context-service
 ```
+
+### Install the cluster-side pieces
+
+```bash
+SH_GITHUB_CLIENT_ID=<your-oauth-client-id> ./prereqs-install.sh
+```
+
+The script creates a kind cluster `moca`, runs MOCA's `deploy/k8s/setup.sh`,
+builds and loads the context-service image, and wires the two together.
+Idempotent; re-runnable. Three things it fixes along the way worth
+knowing about:
+
+- **Podman + proxies.** On macOS, `HTTPS_PROXY` in your shell leaks into
+  kind's containerd and in-cluster pulls fail. The script scrubs it before
+  `kind create`. It also points CoreDNS at `1.1.1.1` / `8.8.8.8` because
+  the Podman-network resolv.conf is flaky from pods.
+- **Context Service image is private.** `ghcr.io/rossoctl/context-service:latest`
+  returns 403 anonymously; the script builds locally and loads with
+  `kind load docker-image`.
+- **Namespace mismatch.** Context Service's upstream manifest ships
+  `namespace: serverless-harness`, but MOCA's supervisor egress NetworkPolicy
+  only allows the namespace literally named `context-service`. The script
+  rewrites the namespace before `kubectl apply`.
+
+The `moca-context-service` Secret's `token` key is required by MOCA but
+not currently enforced by Context Service — the script uses a placeholder.
+Rotate it once trusted-route auth lands upstream.
+
+### Port-forwards (three terminals)
+
+```bash
+kubectl --context kind-moca -n moca port-forward svc/moca-supervisor 8080:8080
+kubectl --context kind-moca -n moca port-forward svc/moca-control-plane 8090:8080
+kubectl --context kind-moca -n context-service port-forward svc/context-service 9090:8080
+```
+
+The MOCA harness **must** be on local 8080 (the control plane advertises
+it there). Context Service's `public-url` in the ConfigMap must match
+whichever port you choose for it (`9090` by default).
 
 ### Log in (once per machine)
 
 ```bash
 export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
 mocactl login
-mocactl doctor
-```
-
-`doctor` verifies the whole path end to end, including that you have
-an inference credential (a leaf's session creation fails without
-one). If it reports none, store your Anthropic key:
-
-```bash
 printf %s "$ANTHROPIC_API_KEY" | mocactl credentials add anthropic \
   --host api.anthropic.com --kind api-key \
   --endpoint https://api.anthropic.com
+mocactl doctor
 ```
 
 For an Anthropic-compatible proxy (e.g. a LiteLLM gateway) that expects
 `Authorization: Bearer`, use `--kind bearer` and point `--host` /
-`--endpoint` at the proxy. `--kind api-key` is only validated against
-`api.anthropic.com`:
+`--endpoint` at the proxy (`--kind api-key` is only validated against
+`api.anthropic.com`).
 
-```bash
-printf %s "$PROXY_TOKEN" | mocactl credentials add anthropic \
-  --host <proxy-host> --kind bearer \
-  --endpoint https://<proxy-host>
-```
+`mocactl doctor` must go all-green before `./setup.sh`.
 
 ## Setup
 
@@ -556,6 +548,7 @@ you care about.
 ```
 PLAN-mocactl.md            Implementation plan for the mocactl migration (this README's design)
 README.md                  This file
+prereqs-install.sh         Stands up MOCA + Context Service on a local kind cluster; see Prerequisites
 skill/SKILL.md             Skill Claude reads to dispatch leaves to MOCA via mocactl
 settings.json.example      Permission policy staged into the scratch dir: denies Task and
                            reading mocactl's config dir, allows the mocactl dispatch commands
