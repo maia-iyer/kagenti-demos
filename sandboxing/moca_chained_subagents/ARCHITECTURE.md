@@ -15,12 +15,12 @@ flowchart LR
     subgraph cc["Claude Code — parent session<br/>cwd = ~/tmp/moca-chained-scratch"]
       direction TB
       TASK["Task tool<br/>DENIED"]:::denied
-      SKILL["skill: moca-dispatch<br/>(mechanism contract)"]
+      SKILL["skill: moca-delegate-task<br/>(upstream, verbatim)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · example_repo.context<br/>leaves/*.prompt.txt · *.json · *.text<br/>.claude/settings.json")]
+    SCRATCH[("Scratch dir<br/>src/ · tests/ · vendor/ · docs/ · README.md<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
-    CTXCTL["contextctl<br/>(ctx pack @ setup time)"]
+    CTXCTL["contextctl<br/>(ctx pack @ dispatch time, per leaf)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
     WORKER["detached worker per leaf<br/>holds sync POST /v1/runs"]
     AUTH[("~/.config/mocactl<br/>tokens — Read DENIED")]:::denied
@@ -49,7 +49,8 @@ flowchart LR
   cc -.->|"re-routes to"| SKILL
   SKILL --> BASH
   BASH --> MOCACTL
-  CTXCTL -->|"setup only"| SCRATCH
+  BASH --> CTXCTL
+  CTXCTL -->|"writes leaves/LABEL.context"| SCRATCH
   cc <--> SCRATCH
   MOCACTL --- AUTH
   MOCACTL --> LEDGER
@@ -90,13 +91,17 @@ sequenceDiagram
 
   OP->>CC: "Dispatch a subagent to diagnose…"
   CC->>FS: write leaves/LABEL.prompt.txt
+  CC->>FS: contextctl ctx pack . -> leaves/LABEL.context
+  CC->>MC: mocactl workloads create --context leaves/LABEL.context --json
+  MC->>CS: upload bundle
+  MC-->>CC: workloadId WLID
   CC->>MC: mocactl spawn --kind prompt --workload WLID [--writable] --tag TAG --json
   Note over CC,MC: permission prompt = operator's visual confirmation
   MC->>SV: create session
   SV-->>MC: sessionId
   MC->>W: fork (detached)
   MC-->>CC: stdout — type=session, sessionId, pid
-  CC->>FS: write leaves/LABEL.json (label to sessionId note)
+  CC->>FS: write leaves/LABEL.json (label, sessionId, workloadId)
   W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
   CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
@@ -116,6 +121,7 @@ sequenceDiagram
   SV-->>MC: status — queued, responded, failed or paused
   MC->>FS: write leaves/SID.text (when responded)
   CC->>FS: read result
+  CC->>MC: mocactl workloads delete WLID (after collection)
   CC-->>OP: surface diagnosis (or still running, and stop)
 ```
 
@@ -128,7 +134,7 @@ primitive, and neither leaf knows a chain exists.
                 leaf 1 "diagnose"                      leaf 2 "fix"
          ┌──────────────────────────┐          ┌──────────────────────────┐
          │ session A                │          │ session B                │
-         │ workload WLID            │          │ workload WLID (same)     │
+         │ workload WLID_A          │          │ workload WLID_B          │
          │   mounted READ-ONLY      │          │   WRITABLE per-run copy  │
          │ runs tests, reports      │          │ edits src/, runs tests   │
          └────────────┬─────────────┘          └────────────┬─────────────┘
@@ -139,10 +145,11 @@ primitive, and neither leaf knows a chain exists.
                       │  parent inlines VERBATIM             │
                       └────────► leaves/fix.prompt.txt       └──► report to operator
 
-   Both leaves share one workload. The writable copy is per-run and
-   discarded on completion — nothing persists across runs (that is
-   phase-2 workloads, https://github.com/rossoctl/moca/issues/476).
-   No file paths cross the leaf boundary.
+   Each leaf has its own workload, packed and created at dispatch and
+   deleted after collection. The writable copy is per-run and discarded
+   on completion — nothing persists across runs (that is phase-2
+   workloads, https://github.com/rossoctl/moca/issues/476). No file
+   paths cross the leaf boundary.
 ```
 
 Isolation is substrate-enforced at the session level (each session
@@ -154,7 +161,7 @@ a sequential chain.
 
 | Boundary | What it guarantees | What it does not |
 | --- | --- | --- |
-| `Task` denied + `moca-dispatch` skill | Subagent work cannot run in-process on the laptop | — |
+| `Task` denied + `moca-delegate-task` skill | Subagent work cannot run in-process on the laptop | — |
 | `mocactl` owns auth (`~/.config/mocactl`, Read-denied) | Demo stores no secret; no token plumbing | — |
 | Workload mount read-only (diagnose leaf) | The diagnose leaf cannot alter the shared revision | — |
 | Writable per-run copy (fix leaf) | Edits are isolated to that run and discarded on completion | **Not durable** — nothing survives to the next run; that is [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |

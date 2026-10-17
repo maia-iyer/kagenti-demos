@@ -5,10 +5,12 @@
       "Read(~/.config/mocactl/**)"
     ],
     "allow": [
+      "Bash(contextctl ctx pack*)",
       "Bash(mocactl spawn*)",
       "Bash(mocactl get*)",
       "Bash(mocactl subagents*)",
       "Bash(mocactl sessions*)",
+      "Bash(mocactl workloads create*)",
       "Bash(mocactl workloads get*)",
       "Bash(mocactl workloads delete*)"
     ]
