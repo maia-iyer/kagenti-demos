@@ -239,7 +239,10 @@ not encode the flow; you drive it.
 **Prompt 1 — start the diagnosis.** Paste something like:
 
 > Dispatch a subagent to diagnose why the fixture project's tests are
-> failing. The leaf is read-only — do not modify files.
+> failing. The leaf is read-only — do not modify files. `mocactl spawn`
+> must be the last tool call of this turn — do not call `get`,
+> `subagents`, or `sleep` after it, and do not wait. The leaf runs
+> durably server-side; end the turn as soon as the note is written.
 
 Claude should:
 
@@ -273,7 +276,10 @@ record `collectedAt` / `deletedAt` on the note.
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
 > Good. Dispatch another subagent to apply that fix, run the tests,
-> and report the change and outcome.
+> and report the change and outcome. `mocactl spawn` must be the last
+> tool call of this turn — do not call `get`, `subagents`, or `sleep`
+> after it, and do not wait. End the turn as soon as the note is
+> written.
 
 Claude dispatches a second leaf, which packs the fixture again and
 creates its own workload, **with `--writable`**, with the diagnosis

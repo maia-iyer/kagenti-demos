@@ -3,18 +3,6 @@
 
 ## Addendum: this scratch dir
 
-Overrides upstream where they conflict.
-
-### Detach on spawn — ignore upstream step 4
-
-`mocactl spawn` is the **last tool call of the dispatch turn**. Write
-the note, report the session id, end the turn. No `get`, `subagents`,
-`sleep`, or polling in the same turn. Leaves are durable server-side;
-waiting locally doesn't make them finish faster.
-
-Collection is a separate turn, triggered by the operator. One `get`
-per turn, no retry loop.
-
 ### Preconditions
 
 `MOCA.md` holds this run's facts:
@@ -40,14 +28,14 @@ mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt \
   --workload "$WORKLOAD_ID" [--writable] --tag "$TAG" --json
 ```
 
-Record `workloadId` on the note. End the turn.
+Record `workloadId` on the note.
 
 **Collection turn:** `mocactl get <sessionId> --out leaves --json`
 once. On `responded` / `failed` / `paused`, surface the outcome and
 `mocactl workloads delete "$WORKLOAD_ID"`. On `queued`, report "still
 running" and stop. Delete pairs with collection, not dispatch.
 
-### Other overrides
+### Notes
 
 - `Task` is denied — this skill is the only subagent path.
 - `get` beats `subagents`: the ledger shows long leaves as
