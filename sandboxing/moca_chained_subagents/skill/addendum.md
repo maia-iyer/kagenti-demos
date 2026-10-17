@@ -3,85 +3,64 @@
 
 ## Addendum: this scratch dir
 
-The rules below **override** the upstream flow where they conflict.
+Overrides upstream where they conflict.
+
+### Detach on spawn — ignore upstream step 4
+
+`mocactl spawn` is the **last tool call of the dispatch turn**. Write
+the note, report the session id, end the turn. No `get`, `subagents`,
+`sleep`, or polling in the same turn. Leaves are durable server-side;
+waiting locally doesn't make them finish faster.
+
+Collection is a separate turn, triggered by the operator. One `get`
+per turn, no retry loop.
 
 ### Preconditions
 
-`MOCA.md` holds this run's facts. Pull `TAG` into a shell variable
-once per turn:
+`MOCA.md` holds this run's facts:
 
 ```bash
 TAG="$(sed -nE 's/^Demo tag:[[:space:]]+//p' MOCA.md)"
 ```
 
-`SH_CONTROL_PLANE_URL` and `SH_HARNESS_URL` are injected via
+`SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` come from
 `.claude/settings.json`. If `MOCA.md` is missing, stop and ask the
 operator to re-run `setup.sh`.
 
-### The fixture
+### Per-leaf workload: pack/create/spawn, then (later) get/delete
 
-The directory to pack is `./example_repo` (relative to this scratch
-dir, staged by `setup.sh`). Pass it to `contextctl ctx pack` as
-`--type workspace`. Do not pack anything else — the demo's leaves are
-written against this fixture.
+Fixture is `./example_repo`. Each leaf owns its own workload.
 
-### Per-spawn pack + create, post-collection delete
+**Dispatch turn:**
 
-Each leaf owns its own workload. Upstream's full
-pack → create → spawn → get → delete sequence runs **per leaf**, not
-once per demo run:
+```bash
+contextctl ctx pack ./example_repo --type workspace -o leaves/<label>.context
+WORKLOAD_ID="$(mocactl workloads create --context leaves/<label>.context --json | jq -r '.workloadId')"
+mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt \
+  --workload "$WORKLOAD_ID" [--writable] --tag "$TAG" --json
+```
 
-1. Before `mocactl spawn`, pack the fixture and create a workload:
+Record `workloadId` on the note. End the turn.
 
-   ```bash
-   contextctl ctx pack ./example_repo --type workspace \
-     -o leaves/<label>.context
-   WORKLOAD_ID="$(mocactl workloads create \
-     --context leaves/<label>.context --json | jq -r '.workloadId')"
-   ```
-
-   Record `WORKLOAD_ID` on the leaf's note (below). The `.context`
-   bundle on disk is a cache you can delete after the workload is up;
-   it is not needed again.
-
-2. Spawn with that workload id (and `--writable` if the leaf edits
-   files), tagged with `$TAG`.
-
-3. On successful `mocactl get` (terminal status, result written),
-   delete the workload:
-
-   ```bash
-   mocactl workloads delete "$WORKLOAD_ID"
-   ```
-
-   Add `deletedAt` to the note. If `get` is still non-terminal, leave
-   the workload alive — delete pairs with **collection**, not with
-   dispatch.
+**Collection turn:** `mocactl get <sessionId> --out leaves --json`
+once. On `responded` / `failed` / `paused`, surface the outcome and
+`mocactl workloads delete "$WORKLOAD_ID"`. On `queued`, report "still
+running" and stop. Delete pairs with collection, not dispatch.
 
 ### Other overrides
 
-- **`Task` is denied.** This skill is the only subagent path. Do not
-  shell out to `curl` against MOCA's HTTP API.
-- **Dispatch-and-stop.** After `mocactl spawn`, write the note, report
-  the session id, and end the turn. Do not poll, `sleep`, or loop on
-  `subagents`. Collection is a later turn's job.
-- **`get` is the source of truth, not the ledger.** Trust
-  `mocactl get --json`'s `status`; `subagents` may show a long-running
-  leaf as `failed: fetch failed` while the run continues server-side.
-- **Infrastructure outcomes aren't findings.** `unknown`, `paused`, and
-  the 5-minute fetch-timeout `failed` say nothing about the operator's
-  code. Say so explicitly.
-- **There is no cancel.** A dispatched leaf runs to completion. Let it
-  finish and ignore its result, or re-dispatch under a fresh label.
+- `Task` is denied — this skill is the only subagent path.
+- `get` beats `subagents`: the ledger shows long leaves as
+  `failed: fetch failed` while the run continues.
+- `unknown` / `paused` / 5-minute `failed` are infrastructure
+  outcomes, not findings.
+- No cancel. Let a bad leaf finish and re-dispatch under a fresh label
+  (`fix` → `fix2`).
 
-### Bookkeeping in `leaves/`
+### `leaves/` bookkeeping
 
-- Prompt: `leaves/<label>.prompt.txt`.
-- Bundle: `leaves/<label>.context` (transient; delete after create).
-- Note: `leaves/<label>.json` with
-  `{label, sessionId, workloadId, kind, writable, promptFile, dispatchedAt}`.
-- Result: `leaves/<sessionId>.text` via `mocactl get --out leaves --json`.
-  Add `collectedAt` and `deletedAt` to the note after collecting and
-  deleting the workload.
-
-Use a fresh label when re-dispatching (`fix` → `fix2`).
+- `<label>.prompt.txt`, `<label>.context` (transient).
+- `<label>.json`: `{label, sessionId, workloadId, kind, writable,
+  promptFile, dispatchedAt}`; add `collectedAt` / `deletedAt` on
+  collection.
+- `<sessionId>.text` via `mocactl get`.
