@@ -15,10 +15,10 @@ flowchart LR
     subgraph cc["Claude Code — parent session<br/>cwd = ~/tmp/moca-chained-scratch"]
       direction TB
       TASK["Task tool<br/>DENIED"]:::denied
-      SKILL["skill: moca-delegate-task<br/>(upstream + demo addendum)"]
+      SKILL["skill: moca-delegate-task<br/>(upstream, verbatim)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
+    SCRATCH[("Scratch dir<br/>src/ · tests/ · vendor/ · docs/ · README.md<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
     CTXCTL["contextctl<br/>(ctx pack @ dispatch time, per leaf)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
@@ -91,7 +91,7 @@ sequenceDiagram
 
   OP->>CC: "Dispatch a subagent to diagnose…"
   CC->>FS: write leaves/LABEL.prompt.txt
-  CC->>FS: contextctl ctx pack ./example_repo -> leaves/LABEL.context
+  CC->>FS: contextctl ctx pack . -> leaves/LABEL.context
   CC->>MC: mocactl workloads create --context leaves/LABEL.context --json
   MC->>CS: upload bundle
   MC-->>CC: workloadId WLID

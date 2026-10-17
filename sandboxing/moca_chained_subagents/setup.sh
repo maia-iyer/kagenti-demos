@@ -7,10 +7,11 @@
 # script does the demo-specific setup:
 #   1. Verify the toolchain and that mocactl can drive the install end to
 #      end (mocactl doctor).
-#   2. Stage a scratch dir: a leaves/ dir for prompts/notes/results, a
-#      copy of the example_repo fixture, a moca-delegate-task skill
-#      (upstream SKILL.md + this demo's addendum, concatenated), and
-#      Claude Code settings pointing at this run.
+#   2. Stage a scratch dir whose contents are the example_repo project
+#      (so `./` at the parent's cwd matches `./` at the leaf's cwd),
+#      plus a leaves/ dir for prompts/notes/results, a moca-delegate-task
+#      skill (upstream SKILL.md, verbatim),
+#      and Claude Code settings pointing at this run.
 #
 # Pack + workload create + workload delete happen per leaf at dispatch
 # time, driven by the agent through the skill — not by this script.
@@ -35,8 +36,10 @@ HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
 
-# Upstream MOCA checkout — holds the moca-delegate-task skill, which we stage
-# as a reference doc under this demo's overlay skill.
+# Upstream MOCA checkout — holds the moca-delegate-task skill, staged
+# verbatim into the scratch dir. This demo adds no overrides: the two
+# operator prompts (one per leaf) carry the demo-specific details
+# (pack `.`, tag `moca-chained-subagents-demo`).
 MOCA_REPO="${MOCA_REPO:-$HOME/workdir/agentic-platform/rossoctl/moca}"
 UPSTREAM_SKILL="${MOCA_REPO}/skills/moca-delegate-task/SKILL.md"
 
@@ -152,54 +155,26 @@ jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" \
    "${SCRATCH_DIR}/.claude/settings.json" >"${settings_tmp}"
 mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 
-# Stage the skill: upstream moca-delegate-task SKILL.md, verbatim, with
-# this demo's addendum appended. The addendum carries the scratch-dir
-# overrides (dispatch-and-stop; per-spawn pack/create/delete; Task is
-# denied; leaves/ bookkeeping). Upstream owns the mechanism; the
-# addendum owns the deltas. Demo-specific posture (which fixture, which
-# leaf is writable, how to chain) lives in the operator's prompts.
+# Stage the skill verbatim from upstream. The demo's two operator
+# prompts carry what's specific here (which directory to pack, which
+# tag to use); the skill itself needs no demo-local override.
 staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
-cat "${UPSTREAM_SKILL}" "${SCRIPT_DIR}/skill/addendum.md" > "${staged_skill}"
+cp "${UPSTREAM_SKILL}" "${staged_skill}"
 
-# The fixture the demo's leaves pack into their own .context bundles at
-# dispatch time. Staged here so the agent's pack command sees a stable
-# path (./example_repo relative to the scratch dir).
-cp -R "${SCRIPT_DIR}/example_repo" "${SCRATCH_DIR}/example_repo"
+# The scratch dir *is* the project the leaves pack. Copy example_repo's
+# contents (not the directory itself) into the scratch dir so `./` at
+# the parent's cwd matches `./` at the leaf's cwd.
+cp -R "${SCRIPT_DIR}/example_repo/." "${SCRATCH_DIR}/"
 
 # Purge any Python bytecode left in the fixture from a prior in-tree test run
-# (e.g. verifying the fixture locally). A .pyc file is tagged with the Python
-# version that produced it (e.g. greet.cpython-311.pyc); the sandbox's Python
-# may be a different minor version and would ignore or reject it, and leaf
-# prompts assume a clean fixture. (`contextctl ctx pack` does not yet honor
-# .gitignore, so this purge is what keeps those files out of the bundle.)
-find "${SCRATCH_DIR}/example_repo" \
+# (e.g. verifying it locally). A .pyc file is tagged with the Python version
+# that produced it (e.g. greet.cpython-311.pyc); the sandbox's Python may be
+# a different minor version and would ignore or reject it. (`contextctl ctx
+# pack` does not yet honor .gitignore, so this purge is what keeps those
+# files out of the bundle.)
+find "${SCRATCH_DIR}" \
   \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
   -prune -exec rm -rf {} +
-
-# One demo tag per scratch dir. mocactl's subagent ledger is machine-global;
-# the tag is what scopes listing and teardown to this demo instance. The
-# agent uses it to tag every leaf it spawns.
-TAG="chained-$(date +%Y%m%d-%H%M%S)"
-
-# Pack + workload create run per leaf, driven by the agent through the
-# skill. MOCA.md intentionally does not carry a workload id — there isn't
-# one shared across the run anymore. Each leaf's note in leaves/<label>.json
-# records its own workloadId.
-cat > "${SCRATCH_DIR}/MOCA.md" <<EOF
-# MOCA runtime facts for this demo run
-
-Control plane URL:     ${CP_URL}
-Harness URL:           ${HARNESS_URL}
-Demo tag:              ${TAG}
-Fixture dir:           ./example_repo
-Leaves dir:            ./leaves
-
-Every mocactl command run from this directory needs the port-forward URLs
-in the environment (the staged .claude/settings.json does this for Claude):
-
-  export SH_CONTROL_PLANE_URL=${CP_URL}
-  export SH_HARNESS_URL=${HARNESS_URL}
-EOF
 
 echo ""
 echo "Setup complete."

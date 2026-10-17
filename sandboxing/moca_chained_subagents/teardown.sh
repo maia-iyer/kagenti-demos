@@ -16,7 +16,9 @@ CP_PORT="${CP_PORT:-8090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
-MOCA_MD="${SCRATCH_DIR}/MOCA.md"
+# Constant: scopes `mocactl subagents --tag` to this demo's leaves on
+# the machine-global ledger. Must match the tag used in operator prompts.
+TAG="moca-chained-subagents-demo"
 
 # mocactl needs the port-forwards to list sessions, delete sessions, and
 # delete the workload.
@@ -24,16 +26,8 @@ export SH_CONTROL_PLANE_URL="${CP_URL}"
 export SH_HARNESS_URL="${HARNESS_URL}"
 
 echo "==> Collecting this demo's leaf sessions..."
-# The demo tag (written to MOCA.md by setup.sh) scopes the machine-global
-# mocactl subagent ledger to this run.
-TAG=""
-if [[ -f "${MOCA_MD}" ]]; then
-  TAG="$(grep -E '^Demo tag:' "${MOCA_MD}" 2>/dev/null \
-    | sed -E 's/^Demo tag:[[:space:]]+//' | head -1 || true)"
-fi
-
 SESSION_IDS=""
-if [[ -n "${TAG}" ]] && command -v mocactl >/dev/null 2>&1; then
+if command -v mocactl >/dev/null 2>&1; then
   if listing="$(mocactl subagents --tag "${TAG}" --json 2>/dev/null)"; then
     SESSION_IDS="$(printf '%s' "${listing}" \
       | jq -r '.subagents[]?.sessionId' 2>/dev/null || true)"
