@@ -26,13 +26,17 @@ and the model composes multi-leaf flows from the operator's requests.
 
 Three pieces cooperate:
 
-1. **A skill (`moca-dispatch`)** — the mechanism contract. Tells
-   Claude how to invoke `mocactl spawn` / `get` / `subagents`, how to
-   compose leaf prompts (project-is-at-your-cwd, read-only vs
-   writable, "end your turn with the full report"), and how to chain
-   leaves by inlining the previous leaf's collected text verbatim
-   into the next prompt. Does **not** prescribe how many leaves to
-   run or in what order — that comes from the operator's prompts.
+1. **A skill (`moca-chained-demo`)** — the demo-specific overlay on
+   upstream MOCA's `moca-delegate-task`. Tells Claude how to invoke
+   `mocactl spawn` / `get` / `subagents`, how to compose leaf prompts
+   (project-is-at-your-cwd, read-only vs writable, "end your turn
+   with the full report"), and how to chain leaves by inlining the
+   previous leaf's collected text verbatim into the next prompt. The
+   upstream SKILL.md is staged alongside under `references/` as a
+   mechanism doc; the overlay overrides upstream's "watch until
+   none is running" with this demo's dispatch-and-stop rhythm. Does
+   **not** prescribe how many leaves to run or in what order — that
+   comes from the operator's prompts.
 2. **`mocactl`** — the official MOCA client, on your `PATH` (never
    staged or wrapped by the demo). It owns **all** auth: the GitHub
    device-flow login, the API token, and the per-session tokens it
@@ -193,7 +197,9 @@ This:
    workload from it, and records the workload id in `MOCA.md`.
 4. Stages the scratch dir at `~/tmp/moca-chained-scratch/`:
    `.claude/settings.json` (with the port-forward URLs injected as env),
-   the `moca-dispatch` skill, a copy of `example_repo/`, an empty
+   the `moca-chained-demo` overlay skill (with the upstream
+   `moca-delegate-task` SKILL.md staged under `references/`),
+   a copy of `example_repo/`, an empty
    `leaves/`, and `MOCA.md` with the runtime facts, this run's demo
    tag, and the workload id.
 
@@ -229,7 +235,7 @@ not encode the flow; you drive it.
 
 Claude should:
 
-1. Read the `moca-dispatch` skill and `MOCA.md` (tag, workload id).
+1. Read the `moca-chained-demo` skill and `MOCA.md` (tag, workload id).
 2. **Not** invoke `Task` — if it tries, the deny fires and it
    re-routes through the skill.
 3. Write the leaf's prompt to `leaves/diagnose.prompt.txt` and run
@@ -397,7 +403,7 @@ running, `Ctrl-C` them.
   a prompt that does.
 - **Claude tries `Task` and gets denied, then stops.** The skill
   wasn't found. Confirm
-  `~/tmp/moca-chained-scratch/.claude/skills/moca-dispatch/SKILL.md`
+  `~/tmp/moca-chained-scratch/.claude/skills/moca-chained-demo/SKILL.md`
   exists; re-run `./setup.sh` if it doesn't.
 - **Re-dispatching after a failure.** Use a fresh label (`diagnose2`)
   so the previous note and prompt files aren't overwritten.
@@ -416,7 +422,7 @@ you care about.
 ```
 README.md                  This file
 prereqs-install.sh         Stands up MOCA + Context Service on a local kind cluster; see Prerequisites
-skill/SKILL.md             Skill Claude reads to dispatch leaves to MOCA via mocactl
+skill/overlay-SKILL.md     Overlay skill with demo-specific invariants; wraps upstream moca-delegate-task
 settings.json.example      Permission policy staged into the scratch dir: denies Task and
                            reading mocactl's config dir, allows the mocactl dispatch commands
 setup.sh                   Verifies prereqs via mocactl doctor, packs the fixture, creates the
@@ -432,7 +438,9 @@ In the scratch dir after `setup.sh`:
 ├── .claude/
 │   ├── settings.json      Permission policy + port-forward env for mocactl
 │   └── skills/
-│       └── moca-dispatch/SKILL.md   The dispatch skill Claude reads
+│       └── moca-chained-demo/
+│           ├── SKILL.md                              The overlay Claude reads (only triggering skill)
+│           └── references/moca-delegate-task.md      Upstream mechanism doc (description stripped)
 ├── example_repo/          Fixture copy packed into the workload (kept for reference)
 ├── example_repo.context   The workspace .context bundle uploaded to Context Service
 ├── leaves/                Leaf prompts, notes (*.json), and collected results (<sid>.text)
