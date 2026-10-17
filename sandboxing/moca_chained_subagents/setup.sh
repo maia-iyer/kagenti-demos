@@ -8,15 +8,14 @@
 #   1. Verify the toolchain and that mocactl can drive the install end to
 #      end (mocactl doctor).
 #   2. Pack the fixture into a workspace .context bundle, create a workload
-#      from it, and record the workload id in MOCA.md. The two leaves of
-#      this run share that workload: the diagnose leaf mounts it read-only,
-#      the fix leaf gets its own writable copy per run.
+#      from it, and record the workload id in MOCA.md. Every leaf the
+#      operator dispatches in this run shares that workload.
 #   3. Stage a scratch dir: a leaves/ dir for prompts/notes/results, a
 #      moca-delegate-task skill (upstream SKILL.md + this demo's addendum,
 #      concatenated), and Claude Code settings pointing at this run.
 #
-# Session dispatch happens later via `mocactl spawn --workload <id>` (and
-# `--writable` for the fix leaf); no `kubectl cp` is involved.
+# Session dispatch happens later via `mocactl spawn --workload <id>`
+# (optionally `--writable` per leaf); no `kubectl cp` is involved.
 #
 # This script does NOT stand up MOCA or Context Service. See the demo
 # README prerequisites.
@@ -154,10 +153,11 @@ jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" \
 mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 
 # Stage the skill: upstream moca-delegate-task SKILL.md, verbatim, with
-# this demo's addendum appended. The addendum carries the demo-specific
+# this demo's addendum appended. The addendum carries the scratch-dir
 # overrides (dispatch-and-stop; setup owns the workload; Task is denied;
-# leaves/ bookkeeping; posture rules; prompt templates). Upstream owns
-# the mechanism; the addendum owns the deltas.
+# leaves/ bookkeeping). Upstream owns the mechanism; the addendum owns
+# the deltas. Demo-specific posture (which fixture, which leaf is
+# writable, how to chain) lives in the operator's prompts, not here.
 staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
 cat "${UPSTREAM_SKILL}" "${SCRIPT_DIR}/skill/addendum.md" > "${staged_skill}"
 
@@ -185,9 +185,8 @@ contextctl ctx pack "${SCRATCH_DIR}/example_repo" --type workspace \
   --output "${CONTEXT_BUNDLE}"
 
 echo "==> Creating the shared workload..."
-# One workload per demo run, shared by both leaves: the diagnose leaf mounts
-# it read-only, the fix leaf gets its own writable per-run copy via --writable.
-# Writes do NOT persist across runs (that is phase-2 workloads,
+# One workload per demo run, shared by every leaf the operator dispatches
+# against it. Writes do NOT persist across runs (that is phase-2 workloads,
 # https://github.com/rossoctl/moca/issues/476).
 WORKLOAD_JSON="$(SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" \
   mocactl workloads create --context "${CONTEXT_BUNDLE}" --json)"
@@ -218,17 +217,6 @@ in the environment (the staged .claude/settings.json does this for Claude):
 
   export SH_CONTROL_PLANE_URL=${CP_URL}
   export SH_HARNESS_URL=${HARNESS_URL}
-
-Notes:
-- Both leaves share workload ${WORKLOAD_ID}. The diagnose leaf dispatches
-  with 'mocactl spawn ... --workload ${WORKLOAD_ID}' (read-only). The fix
-  leaf dispatches with '--workload ${WORKLOAD_ID} --writable' and gets its
-  own copy, discarded when the run ends.
-- Leaf cwd is the workload's view (or writable copy): project files are
-  immediately visible with 'pwd' / 'ls'. There is no fixture-seeding step.
-- There is no cancel; a dispatched leaf runs to completion. Results persist
-  server-side for 24h — collect with 'mocactl get <sessionId>' inside that
-  window.
 EOF
 
 echo ""
@@ -250,8 +238,6 @@ echo "     the flow by hand':"
 echo ""
 echo "       cd ${SCRATCH_DIR}"
 echo "       export SH_CONTROL_PLANE_URL=${CP_URL} SH_HARNESS_URL=${HARNESS_URL}"
-echo "       mocactl spawn \"\$(cat leaves/diagnose.prompt.txt)\" \\"
-echo "         --kind prompt --workload ${WORKLOAD_ID} --tag ${TAG} --json"
 echo ""
 echo "  3. Or start Claude from the scratch dir and drive it with operator"
 echo "     prompts (the agent flow — see the README's 'Run a session'):"
