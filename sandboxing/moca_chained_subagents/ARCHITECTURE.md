@@ -15,7 +15,7 @@ flowchart LR
     subgraph cc["Claude Code — parent session<br/>cwd = ~/tmp/moca-chained-scratch"]
       direction TB
       TASK["Task tool<br/>DENIED"]:::denied
-      SKILL["skill: moca-chained-demo<br/>(overlay on upstream moca-delegate-task)"]
+      SKILL["skill: moca-delegate-task<br/>(upstream + demo addendum)"]
       BASH["Bash"]
     end
     SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · example_repo.context<br/>leaves/*.prompt.txt · *.json · *.text<br/>.claude/settings.json")]
@@ -154,7 +154,7 @@ a sequential chain.
 
 | Boundary | What it guarantees | What it does not |
 | --- | --- | --- |
-| `Task` denied + `moca-chained-demo` skill | Subagent work cannot run in-process on the laptop | — |
+| `Task` denied + `moca-delegate-task` skill | Subagent work cannot run in-process on the laptop | — |
 | `mocactl` owns auth (`~/.config/mocactl`, Read-denied) | Demo stores no secret; no token plumbing | — |
 | Workload mount read-only (diagnose leaf) | The diagnose leaf cannot alter the shared revision | — |
 | Writable per-run copy (fix leaf) | Edits are isolated to that run and discarded on completion | **Not durable** — nothing survives to the next run; that is [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |

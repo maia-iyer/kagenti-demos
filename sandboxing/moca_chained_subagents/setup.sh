@@ -11,10 +11,9 @@
 #      from it, and record the workload id in MOCA.md. The two leaves of
 #      this run share that workload: the diagnose leaf mounts it read-only,
 #      the fix leaf gets its own writable copy per run.
-#   3. Stage a scratch dir: a leaves/ dir for prompts/notes/results, the
-#      moca-chained-demo overlay skill (with upstream moca-delegate-task
-#      copied in as a reference doc), and Claude Code settings pointing at
-#      this run.
+#   3. Stage a scratch dir: a leaves/ dir for prompts/notes/results, a
+#      moca-delegate-task skill (upstream SKILL.md + this demo's addendum,
+#      concatenated), and Claude Code settings pointing at this run.
 #
 # Session dispatch happens later via `mocactl spawn --workload <id>` (and
 # `--writable` for the fix leaf); no `kubectl cp` is involved.
@@ -142,7 +141,7 @@ echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
 # Fresh staging on every run: the demo tag is per-run, so notes and results
 # from an earlier run would be orphaned. Collect results before re-running.
 rm -rf "${SCRATCH_DIR}"
-mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-chained-demo/references" \
+mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-delegate-task" \
          "${SCRATCH_DIR}/leaves"
 
 # Claude Code settings, patched to point mocactl at the port-forwards.
@@ -154,27 +153,13 @@ jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" \
    "${SCRATCH_DIR}/.claude/settings.json" >"${settings_tmp}"
 mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 
-# The overlay skill (moca-chained-demo) + upstream reference doc.
-#
-# This demo's overlay is the only triggering skill in the scratch dir. It
-# wraps the upstream moca-delegate-task mechanism with the demo's invariants
-# (dispatch-and-stop; setup owns the workload; infra outcomes aren't
-# findings). The upstream SKILL.md is staged alongside as a *reference*
-# only, with its `description:` stripped so it does not auto-trigger as a
-# competing skill.
-cp "${SCRIPT_DIR}/skill/overlay-SKILL.md" \
-   "${SCRATCH_DIR}/.claude/skills/moca-chained-demo/SKILL.md"
-
-upstream_ref="${SCRATCH_DIR}/.claude/skills/moca-chained-demo/references/moca-delegate-task.md"
-{
-  printf '<!-- Reference doc. Copied by setup.sh from:\n'
-  printf '     %s\n' "${UPSTREAM_SKILL}"
-  printf '     Its `description:` frontmatter is stripped so Claude Code\n'
-  printf '     does not auto-trigger it as a competing skill. The overlay\n'
-  printf '     (../SKILL.md) is the entry point; this file is for the\n'
-  printf '     mechanism details only. -->\n\n'
-  sed '/^description:/d' "${UPSTREAM_SKILL}"
-} > "${upstream_ref}"
+# Stage the skill: upstream moca-delegate-task SKILL.md, verbatim, with
+# this demo's addendum appended. The addendum carries the demo-specific
+# overrides (dispatch-and-stop; setup owns the workload; Task is denied;
+# leaves/ bookkeeping; posture rules; prompt templates). Upstream owns
+# the mechanism; the addendum owns the deltas.
+staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
+cat "${UPSTREAM_SKILL}" "${SCRIPT_DIR}/skill/addendum.md" > "${staged_skill}"
 
 # The fixture the demo's two leaves share, packed into a workspace .context
 # bundle for Context Service.
