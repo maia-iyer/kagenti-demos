@@ -7,15 +7,15 @@
 # script does the demo-specific setup:
 #   1. Verify the toolchain and that mocactl can drive the install end to
 #      end (mocactl doctor).
-#   2. Pack the fixture into a workspace .context bundle, create a workload
-#      from it, and record the workload id in MOCA.md. Every leaf the
-#      operator dispatches in this run shares that workload.
-#   3. Stage a scratch dir: a leaves/ dir for prompts/notes/results, a
-#      moca-delegate-task skill (upstream SKILL.md + this demo's addendum,
-#      concatenated), and Claude Code settings pointing at this run.
+#   2. Stage a scratch dir: a leaves/ dir for prompts/notes/results, a
+#      copy of the example_repo fixture, a moca-delegate-task skill
+#      (upstream SKILL.md + this demo's addendum, concatenated), and
+#      Claude Code settings pointing at this run.
 #
-# Session dispatch happens later via `mocactl spawn --workload <id>`
-# (optionally `--writable` per leaf); no `kubectl cp` is involved.
+# Pack + workload create + workload delete happen per leaf at dispatch
+# time, driven by the agent through the skill — not by this script.
+# Session dispatch is `mocactl spawn --workload <id>` (optionally
+# `--writable` per leaf); no `kubectl cp` is involved.
 #
 # This script does NOT stand up MOCA or Context Service. See the demo
 # README prerequisites.
@@ -154,15 +154,16 @@ mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 
 # Stage the skill: upstream moca-delegate-task SKILL.md, verbatim, with
 # this demo's addendum appended. The addendum carries the scratch-dir
-# overrides (dispatch-and-stop; setup owns the workload; Task is denied;
-# leaves/ bookkeeping). Upstream owns the mechanism; the addendum owns
-# the deltas. Demo-specific posture (which fixture, which leaf is
-# writable, how to chain) lives in the operator's prompts, not here.
+# overrides (dispatch-and-stop; per-spawn pack/create/delete; Task is
+# denied; leaves/ bookkeeping). Upstream owns the mechanism; the
+# addendum owns the deltas. Demo-specific posture (which fixture, which
+# leaf is writable, how to chain) lives in the operator's prompts.
 staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
 cat "${UPSTREAM_SKILL}" "${SCRIPT_DIR}/skill/addendum.md" > "${staged_skill}"
 
-# The fixture the demo's two leaves share, packed into a workspace .context
-# bundle for Context Service.
+# The fixture the demo's leaves pack into their own .context bundles at
+# dispatch time. Staged here so the agent's pack command sees a stable
+# path (./example_repo relative to the scratch dir).
 cp -R "${SCRIPT_DIR}/example_repo" "${SCRATCH_DIR}/example_repo"
 
 # Purge any Python bytecode left in the fixture from a prior in-tree test run
@@ -175,41 +176,22 @@ find "${SCRATCH_DIR}/example_repo" \
   \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
   -prune -exec rm -rf {} +
 
-echo "==> Packing fixture as a workspace context bundle..."
-# ctx pack produces a .context file (gzipped tar) under workspace/, with
-# every file sha256-pinned by the resulting revision. The upload limits
-# (10,000 entries, 256 MiB per file, 1 GiB expanded) are enforced client-
-# side, so an oversized fixture fails before upload.
-CONTEXT_BUNDLE="${SCRATCH_DIR}/example_repo.context"
-contextctl ctx pack "${SCRATCH_DIR}/example_repo" --type workspace \
-  --output "${CONTEXT_BUNDLE}"
-
-echo "==> Creating the shared workload..."
-# One workload per demo run, shared by every leaf the operator dispatches
-# against it. Writes do NOT persist across runs (that is phase-2 workloads,
-# https://github.com/rossoctl/moca/issues/476).
-WORKLOAD_JSON="$(SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" \
-  mocactl workloads create --context "${CONTEXT_BUNDLE}" --json)"
-WORKLOAD_ID="$(printf '%s' "${WORKLOAD_JSON}" | jq -r '.workloadId')"
-if [[ -z "${WORKLOAD_ID}" || "${WORKLOAD_ID}" == "null" ]]; then
-  echo "    workloads create did not return a workloadId:" >&2
-  echo "    ${WORKLOAD_JSON}" >&2
-  exit 1
-fi
-echo "    created workload ${WORKLOAD_ID}"
-
 # One demo tag per scratch dir. mocactl's subagent ledger is machine-global;
-# the tag is what scopes listing and teardown to this demo instance.
+# the tag is what scopes listing and teardown to this demo instance. The
+# agent uses it to tag every leaf it spawns.
 TAG="chained-$(date +%Y%m%d-%H%M%S)"
 
+# Pack + workload create run per leaf, driven by the agent through the
+# skill. MOCA.md intentionally does not carry a workload id — there isn't
+# one shared across the run anymore. Each leaf's note in leaves/<label>.json
+# records its own workloadId.
 cat > "${SCRATCH_DIR}/MOCA.md" <<EOF
 # MOCA runtime facts for this demo run
 
 Control plane URL:     ${CP_URL}
 Harness URL:           ${HARNESS_URL}
 Demo tag:              ${TAG}
-Workload id:           ${WORKLOAD_ID}
-Context bundle:        ./example_repo.context
+Fixture dir:           ./example_repo
 Leaves dir:            ./leaves
 
 Every mocactl command run from this directory needs the port-forward URLs

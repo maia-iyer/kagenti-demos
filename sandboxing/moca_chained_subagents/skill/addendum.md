@@ -7,22 +7,59 @@ The rules below **override** the upstream flow where they conflict.
 
 ### Preconditions
 
-`MOCA.md` holds this run's facts. Pull `WORKLOAD_ID` and `TAG` into shell
-variables once per turn:
+`MOCA.md` holds this run's facts. Pull `TAG` into a shell variable
+once per turn:
 
 ```bash
 TAG="$(sed -nE 's/^Demo tag:[[:space:]]+//p' MOCA.md)"
-WORKLOAD_ID="$(sed -nE 's/^Workload id:[[:space:]]+//p' MOCA.md)"
 ```
 
 `SH_CONTROL_PLANE_URL` and `SH_HARNESS_URL` are injected via
-`.claude/settings.json`.
+`.claude/settings.json`. If `MOCA.md` is missing, stop and ask the
+operator to re-run `setup.sh`.
 
-### Overrides
+### The fixture
 
-- **Skip pack + workload create + workload delete.** `setup.sh` /
-  `teardown.sh` own them. If `MOCA.md` is missing, stop and ask the
-  operator to re-run `setup.sh`.
+The directory to pack is `./example_repo` (relative to this scratch
+dir, staged by `setup.sh`). Pass it to `contextctl ctx pack` as
+`--type workspace`. Do not pack anything else — the demo's leaves are
+written against this fixture.
+
+### Per-spawn pack + create, post-collection delete
+
+Each leaf owns its own workload. Upstream's full
+pack → create → spawn → get → delete sequence runs **per leaf**, not
+once per demo run:
+
+1. Before `mocactl spawn`, pack the fixture and create a workload:
+
+   ```bash
+   contextctl ctx pack ./example_repo --type workspace \
+     -o leaves/<label>.context
+   WORKLOAD_ID="$(mocactl workloads create \
+     --context leaves/<label>.context --json | jq -r '.workloadId')"
+   ```
+
+   Record `WORKLOAD_ID` on the leaf's note (below). The `.context`
+   bundle on disk is a cache you can delete after the workload is up;
+   it is not needed again.
+
+2. Spawn with that workload id (and `--writable` if the leaf edits
+   files), tagged with `$TAG`.
+
+3. On successful `mocactl get` (terminal status, result written),
+   delete the workload:
+
+   ```bash
+   mocactl workloads delete "$WORKLOAD_ID"
+   ```
+
+   Add `deletedAt` to the note. If `get` is still non-terminal, leave
+   the workload alive — delete pairs with **collection**, not with
+   dispatch.
+
+### Other overrides
+
 - **`Task` is denied.** This skill is the only subagent path. Do not
   shell out to `curl` against MOCA's HTTP API.
 - **Dispatch-and-stop.** After `mocactl spawn`, write the note, report
@@ -40,9 +77,11 @@ WORKLOAD_ID="$(sed -nE 's/^Workload id:[[:space:]]+//p' MOCA.md)"
 ### Bookkeeping in `leaves/`
 
 - Prompt: `leaves/<label>.prompt.txt`.
+- Bundle: `leaves/<label>.context` (transient; delete after create).
 - Note: `leaves/<label>.json` with
-  `{label, sessionId, kind, writable, promptFile, dispatchedAt}`.
+  `{label, sessionId, workloadId, kind, writable, promptFile, dispatchedAt}`.
 - Result: `leaves/<sessionId>.text` via `mocactl get --out leaves --json`.
-  Add `collectedAt` to the note after collecting.
+  Add `collectedAt` and `deletedAt` to the note after collecting and
+  deleting the workload.
 
 Use a fresh label when re-dispatching (`fix` → `fix2`).
