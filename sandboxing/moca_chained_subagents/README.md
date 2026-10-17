@@ -296,16 +296,19 @@ whichever port you choose for it (`9090` by default).
 ```bash
 export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
 mocactl login
-printf %s "$ANTHROPIC_API_KEY" | mocactl credentials add anthropic \
-  --host api.anthropic.com --kind api-key \
-  --endpoint https://api.anthropic.com
+# ANTHROPIC_BASE_URL points at an Anthropic-compatible endpoint (e.g. a
+# LiteLLM gateway); ANTHROPIC_AUTH_TOKEN is the bearer token for it.
+printf %s "$ANTHROPIC_AUTH_TOKEN" | mocactl credentials add anthropic \
+  --host "$(printf %s "$ANTHROPIC_BASE_URL" | awk -F/ '{print $3}')" --kind bearer \
+  --endpoint "$ANTHROPIC_BASE_URL"
 mocactl doctor
 ```
 
-For an Anthropic-compatible proxy (e.g. a LiteLLM gateway) that expects
-`Authorization: Bearer`, use `--kind bearer` and point `--host` /
-`--endpoint` at the proxy (`--kind api-key` is only validated against
-`api.anthropic.com`).
+`--kind bearer` is required for Anthropic-compatible proxies that expect
+`Authorization: Bearer` (`--kind api-key` is only validated against
+`api.anthropic.com`). To talk directly to `api.anthropic.com` with an
+`ANTHROPIC_API_KEY`, swap in `--host api.anthropic.com --kind api-key
+--endpoint https://api.anthropic.com` and pipe `$ANTHROPIC_API_KEY`.
 
 `mocactl doctor` must go all-green before `./setup.sh`.
 

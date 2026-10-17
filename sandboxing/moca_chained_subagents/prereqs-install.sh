@@ -86,7 +86,11 @@ echo "==> 4/5 Context Service image + manifest"
 kind load docker-image dev.local/context-service:local --name "${KIND_CLUSTER}"
 
 # Rewrite the namespace: the manifest ships `serverless-harness`, MOCA
-# requires `context-service`.
+# requires `context-service`. The upstream manifest has no Namespace
+# resource of its own, so create it before applying.
+kubectl --context "${KUBE_CONTEXT}" create namespace context-service \
+  --dry-run=client -o yaml |
+  kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
 sed 's/namespace: serverless-harness/namespace: context-service/g' \
     "${CONTEXT_SERVICE_DIR}/deploy/context-service.yaml" |
   kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
@@ -130,9 +134,11 @@ Then, once per machine:
 
   export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
   mocactl login
-  printf %s "\$ANTHROPIC_API_KEY" | mocactl credentials add anthropic \\
-    --host api.anthropic.com --kind api-key \\
-    --endpoint https://api.anthropic.com
+  # ANTHROPIC_BASE_URL points at an Anthropic-compatible endpoint (e.g. a
+  # LiteLLM gateway); ANTHROPIC_AUTH_TOKEN is the bearer token for it.
+  printf %s "\$ANTHROPIC_AUTH_TOKEN" | mocactl credentials add anthropic \\
+    --host "\$(printf %s "\$ANTHROPIC_BASE_URL" | awk -F/ '{print \$3}')" --kind bearer \\
+    --endpoint "\$ANTHROPIC_BASE_URL"
   mocactl doctor
 
 Then run this demo's ./setup.sh.
