@@ -7,15 +7,16 @@
 # script does the demo-specific setup:
 #   1. Verify the toolchain and that mocactl can drive the install end to
 #      end (mocactl doctor).
-#   2. Pack the fixture into a workspace .context bundle, create a workload
-#      from it, and record the workload id in MOCA.md. The two leaves of
-#      this run share that workload: the diagnose leaf mounts it read-only,
-#      the fix leaf gets its own writable copy per run.
-#   3. Stage a scratch dir: a leaves/ dir for prompts/notes/results, the
-#      moca-dispatch skill, and Claude Code settings pointing at this run.
+#   2. Stage a scratch dir whose contents are the example_repo project
+#      (so `./` at the parent's cwd matches `./` at the leaf's cwd),
+#      plus a leaves/ dir for prompts/notes/results, a moca-delegate-task
+#      skill (upstream SKILL.md, verbatim),
+#      and Claude Code settings pointing at this run.
 #
-# Session dispatch happens later via `mocactl spawn --workload <id>` (and
-# `--writable` for the fix leaf); no `kubectl cp` is involved.
+# Pack + workload create + workload delete happen per leaf at dispatch
+# time, driven by the agent through the skill — not by this script.
+# Session dispatch is `mocactl spawn --workload <id>` (optionally
+# `--writable` per leaf); no `kubectl cp` is involved.
 #
 # This script does NOT stand up MOCA or Context Service. See the demo
 # README prerequisites.
@@ -34,6 +35,16 @@ CP_PORT="${CP_PORT:-8090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
+
+# Upstream MOCA checkout — holds the moca-delegate-task skill, staged
+# verbatim into the scratch dir. This demo adds no overrides: the two
+# operator prompts (one per leaf) carry the demo-specific details
+# (pack `./example_repo`, tag `moca-chained-subagents-demo`).
+# No default — operators clone rossoctl/moca themselves (see README
+# Prerequisites) and point MOCA_DIR at it. Same variable that
+# prereqs-install.sh reads.
+MOCA_DIR="${MOCA_DIR:-}"
+UPSTREAM_SKILL="${MOCA_DIR}/skills/moca-delegate-task/SKILL.md"
 
 echo "==> Prerequisite checks..."
 
@@ -74,6 +85,23 @@ if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
   exit 1
 fi
 echo "    ok: namespace ${MOCA_NS} exists"
+
+if [[ -z "${MOCA_DIR}" ]]; then
+  echo "    MOCA_DIR is not set. This demo stages upstream MOCA's" >&2
+  echo "    moca-delegate-task SKILL.md verbatim into the scratch dir." >&2
+  echo "    Point MOCA_DIR at your rossoctl/moca checkout:" >&2
+  echo "      MOCA_DIR=/path/to/rossoctl/moca ./setup.sh" >&2
+  echo "    (See README Prerequisites > Checkouts for the clone commands.)" >&2
+  exit 1
+fi
+if [[ ! -f "${UPSTREAM_SKILL}" ]]; then
+  echo "    upstream skill not found: ${UPSTREAM_SKILL}" >&2
+  echo "    MOCA_DIR=${MOCA_DIR} does not look like a rossoctl/moca" >&2
+  echo "    checkout. Expected: \${MOCA_DIR}/skills/moca-delegate-task/SKILL.md" >&2
+  echo "    Verify the path and that the checkout is up to date (git pull)." >&2
+  exit 1
+fi
+echo "    ok: upstream skill at ${UPSTREAM_SKILL}"
 
 echo "==> Running mocactl doctor..."
 # doctor (with the port-forward URLs via env) covers everything the old setup
@@ -125,7 +153,8 @@ echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
 # Fresh staging on every run: the demo tag is per-run, so notes and results
 # from an earlier run would be orphaned. Collect results before re-running.
 rm -rf "${SCRATCH_DIR}"
-mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-dispatch" "${SCRATCH_DIR}/leaves"
+mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-delegate-task" \
+         "${SCRATCH_DIR}/leaves"
 
 # Claude Code settings, patched to point mocactl at the port-forwards.
 # mocactl itself is already on PATH — verified above, not patched.
@@ -136,54 +165,45 @@ jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" \
    "${SCRATCH_DIR}/.claude/settings.json" >"${settings_tmp}"
 mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 
-# The dispatch skill — the agent flow's mechanism contract (the by-hand
-# appendix in the README never reads it; a Claude session does).
-cp "${SCRIPT_DIR}/skill/SKILL.md" \
-   "${SCRATCH_DIR}/.claude/skills/moca-dispatch/SKILL.md"
+# Stage the skill verbatim from upstream. The demo's two operator
+# prompts carry what's specific here (which directory to pack, which
+# tag to use); the skill itself needs no demo-local override.
+staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
+cp "${UPSTREAM_SKILL}" "${staged_skill}"
 
-# The fixture the demo's two leaves share, packed into a workspace .context
-# bundle for Context Service.
+# The project the leaves pack lives at ./example_repo in the scratch dir —
+# NOT at the scratch dir root. Keeping it as a subdir means `leaves/` and
+# `.claude/` (parent-side bookkeeping) do not get picked up when the agent
+# runs `contextctl ctx pack ./example_repo`. Each leaf's workload then
+# contains only the fixture, independent of how many leaves ran before.
 cp -R "${SCRIPT_DIR}/example_repo" "${SCRATCH_DIR}/example_repo"
 
 # Purge any Python bytecode left in the fixture from a prior in-tree test run
-# (e.g. verifying the fixture locally). A .pyc file is tagged with the Python
-# version that produced it (e.g. greet.cpython-311.pyc); the sandbox's Python
-# may be a different minor version and would ignore or reject it, and leaf
-# prompts assume a clean fixture. (`contextctl ctx pack` does not yet honor
-# .gitignore, so this purge is what keeps those files out of the bundle.)
+# (e.g. verifying it locally). A .pyc file is tagged with the Python version
+# that produced it (e.g. greet.cpython-311.pyc); the sandbox's Python may be
+# a different minor version and would ignore or reject it. (`contextctl ctx
+# pack` does not yet honor .gitignore, so this purge is what keeps those
+# files out of the bundle.)
 find "${SCRATCH_DIR}/example_repo" \
   \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
   -prune -exec rm -rf {} +
 
-echo "==> Packing fixture as a workspace context bundle..."
-# ctx pack produces a .context file (gzipped tar) under workspace/, with
-# every file sha256-pinned by the resulting revision. The upload limits
-# (10,000 entries, 256 MiB per file, 1 GiB expanded) are enforced client-
-# side, so an oversized fixture fails before upload.
-CONTEXT_BUNDLE="${SCRATCH_DIR}/example_repo.context"
-contextctl ctx pack "${SCRATCH_DIR}/example_repo" --type workspace \
-  --output "${CONTEXT_BUNDLE}"
-
-echo "==> Creating the shared workload..."
-# One workload per demo run, shared by both leaves: the diagnose leaf mounts
-# it read-only, the fix leaf gets its own writable per-run copy via --writable.
-# Writes do NOT persist across runs (that is phase-2 workloads,
-# https://github.com/rossoctl/moca/issues/476).
-WORKLOAD_JSON="$(SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" \
-  mocactl workloads create --context "${CONTEXT_BUNDLE}" --json)"
-WORKLOAD_ID="$(printf '%s' "${WORKLOAD_JSON}" | jq -r '.workloadId')"
-if [[ -z "${WORKLOAD_ID}" || "${WORKLOAD_ID}" == "null" ]]; then
-  echo "    workloads create did not return a workloadId:" >&2
-  echo "    ${WORKLOAD_JSON}" >&2
-  exit 1
-fi
-echo "    created workload ${WORKLOAD_ID}"
+# .envrc gives operators driving the by-hand flow a one-line way to pick
+# up the port-forward URLs in a plain shell. Claude Code sessions still
+# inherit the same env via .claude/settings.json; this is the sibling
+# for `source .envrc` from a plain `bash`/`zsh`.
+cat > "${SCRATCH_DIR}/.envrc" <<EOF
+export SH_CONTROL_PLANE_URL=${CP_URL}
+export SH_HARNESS_URL=${HARNESS_URL}
+EOF
 
 echo "==> Promoting the two config bundles..."
 # Config bundles carry each leaf's skills + commands (NOT CLAUDE.md). They
 # travel server-held and content-addressed, picked up at dispatch time via
 # `mocactl spawn --config <digest>`. The diagnose leaf runs with the
 # public-only posture; the fix leaf runs with the full-access posture.
+# Workloads themselves are per-leaf and created by the agent at dispatch
+# time (not by setup) — see the moca-delegate-task skill.
 promote_bundle() {
   local dir="$1"
   local label="$2"
@@ -204,39 +224,33 @@ echo "    promoted public-only  ${DIGEST_PUBLIC}"
 DIGEST_FULL="$(promote_bundle "${SCRIPT_DIR}/bundles/full" full)"
 echo "    promoted full         ${DIGEST_FULL}"
 
-# One demo tag per scratch dir. mocactl's subagent ledger is machine-global;
-# the tag is what scopes listing and teardown to this demo instance.
-TAG="chained-$(date +%Y%m%d-%H%M%S)"
-
+# Record the two digests + run facts in the scratch dir so a resumed Claude
+# session (or an operator driving the by-hand flow) can reconstruct them
+# without re-running `mocactl promote`.
 cat > "${SCRATCH_DIR}/MOCA.md" <<EOF
 # MOCA runtime facts for this demo run
 
 Control plane URL:     ${CP_URL}
 Harness URL:           ${HARNESS_URL}
-Demo tag:              ${TAG}
-Workload id:           ${WORKLOAD_ID}
 Config digest public:  ${DIGEST_PUBLIC}
 Config digest full:    ${DIGEST_FULL}
-Context bundle:        ./example_repo.context
+Project to pack:       ./example_repo
 Leaves dir:            ./leaves
 
 Every mocactl command run from this directory needs the port-forward URLs
-in the environment (the staged .claude/settings.json does this for Claude):
-
-  export SH_CONTROL_PLANE_URL=${CP_URL}
-  export SH_HARNESS_URL=${HARNESS_URL}
+in the environment (the staged .claude/settings.json does this for Claude;
+a plain shell picks them up via \`source .envrc\`).
 
 Notes:
-- Both leaves share workload ${WORKLOAD_ID}. The diagnose leaf dispatches
-  with '--config ${DIGEST_PUBLIC} --workload ${WORKLOAD_ID}' (read-only).
-  The fix leaf dispatches with '--config ${DIGEST_FULL} --workload
-  ${WORKLOAD_ID} --writable' and gets its own copy, discarded when the run
-  ends.
+- The diagnose leaf dispatches with '--config ${DIGEST_PUBLIC}' (public-
+  posture skill, read-only workload). The fix leaf dispatches with
+  '--config ${DIGEST_FULL} --writable' (full-access skill, per-run
+  writable copy of the workload).
+- The agent packs ./example_repo and creates one workload per leaf at
+  dispatch time; those workloads are released after collection.
 - Each child's identity is (config digest, workload revision, sessionId) —
   three sha256-pinned handles, all server-held, all reconstructable from
-  this file + the mocactl ledger.
-- Leaf cwd is the workload's view (or writable copy): project files are
-  immediately visible with 'pwd' / 'ls'. There is no fixture-seeding step.
+  this file plus the mocactl ledger.
 - There is no cancel; a dispatched leaf runs to completion. Results persist
   server-side for 24h — collect with 'mocactl get <sessionId>' inside that
   window.
@@ -260,10 +274,8 @@ echo "     (spawn, collect, chain) is the demo README's 'Appendix: running"
 echo "     the flow by hand':"
 echo ""
 echo "       cd ${SCRATCH_DIR}"
-echo "       export SH_CONTROL_PLANE_URL=${CP_URL} SH_HARNESS_URL=${HARNESS_URL}"
-echo "       mocactl spawn \"\$(cat leaves/diagnose.prompt.txt)\" \\"
-echo "         --config ${DIGEST_PUBLIC} \\"
-echo "         --kind prompt --workload ${WORKLOAD_ID} --tag ${TAG} --json"
+echo "       source .envrc    # or: export the two URLs by hand"
+echo "     The two config digests to dispatch leaves with are in MOCA.md."
 echo ""
 echo "  3. Or start Claude from the scratch dir and drive it with operator"
 echo "     prompts (the agent flow — see the README's 'Run a session'):"

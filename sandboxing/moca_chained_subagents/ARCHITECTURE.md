@@ -16,12 +16,12 @@ flowchart LR
     subgraph cc["Claude Code — parent session<br/>cwd = ~/tmp/moca-chained-scratch"]
       direction TB
       TASK["Task tool<br/>DENIED"]:::denied
-      SKILL["skill: moca-dispatch<br/>(mechanism contract)"]
+      SKILL["skill: moca-delegate-task<br/>(upstream, verbatim)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · example_repo.context<br/>bundles/public-only/ · bundles/full/<br/>leaves/*.prompt.txt · *.json · *.text<br/>.claude/settings.json")]
+    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · bundles/public-only/ · bundles/full/<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
-    CTXCTL["contextctl<br/>(ctx pack @ setup time)"]
+    CTXCTL["contextctl<br/>(ctx pack @ dispatch time, per leaf)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
     WORKER["detached worker per leaf<br/>holds sync POST /v1/runs"]
     AUTH[("~/.config/mocactl<br/>tokens — Read DENIED")]:::denied
@@ -47,11 +47,12 @@ flowchart LR
     end
   end
 
-  OP -->|"prompt 1..5"| cc
+  OP -->|"prompt 1..4"| cc
   cc -.->|"re-routes to"| SKILL
   SKILL --> BASH
   BASH --> MOCACTL
-  CTXCTL -->|"setup only"| SCRATCH
+  BASH --> CTXCTL
+  CTXCTL -->|"writes leaves/LABEL.context"| SCRATCH
   cc <--> SCRATCH
   MOCACTL --- AUTH
   MOCACTL --> LEDGER
@@ -68,8 +69,8 @@ flowchart LR
   CP --- BUNDLES
   SUP --- RESULTS
   CS --- REV
-  SUP -->|"apply config overlay<br/>(skills from DIGEST)"| POD0
   SUP -->|"fetch frozen revision<br/>(read-only or writable copy)"| CS
+  SUP -->|"apply config overlay<br/>(skills from DIGEST)"| POD0
   SUP -->|"mount workload view at<br/>/workspace/.moca-context/runs/&lt;sid&gt;"| POD0
   SUP --> POD1
 
@@ -95,34 +96,39 @@ sequenceDiagram
 
   OP->>CC: "Dispatch a subagent to diagnose…"
   CC->>FS: write leaves/LABEL.prompt.txt
-  CC->>MC: mocactl spawn --kind prompt --config DIGEST<br/>--workload WLID [--writable] --tag TAG --json
+  CC->>FS: contextctl ctx pack . -> leaves/LABEL.context
+  CC->>MC: mocactl workloads create --context leaves/LABEL.context --json
+  MC->>CS: upload bundle
+  MC-->>CC: workloadId WLID
+  CC->>MC: mocactl spawn --kind prompt --config DIGEST --workload WLID [--writable] --tag TAG --json
   Note over CC,MC: permission prompt = operator's visual confirmation<br/>digest and workload id visible on the command line
   MC->>SV: create session; configRef=DIGEST, workloadId=WLID
   SV-->>MC: sessionId
-  MC->>W: fork detached worker
+  MC->>W: fork (detached)
   MC-->>CC: stdout — type=session, sessionId, pid
-  CC->>FS: write leaves/LABEL.json — label, config, workload, writable
-  W->>SV: POST /v1/runs — synchronous, no disconnect-abort
-  CC-->>OP: dispatched, sessionId=… then STOPS, no polling
+  CC->>FS: write leaves/LABEL.json — label, sessionId, workloadId, configDigest
+  W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
+  CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
   Note over SV,SB: leaf runs server-side — session pins to one pod on first turn
   SV->>SB: apply config overlay — skills and commands from DIGEST
-  SV->>CS: fetch frozen revision lazily, cached per user and revision
-  CS-->>SV: bundle bytes streamed, sha256-verified
-  SV->>SB: mount view at /workspace/.moca-context/runs/sid<br/>read-only, or writable per-run copy
+  SV->>CS: fetch frozen revision (lazy, cached per user+revision)
+  CS-->>SV: bundle bytes (streamed, sha256-verified)
+  SV->>SB: mount view at /workspace/.moca-context/runs/sid<br/>(read-only, or writable per-run copy)
   SV->>SB: leaf tool calls, cwd = that mount
   SB-->>SV: final message
-  SV->>SV: persist result BEFORE responding, 24h TTL
-  SV-->>W: 200 — worker may already be dead, irrelevant
+  SV->>SV: persist result BEFORE responding (24h TTL)
+  SV-->>W: 200 (worker may already be dead — irrelevant)
 
   Note over OP,CC: minutes or hours later — may be a brand-new Claude session
   OP->>CC: "Check on that subagent."
   CC->>MC: mocactl get SID --out leaves --json
   MC->>SV: fetch result
   SV-->>MC: status — queued, responded, failed or paused
-  MC->>FS: write leaves/SID.text when responded
+  MC->>FS: write leaves/SID.text (when responded)
   CC->>FS: read result
-  CC-->>OP: surface diagnosis, or still running and stop
+  CC->>MC: mocactl workloads delete WLID (after collection)
+  CC-->>OP: surface diagnosis (or still running, and stop)
 ```
 
 ## Chaining: context flows as prompt text only
@@ -135,8 +141,7 @@ primitive, and neither leaf knows a chain exists.
          ┌──────────────────────────┐          ┌──────────────────────────┐
          │ session A                │          │ session B                │
          │ config  DIGEST_PUBLIC    │          │ config  DIGEST_FULL      │
-         │   (public-posture skill) │          │   (full-access skill)    │
-         │ workload WLID            │          │ workload WLID (same)     │
+         │ workload WLID_A          │          │ workload WLID_B          │
          │   mounted READ-ONLY      │          │   WRITABLE per-run copy  │
          │ runs tests, reports      │          │ edits src/, runs tests   │
          └────────────┬─────────────┘          └────────────┬─────────────┘
@@ -147,15 +152,14 @@ primitive, and neither leaf knows a chain exists.
                       │  parent inlines VERBATIM             │
                       └────────► leaves/fix.prompt.txt       └──► report to operator
 
-   Both leaves share one workload but boot with different config
-   bundles — same files, different posture. Each child's identity is
-   the triple (config digest, workload revision, sessionId), all
-   sha256-pinned and server-held.
-
-   The writable copy is per-run and discarded on completion — nothing
-   persists across runs (that is phase-2 workloads,
-   https://github.com/rossoctl/moca/issues/476). No file paths cross
-   the leaf boundary.
+   Each leaf has its own workload, packed and created at dispatch and
+   deleted after collection, and boots with its own content-addressed
+   config bundle — same `mocactl spawn`, different posture. Each
+   child's identity is the triple (config digest, workload revision,
+   sessionId), all sha256-pinned and server-held. The writable copy is
+   per-run and discarded on completion — nothing persists across runs
+   (that is phase-2 workloads, https://github.com/rossoctl/moca/issues/476).
+   No file paths cross the leaf boundary.
 ```
 
 Isolation is substrate-enforced at the session level (each session
@@ -167,7 +171,7 @@ a sequential chain.
 
 | Boundary | What it guarantees | What it does not |
 | --- | --- | --- |
-| `Task` denied + `moca-dispatch` skill | Subagent work cannot run in-process on the laptop | — |
+| `Task` denied + `moca-delegate-task` skill | Subagent work cannot run in-process on the laptop | — |
 | `mocactl` owns auth (`~/.config/mocactl`, Read-denied) | Demo stores no secret; no token plumbing | — |
 | Promoted config bundle, sha256-pinned | The skills (and commands) a leaf boots with are content-addressed and server-held; two leaves can share one workload but differ in posture | Ships skills + commands only — a `CLAUDE.md` under the promoted dir is NOT included and does not travel to the sandbox |
 | Workload mount read-only (diagnose leaf) | The diagnose leaf cannot alter the shared revision | — |
