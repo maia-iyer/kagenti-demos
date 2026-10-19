@@ -102,11 +102,11 @@ sequenceDiagram
   MC-->>CC: workloadId WLID
   CC->>MC: mocactl spawn --kind prompt --config DIGEST --workload WLID [--writable] --tag TAG --json
   Note over CC,MC: permission prompt = operator's visual confirmation<br/>digest and workload id visible on the command line
-  MC->>SV: create session; configRef=DIGEST, workloadId=WLID
+  MC->>SV: create session with configRef and workloadId
   SV-->>MC: sessionId
   MC->>W: fork (detached)
   MC-->>CC: stdout — type=session, sessionId, pid
-  CC->>FS: write leaves/LABEL.json — label, sessionId, workloadId, configDigest
+  CC->>FS: write leaves/LABEL.json — label · sessionId · workloadId · configDigest
   W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
   CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
