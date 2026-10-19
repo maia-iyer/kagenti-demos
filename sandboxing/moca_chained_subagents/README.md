@@ -263,12 +263,11 @@ not encode the flow; you drive it.
 > Dispatch a subagent to diagnose why the project at `./example_repo`
 > is failing its tests. Pack `./example_repo`, dispatch with the
 > **public-only** config digest from `MOCA.md` (`--config $DIGEST_PUBLIC`),
-> and tag the spawn with `moca-chained-subagents-demo`. The leaf is
-> read-only — do not pass `--writable` and tell it not to modify files.
-> `mocactl spawn` must be the last tool call of this turn — do not
-> call `get`, `subagents`, or `sleep` after it, and do not wait. The
-> leaf runs durably server-side; end the turn as soon as the note is
-> written.
+> read-only (no `--writable`), tag `moca-chained-subagents-demo`.
+> Tell the leaf to use its `public-research` skill. `mocactl spawn`
+> must be the last tool call of this turn — do not call `get`,
+> `subagents`, or `sleep` after it, and do not wait. End the turn as
+> soon as the note is written.
 
 Claude should:
 
@@ -301,14 +300,15 @@ record `collectedAt` / `deletedAt` on the note.
 
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
-> Good. Dispatch another subagent to apply that fix, run the tests,
-> and report the change and outcome. Pack `./example_repo`, dispatch
-> with the **full** config digest from `MOCA.md` (`--config $DIGEST_FULL`)
-> and `--writable`, and tag it `moca-chained-subagents-demo`.
-> Inline the diagnosis from the previous leaf verbatim into the new
-> prompt. `mocactl spawn` must be the last tool call of this turn —
-> do not call `get`, `subagents`, or `sleep` after it, and do not
-> wait. End the turn as soon as the note is written.
+> Good. Dispatch another subagent to apply that fix. Pack
+> `./example_repo`, dispatch with the **full** config digest from
+> `MOCA.md` (`--config $DIGEST_FULL`) and `--writable`, tag
+> `moca-chained-subagents-demo`. Tell the leaf to use its
+> `full-access-fix` skill and inline the previous leaf's diagnosis
+> verbatim into the prompt. `mocactl spawn` must be the last tool
+> call of this turn — do not call `get`, `subagents`, or `sleep`
+> after it, and do not wait. End the turn as soon as the note is
+> written.
 
 Claude dispatches a second leaf, which packs the project subdir again
 and creates its own workload (**with `--writable`**), with the
@@ -626,26 +626,15 @@ DIGEST_FULL="$(grep -E '^Config digest full:'   MOCA.md | awk '{print $NF}')"
 
 ```bash
 cat > leaves/diagnose.prompt.txt <<'EOF'
-You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is this run's view of a small Python project — do not cd elsewhere.
-The files are mounted read-only.
-
-The project's tests currently fail. Run the test suite
-(`python3 -m unittest discover -s tests`), read the relevant code and the
-docs under docs/upstream-refs/, and report:
-1. The exact failing assertion and the test command that exercises it.
-2. The root cause, with file paths and line references.
-3. The minimal change that would fix it, described precisely — another agent
-   will apply it on its own writable copy of this project.
-
-The project is stdlib-only; do NOT install or download anything (no `pip`,
-no package manager). Diagnose from the source and docs alone.
-
-Do NOT edit any files: this is a diagnosis-only task, and the mount is
-read-only anyway. End your turn with the full diagnosis as your final
-message.
+Use the public-research skill. The project's tests currently fail —
+diagnose why. The relevant docs are under docs/upstream-refs/.
 EOF
 ```
+
+The `public-research` skill (shipped by the public-only bundle) carries
+the posture, the test command, the "no edits / stdlib-only / end with
+the full report" rules, and the deliverable shape. The prompt only has
+to name the task.
 
 **2 — pack the project subdir and create this leaf's workload:**
 
@@ -716,29 +705,21 @@ each leaf has its own view / writable copy):
 ```bash
 DIAG="$(cat leaves/"$SID".text)"
 cat > leaves/fix.prompt.txt <<EOF
-You are a subagent leaf running inside a MOCA sandbox. Your current working
-directory is this run's own writable copy of a small Python project — do not
-cd elsewhere. The copy is discarded when this run ends, so anything you want
-to return must be in your final message.
-
-A prior agent diagnosed a test failure in a fresh copy of this project:
+Use the full-access-fix skill. A prior agent produced this diagnosis
+of the failing tests:
 
 ------------------------------------------------------------------------
 $DIAG
 ------------------------------------------------------------------------
 
-Apply the fix — edit src/, never vendor/ — then run
-\`python3 -m unittest discover -s tests\` to confirm the suite passes. The
-project is stdlib-only; do NOT install or download anything (no \`pip\`, no
-package manager). Report:
-1. The exact change you made (file, line, before/after).
-2. The full test output after your change (verbatim, including the
-   \`Ran N tests\` and \`OK\` / \`FAILED\` lines).
-
-End your turn with the full report as your final message. There will be no
-other record of your edits — the writable copy will be gone.
+Apply the fix and verify.
 EOF
 ```
+
+The `full-access-fix` skill (shipped by the full bundle) carries the
+testing convention, the src/-not-vendor/ rule, the "no pip" rule, and
+the verbatim-test-output deliverable. The prompt only has to pass
+through the prior leaf's diagnosis.
 
 Pack a fresh workload for the fix leaf, dispatch it with `--writable`,
 then collect and release. `get` exit 1 with "has not finished yet"
