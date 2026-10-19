@@ -835,3 +835,82 @@ per-pod-instance and doesn't come back. The leaf eventually
 disappeared, but "eventually" is several minutes while the leaf's
 model retries its tools with growing backoff — too slow for a live
 beat. The "What survives" table above has the one-line summary.
+
+## Appendix: watching state move during the demo
+
+Three state types travel through this chain. All are reachable with
+`mocactl` from the operator's shell — no `kubectl exec`, no admin
+access to the cluster. Run these in a side terminal while the main
+chain runs.
+
+Set these once (either `source .envrc`, or paste from the scratch
+dir's `MOCA.md`):
+
+```bash
+cd ~/tmp/moca-chained-scratch && source .envrc
+TAG=moca-chained-subagents-demo
+SID=$(jq -r .sessionId leaves/diagnose.json)
+WLID=$(jq -r .workloadId leaves/diagnose.json)
+```
+
+### 1. Config bundle — sha256-pinned skills (control plane)
+
+Promoted at `./setup.sh` time; same handle for every dispatch until
+teardown. Carries skills + commands, nothing else. `mocactl` has no
+`bundles list` yet, so the operator-visible record is the two digests
+setup wrote into `MOCA.md`, plus the `bundle` field on each session:
+
+```bash
+grep '^Config digest' MOCA.md             # the two promoted digests
+mocactl subagents --tag "$TAG" --json \
+  | jq -r '.subagents[] | "\(.sessionId[:12])  \(.bundle)"'
+```
+
+The bundle field on each row tells you which posture that leaf booted
+with. After `./teardown.sh`, `mocactl bundles delete` has freed both.
+
+### 2. Workload — sha256-pinned files (Context Service)
+
+Created per leaf at dispatch, released after collection. Carries
+the fixture tree the leaf mounts.
+
+```bash
+mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
+```
+
+The `revision` is the sha256 of the file tree; the `status` moves
+`creating` → `awaiting_upload` → `ready` → `deleted`. Watch it
+transition during a dispatch by re-running the command.
+
+### 3. Session — the per-leaf join (control plane)
+
+The record that ties this leaf to one config bundle + one workload +
+one sandbox pod. 24h TTL on the result.
+
+```bash
+mocactl get "$SID" --json | jq .
+# status progresses: queued → responded (or failed / paused)
+```
+
+Once the leaf has finished:
+
+```bash
+mocactl subagents --tag "$TAG"              # ledger view: this run's leaves
+cat leaves/"$SID".text | head                # the leaf's final message
+```
+
+### What the demo tag scopes
+
+`moca-chained-subagents-demo` is the operator-side handle for *"this
+demo's leaves"*. Scopes `mocactl subagents --tag`, teardown's
+reconciler, and nothing else — it's not a server-side identity.
+
+### What's NOT visible from the client
+
+- Which sandbox pod the session pinned to (lives in Redis
+  `sh:sandbox:affinity:<sid>`; no client-side query today).
+- The audit stream (`session_created`, `credential_issued` events).
+- Supervisor / control plane / Context Service logs are silent at
+  steady state — they emit nothing per-request at default verbosity,
+  so there's no useful log tail to project. The visible state surface
+  is the three `mocactl` commands above, not log streams.
