@@ -110,7 +110,8 @@ session reconstructs the picture from those notes plus
   Probe: `mocactl workloads` must say `workloads needs create, get or delete`.
 - [`contextctl`](https://github.com/rossoctl/context-service) with the
   `ctx pack` subcommand (build from main — `make build` — until a release
-  with workspace bundles ships).
+  with workspace bundles ships). `make build` writes to
+  `<context-service>/bin/contextctl`; put that on `PATH`.
 
 ### Checkouts
 
@@ -135,8 +136,11 @@ CLONE_DIR=<parent-of-both-checkouts> \
 
 The script creates a kind cluster `moca`, runs MOCA's `deploy/k8s/setup.sh`,
 builds and loads the context-service image, and wires the two together.
-Idempotent; re-runnable. Three things it fixes along the way worth
-knowing about:
+Re-runnable on a *clean* cluster: a partially-completed prior run leaves
+namespaces behind, and `kubectl apply` on the manifest then fails with
+`namespaces "moca-credentials" already exists`. If that happens, delete
+and recreate the kind cluster (`kind delete cluster --name moca`) before
+re-running. Three things it fixes along the way worth knowing about:
 
 - **Flaky pod DNS on podman.** The Podman-network resolv.conf often
   points at an unreachable IPv6 nameserver first; the script points
@@ -203,9 +207,10 @@ This:
    login, credential, harness, and an end-to-end scratch session.
 3. Stages the scratch dir at `~/tmp/moca-chained-scratch/`:
    `.claude/settings.json` (with the port-forward URLs injected as env),
-   the `moca-delegate-task` skill (upstream SKILL.md, verbatim), the
-   contents of `example_repo/` copied into the scratch dir's root (so
-   the parent's `./` matches the leaf's `./`), and an empty `leaves/`.
+   the `moca-delegate-task` skill (upstream SKILL.md, verbatim),
+   `example_repo/` as a subdir (so the agent packs just the project,
+   not parent-side bookkeeping), an empty `leaves/`, and an `.envrc`
+   with the two port-forward URLs for by-hand shells.
 
 Setup creates **no workload, no session, and seeds nothing per pod** —
 the agent packs the scratch dir and runs `mocactl workloads create`
@@ -471,7 +476,8 @@ In the scratch dir after `setup.sh`:
 │   ├── settings.json      Permission policy + port-forward env for mocactl
 │   └── skills/
 │       └── moca-delegate-task/SKILL.md   Upstream SKILL.md, verbatim
-├── src/ tests/ vendor/ docs/ README.md   example_repo's contents, at the root
+├── .envrc                 Written by setup.sh — `source .envrc` picks up the port-forward URLs in a plain shell
+├── example_repo/          src/ tests/ vendor/ docs/ README.md — the project the leaves pack
 └── leaves/                Leaf prompts, per-leaf .context bundles, notes (*.json), results (<sid>.text)
 ```
 
