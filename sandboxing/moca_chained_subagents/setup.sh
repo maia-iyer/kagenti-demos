@@ -25,6 +25,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MOCA_NS="${MOCA_NS:-moca}"
+CONTEXT_SERVICE_NS="${CONTEXT_SERVICE_NS:-context-service}"
 # The control plane tells clients where the harness is, and deploy/k8s
 # advertises it as http://127.0.0.1:8080 — so the supervisor's port-forward
 # must use local port 8080 specifically.
@@ -89,6 +90,36 @@ if ! SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" mocactl do
   echo "    MOCA's moca-context-service ConfigMap). See README prerequisites." >&2
   exit 1
 fi
+
+# mocactl doctor does not probe Context Service's public URL, but the client
+# (contextctl / mocactl workloads create) uploads the bundle directly to it.
+# If the port-forward is missing, workloads create fails with "cannot reach
+# Context Service: fetch failed" AFTER the server has already allocated and
+# then rolled back a workload. Catch that here with a clear fix message.
+CS_PUBLIC_URL="$(kubectl -n "${MOCA_NS}" get configmap moca-context-service \
+  -o jsonpath='{.data.public-url}' 2>/dev/null || true)"
+if [[ -z "${CS_PUBLIC_URL}" ]]; then
+  echo "    moca-context-service ConfigMap has no public-url key. Reinstall" >&2
+  echo "    prerequisites (see README) so the ConfigMap is populated." >&2
+  exit 1
+fi
+# curl exit 7 = connection refused; anything else (incl. an HTTP status like
+# 404 on /) means the service is reachable on this port.
+cs_probe_status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
+  "${CS_PUBLIC_URL%/}/" 2>/dev/null || true)"
+if [[ "${cs_probe_status}" == "000" || -z "${cs_probe_status}" ]]; then
+  cs_local_port="$(printf '%s' "${CS_PUBLIC_URL}" | awk -F: '{print $NF}' | tr -d /)"
+  echo "" >&2
+  echo "    Context Service's public URL (${CS_PUBLIC_URL}) is not reachable" >&2
+  echo "    from this host. The server-side workload create will succeed," >&2
+  echo "    but the client-side bundle upload will then fail with" >&2
+  echo "    'cannot reach Context Service: fetch failed'." >&2
+  echo "" >&2
+  echo "    Start the third port-forward (keep it running):" >&2
+  echo "      kubectl port-forward -n ${CONTEXT_SERVICE_NS} svc/context-service ${cs_local_port:-9090}:8080" >&2
+  exit 1
+fi
+echo "    ok: Context Service public URL reachable at ${CS_PUBLIC_URL}"
 
 echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
 # Fresh staging on every run: the demo tag is per-run, so notes and results
