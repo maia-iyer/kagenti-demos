@@ -57,20 +57,22 @@ Three pieces cooperate:
 
 - **Setup time.** `mocactl login` + an inference credential (verified
   end-to-end by `mocactl doctor`), and a scratch dir staged with the
-  example project's files at its root (so `./` matches the leaf's
-  cwd). No workload is created yet — the agent packs and creates one
-  per leaf at dispatch.
+  example project at `./example_repo/` (not the scratch root — this
+  keeps parent-side bookkeeping like `leaves/` and `.claude/` out of
+  each leaf's workload bundle). No workload is created yet — the
+  agent packs and creates one per leaf at dispatch.
 - **Dispatch.** The parent authors `leaves/<label>.prompt.txt`, packs
-  the scratch dir (`contextctl ctx pack . --type workspace -o
-  leaves/<label>.context`), creates a workload for just that leaf
-  (`mocactl workloads create --context leaves/<label>.context --json`),
-  runs `mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt
-  --workload "$WORKLOAD_ID" [--writable] --tag
-  moca-chained-subagents-demo --json`, writes the note file (with the
-  leaf's `workloadId`), and **stops** — no waiting, no polling, no
-  seeding. The diagnose leaf dispatches read-only (just `--workload`);
-  the fix leaf dispatches with `--writable` and gets its own per-run
-  copy of the files, discarded when the run ends.
+  the project subdir (`contextctl ctx pack ./example_repo --type
+  workspace -o leaves/<label>.context`), creates a workload for just
+  that leaf (`mocactl workloads create --context
+  leaves/<label>.context --json`), runs `mocactl spawn "$(cat
+  leaves/<label>.prompt.txt)" --kind prompt --workload "$WORKLOAD_ID"
+  [--writable] --tag moca-chained-subagents-demo --json`, writes the
+  note file (with the leaf's `workloadId`), and **stops** — no
+  waiting, no polling, no seeding. The diagnose leaf dispatches
+  read-only (just `--workload`); the fix leaf dispatches with
+  `--writable` and gets its own per-run copy of the files, discarded
+  when the run ends.
 - **Execution.** The detached worker holds the synchronous
   `POST /v1/runs`; the server runs the leaf to completion and stores
   the result **before** responding, with no client-disconnect abort.
@@ -108,7 +110,8 @@ session reconstructs the picture from those notes plus
   Probe: `mocactl workloads` must say `workloads needs create, get or delete`.
 - [`contextctl`](https://github.com/rossoctl/context-service) with the
   `ctx pack` subcommand (build from main — `make build` — until a release
-  with workspace bundles ships).
+  with workspace bundles ships). `make build` writes to
+  `<context-service>/bin/contextctl`; put that on `PATH`.
 
 ### Checkouts
 
@@ -133,8 +136,11 @@ CLONE_DIR=<parent-of-both-checkouts> \
 
 The script creates a kind cluster `moca`, runs MOCA's `deploy/k8s/setup.sh`,
 builds and loads the context-service image, and wires the two together.
-Idempotent; re-runnable. Three things it fixes along the way worth
-knowing about:
+Re-runnable on a *clean* cluster: a partially-completed prior run leaves
+namespaces behind, and `kubectl apply` on the manifest then fails with
+`namespaces "moca-credentials" already exists`. If that happens, delete
+and recreate the kind cluster (`kind delete cluster --name moca`) before
+re-running. Three things it fixes along the way worth knowing about:
 
 - **Flaky pod DNS on podman.** The Podman-network resolv.conf often
   points at an unreachable IPv6 nameserver first; the script points
@@ -201,9 +207,10 @@ This:
    login, credential, harness, and an end-to-end scratch session.
 3. Stages the scratch dir at `~/tmp/moca-chained-scratch/`:
    `.claude/settings.json` (with the port-forward URLs injected as env),
-   the `moca-delegate-task` skill (upstream SKILL.md, verbatim), the
-   contents of `example_repo/` copied into the scratch dir's root (so
-   the parent's `./` matches the leaf's `./`), and an empty `leaves/`.
+   the `moca-delegate-task` skill (upstream SKILL.md, verbatim),
+   `example_repo/` as a subdir (so the agent packs just the project,
+   not parent-side bookkeeping), an empty `leaves/`, and an `.envrc`
+   with the two port-forward URLs for by-hand shells.
 
 Setup creates **no workload, no session, and seeds nothing per pod** —
 the agent packs the scratch dir and runs `mocactl workloads create`
@@ -238,8 +245,8 @@ not encode the flow; you drive it.
 
 **Prompt 1 — start the diagnosis.** Paste something like:
 
-> Dispatch a subagent to diagnose why this project's tests are failing.
-> Pack this folder (`.`) and tag the spawn with
+> Dispatch a subagent to diagnose why the project at `./example_repo`
+> is failing its tests. Pack `./example_repo` and tag the spawn with
 > `moca-chained-subagents-demo`. The leaf is read-only — do not pass
 > `--writable` and tell it not to modify files. `mocactl spawn` must
 > be the last tool call of this turn — do not call `get`, `subagents`,
@@ -251,9 +258,9 @@ Claude should:
 1. Read the `moca-delegate-task` skill.
 2. **Not** invoke `Task` — if it tries, the deny fires and it
    re-routes through the skill.
-3. Write the leaf's prompt to `leaves/diagnose.prompt.txt`, pack this
-   folder (`contextctl ctx pack . --type workspace -o
-   leaves/diagnose.context`), create its workload
+3. Write the leaf's prompt to `leaves/diagnose.prompt.txt`, pack the
+   project subdir (`contextctl ctx pack ./example_repo --type
+   workspace -o leaves/diagnose.context`), create its workload
    (`mocactl workloads create --context leaves/diagnose.context --json`),
    then run `mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind
    prompt --workload "$WORKLOAD_ID" --tag moca-chained-subagents-demo
@@ -278,18 +285,18 @@ record `collectedAt` / `deletedAt` on the note.
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
 > Good. Dispatch another subagent to apply that fix, run the tests,
-> and report the change and outcome. Pack this folder (`.`), spawn
+> and report the change and outcome. Pack `./example_repo`, spawn
 > **with `--writable`**, and tag it `moca-chained-subagents-demo`.
 > Inline the diagnosis from the previous leaf verbatim into the new
 > prompt. `mocactl spawn` must be the last tool call of this turn —
 > do not call `get`, `subagents`, or `sleep` after it, and do not
 > wait. End the turn as soon as the note is written.
 
-Claude dispatches a second leaf, which packs this folder again and
-creates its own workload (**with `--writable`**), with the diagnosis
-from Prompt 2 embedded verbatim in the new leaf's prompt. No seeding
-— the writable copy is served by Context Service into the sandbox
-automatically.
+Claude dispatches a second leaf, which packs the project subdir again
+and creates its own workload (**with `--writable`**), with the
+diagnosis from Prompt 2 embedded verbatim in the new leaf's prompt.
+No seeding — the writable copy is served by Context Service into the
+sandbox automatically.
 
 **Prompt 4 — collect the fix result.**
 
@@ -469,7 +476,8 @@ In the scratch dir after `setup.sh`:
 │   ├── settings.json      Permission policy + port-forward env for mocactl
 │   └── skills/
 │       └── moca-delegate-task/SKILL.md   Upstream SKILL.md, verbatim
-├── src/ tests/ vendor/ docs/ README.md   example_repo's contents, at the root
+├── .envrc                 Written by setup.sh — `source .envrc` picks up the port-forward URLs in a plain shell
+├── example_repo/          src/ tests/ vendor/ docs/ README.md — the project the leaves pack
 └── leaves/                Leaf prompts, per-leaf .context bundles, notes (*.json), results (<sid>.text)
 ```
 
@@ -547,6 +555,19 @@ cat leaves/<sessionId>.text       # the collected result
 - **Chaining is parent-side.** MOCA has no "on complete, trigger X"
   primitive; the parent Claude session does the sequencing between
   the operator's prompts.
+- **Orphan workloads if the agent dies between `workloads create` and
+  the note write.** `teardown.sh` reconciles workload leftovers by
+  reading `workloadId` from `leaves/*.json`. A workload created but
+  never recorded in a note (because the agent process died in the
+  seconds-wide window between `mocactl workloads create` returning
+  and the parent writing `leaves/<label>.json`) is unrecoverable by
+  teardown — `mocactl workloads` has no `list` subcommand to walk,
+  and the orphan sits on the user's quota (5 live workloads by
+  default) until it ages out. If `workloads create` starts failing
+  with `429 workload_quota_exceeded` after many abandoned runs, that
+  is the symptom; `mocactl workloads delete <id>` by id is the only
+  remedy today. The structural fix is a `mocactl workloads list`
+  subcommand — not yet upstream.
 
 ## Appendix: running the flow by hand
 
@@ -558,9 +579,13 @@ believed. Run it from a fresh `./setup.sh`.
 ```bash
 cd ~/tmp/moca-chained-scratch
 
-# mocactl reaches MOCA through the port-forwards (both must be up):
-export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
-export SH_HARNESS_URL=http://127.0.0.1:8080
+# mocactl reaches MOCA through the port-forwards (both must be up).
+# setup.sh writes .envrc with the two exports; source it, or export
+# them by hand:
+source .envrc
+# or:
+# export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+# export SH_HARNESS_URL=http://127.0.0.1:8080
 
 # Constant tag — scopes `mocactl subagents --tag` and teardown to
 # this demo's leaves on the machine-global ledger.
@@ -592,10 +617,10 @@ message.
 EOF
 ```
 
-**2 — pack this folder and create this leaf's workload:**
+**2 — pack the project subdir and create this leaf's workload:**
 
 ```bash
-contextctl ctx pack . --type workspace \
+contextctl ctx pack ./example_repo --type workspace \
   -o leaves/diagnose.context
 DIAG_WORKLOAD_ID="$(mocactl workloads create \
   --context leaves/diagnose.context --json | jq -r '.workloadId')"
@@ -688,7 +713,7 @@ then collect and release. `get` exit 1 with "has not finished yet"
 just means still running:
 
 ```bash
-contextctl ctx pack . --type workspace -o leaves/fix.context
+contextctl ctx pack ./example_repo --type workspace -o leaves/fix.context
 FIX_WORKLOAD_ID="$(mocactl workloads create \
   --context leaves/fix.context --json | jq -r '.workloadId')"
 
@@ -737,7 +762,7 @@ prompt file and edit as needed):
 
 ```bash
 cp leaves/fix.prompt.txt leaves/fix2.prompt.txt
-contextctl ctx pack . --type workspace -o leaves/fix2.context
+contextctl ctx pack ./example_repo --type workspace -o leaves/fix2.context
 FIX2_WORKLOAD_ID="$(mocactl workloads create \
   --context leaves/fix2.context --json | jq -r '.workloadId')"
 mocactl spawn "$(cat leaves/fix2.prompt.txt)" --kind prompt \
