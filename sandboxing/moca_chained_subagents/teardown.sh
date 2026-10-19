@@ -11,6 +11,9 @@
 set -euo pipefail
 
 MOCA_NS="${MOCA_NS:-moca}"
+SANDBOX_NS="${SANDBOX_NS:-moca-sandbox}"
+SANDBOX_POD_SELECTOR="${SANDBOX_POD_SELECTOR:-app=moca-sandbox}"
+SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-sandbox}"
 HARNESS_PORT="${HARNESS_PORT:-8080}"
 CP_PORT="${CP_PORT:-8090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
@@ -85,6 +88,41 @@ else
   fi
 fi
 
+echo "==> Removing this demo's per-session dirs from sandbox pods..."
+# MOCA's remote-worker creates /workspace/<sessionId>/ on first Exec for every
+# session (workspace-subdir capability). With --workload, the leaf's cwd is
+# the workload mount instead, so those directories end up empty but persist
+# on the pod until the worker's 30-min idle sweep. Clean up only the
+# sessions this demo created, right now, so the pod does not visibly carry
+# demo detritus between runs. The sweep would get these eventually anyway;
+# this just makes it immediate.
+if [[ -z "${SESSION_IDS}" ]]; then
+  echo "    (no session ids known; nothing to clean up)"
+elif ! command -v kubectl >/dev/null 2>&1; then
+  echo "    (kubectl not on PATH; skipping per-session dir cleanup)" >&2
+else
+  pods="$(kubectl -n "${SANDBOX_NS}" get pods -l "${SANDBOX_POD_SELECTOR}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+  if [[ -z "${pods}" ]]; then
+    echo "    (no sandbox pods matched -l ${SANDBOX_POD_SELECTOR} in ns ${SANDBOX_NS}; skipping)" >&2
+  else
+    for sid in ${SESSION_IDS}; do
+      # Guard: ${sid} is a UUID from mocactl, but shell-interpolate carefully
+      # since this becomes an rm -rf argument on the pod.
+      case "${sid}" in
+        [0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*) ;;
+        *) echo "    (skipping non-UUID-shaped sid: ${sid})" >&2; continue ;;
+      esac
+      for pod in ${pods}; do
+        if kubectl -n "${SANDBOX_NS}" exec "${pod}" -c "${SANDBOX_CONTAINER}" -- \
+          rm -rf "/workspace/${sid}" >/dev/null 2>&1; then
+          echo "    removed /workspace/${sid} from ${pod}"
+        fi
+      done
+    done
+  fi
+fi
+
 echo "==> Removing scratch directory ${SCRATCH_DIR}..."
 if [[ -d "${SCRATCH_DIR}" ]]; then
   rm -rf "${SCRATCH_DIR}"
@@ -97,7 +135,7 @@ echo ""
 echo "Teardown complete."
 echo ""
 echo "Not touched by this script (deliberately — they're prerequisites or yours):"
-echo "  - MOCA install in namespace ${MOCA_NS}"
+echo "  - MOCA install in namespaces ${MOCA_NS} and ${SANDBOX_NS}"
 echo "  - Context Service install"
 echo "  - the kind cluster"
 echo "  - your mocactl login and stored credentials"
