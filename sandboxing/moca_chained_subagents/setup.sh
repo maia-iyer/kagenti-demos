@@ -39,8 +39,10 @@ SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
 # Upstream MOCA checkout — holds the moca-delegate-task skill, staged
 # verbatim into the scratch dir. This demo adds no overrides: the two
 # operator prompts (one per leaf) carry the demo-specific details
-# (pack `.`, tag `moca-chained-subagents-demo`).
-MOCA_REPO="${MOCA_REPO:-$HOME/workdir/agentic-platform/rossoctl/moca}"
+# (pack `./example_repo`, tag `moca-chained-subagents-demo`).
+# No default — operators clone rossoctl/moca themselves (see README
+# Prerequisites) and point MOCA_REPO at it.
+MOCA_REPO="${MOCA_REPO:-}"
 UPSTREAM_SKILL="${MOCA_REPO}/skills/moca-delegate-task/SKILL.md"
 
 echo "==> Prerequisite checks..."
@@ -83,12 +85,19 @@ if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
 fi
 echo "    ok: namespace ${MOCA_NS} exists"
 
+if [[ -z "${MOCA_REPO}" ]]; then
+  echo "    MOCA_REPO is not set. This demo stages upstream MOCA's" >&2
+  echo "    moca-delegate-task SKILL.md verbatim into the scratch dir." >&2
+  echo "    Point MOCA_REPO at your rossoctl/moca checkout:" >&2
+  echo "      MOCA_REPO=/path/to/rossoctl/moca ./setup.sh" >&2
+  echo "    (See README Prerequisites > Checkouts for the clone commands.)" >&2
+  exit 1
+fi
 if [[ ! -f "${UPSTREAM_SKILL}" ]]; then
   echo "    upstream skill not found: ${UPSTREAM_SKILL}" >&2
-  echo "    This demo stages upstream MOCA's moca-delegate-task SKILL.md" >&2
-  echo "    under its own overlay skill as a reference doc. Clone or" >&2
-  echo "    update rossoctl/moca and set MOCA_REPO:" >&2
-  echo "      MOCA_REPO=/path/to/rossoctl/moca ./setup.sh" >&2
+  echo "    MOCA_REPO=${MOCA_REPO} does not look like a rossoctl/moca" >&2
+  echo "    checkout. Expected: \${MOCA_REPO}/skills/moca-delegate-task/SKILL.md" >&2
+  echo "    Verify the path and that the checkout is up to date (git pull)." >&2
   exit 1
 fi
 echo "    ok: upstream skill at ${UPSTREAM_SKILL}"
@@ -161,10 +170,12 @@ mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
 cp "${UPSTREAM_SKILL}" "${staged_skill}"
 
-# The scratch dir *is* the project the leaves pack. Copy example_repo's
-# contents (not the directory itself) into the scratch dir so `./` at
-# the parent's cwd matches `./` at the leaf's cwd.
-cp -R "${SCRIPT_DIR}/example_repo/." "${SCRATCH_DIR}/"
+# The project the leaves pack lives at ./example_repo in the scratch dir —
+# NOT at the scratch dir root. Keeping it as a subdir means `leaves/` and
+# `.claude/` (parent-side bookkeeping) do not get picked up when the agent
+# runs `contextctl ctx pack ./example_repo`. Each leaf's workload then
+# contains only the fixture, independent of how many leaves ran before.
+cp -R "${SCRIPT_DIR}/example_repo" "${SCRATCH_DIR}/example_repo"
 
 # Purge any Python bytecode left in the fixture from a prior in-tree test run
 # (e.g. verifying it locally). A .pyc file is tagged with the Python version
@@ -172,9 +183,18 @@ cp -R "${SCRIPT_DIR}/example_repo/." "${SCRATCH_DIR}/"
 # a different minor version and would ignore or reject it. (`contextctl ctx
 # pack` does not yet honor .gitignore, so this purge is what keeps those
 # files out of the bundle.)
-find "${SCRATCH_DIR}" \
+find "${SCRATCH_DIR}/example_repo" \
   \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
   -prune -exec rm -rf {} +
+
+# .envrc gives operators driving the by-hand flow a one-line way to pick
+# up the port-forward URLs in a plain shell. Claude Code sessions still
+# inherit the same env via .claude/settings.json; this is the sibling
+# for `source .envrc` from a plain `bash`/`zsh`.
+cat > "${SCRATCH_DIR}/.envrc" <<EOF
+export SH_CONTROL_PLANE_URL=${CP_URL}
+export SH_HARNESS_URL=${HARNESS_URL}
+EOF
 
 echo ""
 echo "Setup complete."
@@ -194,7 +214,7 @@ echo "     (spawn, collect, chain) is the demo README's 'Appendix: running"
 echo "     the flow by hand':"
 echo ""
 echo "       cd ${SCRATCH_DIR}"
-echo "       export SH_CONTROL_PLANE_URL=${CP_URL} SH_HARNESS_URL=${HARNESS_URL}"
+echo "       source .envrc    # or: export the two URLs by hand"
 echo ""
 echo "  3. Or start Claude from the scratch dir and drive it with operator"
 echo "     prompts (the agent flow — see the README's 'Run a session'):"
