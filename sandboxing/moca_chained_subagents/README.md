@@ -377,6 +377,7 @@ ledger). Nothing lives in the Claude Code session identifier.
 | Wait past 24h | No — the stored result is gone |
 | Port-forwards down mid-leaf | Yes — the leaf still completes; restore the port-forward to collect |
 | Supervisor restarts mid-leaf | Possibly never — `subagents` shows `unknown`; re-dispatch |
+| Sandbox pod killed mid-leaf | Eventually (minutes) — session reconnects and the leaf reports the mount is gone; re-dispatch |
 | `./teardown.sh` | No — deletes the sessions and any leftover workloads |
 
 **Caveats.**
@@ -811,3 +812,26 @@ Start a completely fresh chain (new tag, fresh scratch):
 ```bash
 ./teardown.sh && ./setup.sh
 ```
+
+## Appendix: durability — parent Claude Code quits mid-chain
+
+Same four prompts, one interjection between prompts 1 and 2. Arc
+ends on `OK`.
+
+1. **Prompt 1** — dispatch diagnose.
+2. `exit` Claude (operator "closes the laptop").
+3. `cd ~/tmp/moca-chained-scratch && claude` → *"Any subagents still
+   pending from an earlier session?"*
+4. **Prompt 2** — collect; diagnosis lands.
+5. **Prompts 3 and 4** — fix leaf, `Ran 1 test / OK`.
+
+What this shows: the scratch dir plus the mocactl ledger are the
+resumable state; the server-side result store carries the work.
+
+**Not shown live: sandbox pod killed mid-leaf.** The session
+reconnects to the respawned pod, but the per-session mount is
+per-pod-instance and doesn't come back. The leaf eventually
+`respond`s with an honest-failure message explaining the context
+disappeared, but "eventually" is several minutes while the leaf's
+model retries its tools with growing backoff — too slow for a live
+beat. The "What survives" table above has the one-line summary.
