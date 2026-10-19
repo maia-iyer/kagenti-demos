@@ -19,7 +19,9 @@ CP_PORT="${CP_PORT:-8090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
-MOCA_MD="${SCRATCH_DIR}/MOCA.md"
+# Constant: scopes `mocactl subagents --tag` to this demo's leaves on
+# the machine-global ledger. Must match the tag used in operator prompts.
+TAG="moca-chained-subagents-demo"
 
 # mocactl needs the port-forwards to list sessions, delete sessions, and
 # delete the workload.
@@ -27,19 +29,8 @@ export SH_CONTROL_PLANE_URL="${CP_URL}"
 export SH_HARNESS_URL="${HARNESS_URL}"
 
 echo "==> Collecting this demo's leaf sessions..."
-# The demo tag (written to MOCA.md by setup.sh) scopes the machine-global
-# mocactl subagent ledger to this run.
-TAG=""
-WORKLOAD_ID=""
-if [[ -f "${MOCA_MD}" ]]; then
-  TAG="$(grep -E '^Demo tag:' "${MOCA_MD}" 2>/dev/null \
-    | sed -E 's/^Demo tag:[[:space:]]+//' | head -1 || true)"
-  WORKLOAD_ID="$(grep -E '^Workload id:' "${MOCA_MD}" 2>/dev/null \
-    | sed -E 's/^Workload id:[[:space:]]+//' | head -1 || true)"
-fi
-
 SESSION_IDS=""
-if [[ -n "${TAG}" ]] && command -v mocactl >/dev/null 2>&1; then
+if command -v mocactl >/dev/null 2>&1; then
   if listing="$(mocactl subagents --tag "${TAG}" --json 2>/dev/null)"; then
     SESSION_IDS="$(printf '%s' "${listing}" \
       | jq -r '.subagents[]?.sessionId' 2>/dev/null || true)"
@@ -48,7 +39,9 @@ if [[ -n "${TAG}" ]] && command -v mocactl >/dev/null 2>&1; then
   fi
 fi
 # Union with the parent's per-leaf notes in the scratch dir, so teardown
-# still works when mocactl cannot reach the cluster.
+# still works when mocactl cannot reach the cluster. Workload ids live
+# only on the notes (one per leaf — there is no shared workload anymore).
+WORKLOAD_IDS=""
 if [[ -d "${SCRATCH_DIR}/leaves" ]]; then
   for note in "${SCRATCH_DIR}"/leaves/*.json; do
     [[ -e "${note}" ]] || continue
@@ -56,9 +49,14 @@ if [[ -d "${SCRATCH_DIR}/leaves" ]]; then
     if [[ -n "${sid}" ]]; then
       SESSION_IDS="$(printf '%s\n%s' "${SESSION_IDS}" "${sid}")"
     fi
+    wid="$(jq -r '.workloadId // empty' "${note}" 2>/dev/null || true)"
+    if [[ -n "${wid}" ]]; then
+      WORKLOAD_IDS="$(printf '%s\n%s' "${WORKLOAD_IDS}" "${wid}")"
+    fi
   done
 fi
 SESSION_IDS="$(printf '%s\n' "${SESSION_IDS}" | sed '/^$/d' | sort -u)"
+WORKLOAD_IDS="$(printf '%s\n' "${WORKLOAD_IDS}" | sed '/^$/d' | sort -u)"
 
 if [[ -z "${SESSION_IDS}" ]]; then
   echo "    (no leaf sessions found for this demo; nothing to delete)"
@@ -73,19 +71,22 @@ else
   done
 fi
 
-echo "==> Deleting the workload..."
-# The workload's shared read-only cache and any per-run writable copies are
-# released by DELETE /workloads/{id}. Writable per-run copies are already
-# discarded when their runs end (nothing persists across runs in phase 1).
-if [[ -z "${WORKLOAD_ID}" ]]; then
-  echo "    (no workload id in MOCA.md; nothing to delete)"
+echo "==> Deleting leftover workloads..."
+# The agent is expected to delete each leaf's workload after collecting
+# its result, so this step is a no-op in the normal case. It catches
+# workloads from leaves the operator abandoned (dispatched but never
+# collected). Writable per-run copies are discarded when the run ends;
+# the shared read-only cache is released by DELETE /workloads/{id}.
+if [[ -z "${WORKLOAD_IDS}" ]]; then
+  echo "    (no workload ids in leaf notes; nothing to delete)"
 else
-  if mocactl workloads delete "${WORKLOAD_ID}" >/dev/null 2>&1; then
-    echo "    deleted workload ${WORKLOAD_ID}"
-  else
-    echo "    could not delete workload ${WORKLOAD_ID} (already gone?)" >&2
-    echo "      delete it later with:  mocactl workloads delete ${WORKLOAD_ID}" >&2
-  fi
+  for wid in ${WORKLOAD_IDS}; do
+    if mocactl workloads delete "${wid}" >/dev/null 2>&1; then
+      echo "    deleted workload ${wid}"
+    else
+      echo "    could not delete workload ${wid} (already gone?)"
+    fi
+  done
 fi
 
 echo "==> Removing this demo's per-session dirs from sandbox pods..."
