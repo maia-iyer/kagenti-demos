@@ -3,7 +3,8 @@
 How the pieces of this demo fit together: a local Claude Code session
 (the **parent**) dispatches isolated **leaves** to MOCA on a kind
 cluster via `mocactl`, against a workload Context Service holds the
-files for, and collects their results later.
+files for and promoted config bundles the control plane holds the
+skills for, and collects their results later.
 
 ## Components
 
@@ -18,7 +19,7 @@ flowchart LR
       SKILL["skill: moca-delegate-task<br/>(upstream, verbatim)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir<br/>src/ · tests/ · vendor/ · docs/ · README.md<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
+    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · bundles/public-only/ · bundles/full/<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
     CTXCTL["contextctl<br/>(ctx pack @ dispatch time, per leaf)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
@@ -34,6 +35,7 @@ flowchart LR
       SUP["supervisor / harness"]
       REDIS[("Redis")]
       RESULTS[("session + result store<br/>24h TTL")]
+      BUNDLES[("promoted config bundles<br/>DIGEST_PUBLIC · DIGEST_FULL<br/>sha256-pinned skills + commands")]
     end
     subgraph nsctx["namespace: context-service"]
       CS["Context Service"]
@@ -55,17 +57,20 @@ flowchart LR
   MOCACTL --- AUTH
   MOCACTL --> LEDGER
   MOCACTL -->|"workloads create: upload bundle"| PF
+  MOCACTL -->|"promote: upload skills+commands<br/>(setup only, per bundle)"| PF
   MOCACTL -->|"spawn: forks"| WORKER
   MOCACTL -->|"create session"| PF
-  WORKER -->|"POST /v1/runs (--workload)"| PF
+  WORKER -->|"POST /v1/runs<br/>(--config DIGEST --workload)"| PF
   MOCACTL -->|"get / subagents"| PF
   PF --> CP
   PF --> SUP
   PF --> CS
   CP --- REDIS
+  CP --- BUNDLES
   SUP --- RESULTS
   CS --- REV
   SUP -->|"fetch frozen revision<br/>(read-only or writable copy)"| CS
+  SUP -->|"apply config overlay<br/>(skills from DIGEST)"| POD0
   SUP -->|"mount workload view at<br/>/workspace/.moca-context/runs/&lt;sid&gt;"| POD0
   SUP --> POD1
 
@@ -95,17 +100,18 @@ sequenceDiagram
   CC->>MC: mocactl workloads create --context leaves/LABEL.context --json
   MC->>CS: upload bundle
   MC-->>CC: workloadId WLID
-  CC->>MC: mocactl spawn --kind prompt --workload WLID [--writable] --tag TAG --json
-  Note over CC,MC: permission prompt = operator's visual confirmation
-  MC->>SV: create session
+  CC->>MC: mocactl spawn --kind prompt --config DIGEST --workload WLID [--writable] --tag TAG --json
+  Note over CC,MC: permission prompt = operator's visual confirmation<br/>digest and workload id visible on the command line
+  MC->>SV: create session with configRef and workloadId
   SV-->>MC: sessionId
   MC->>W: fork (detached)
   MC-->>CC: stdout — type=session, sessionId, pid
-  CC->>FS: write leaves/LABEL.json (label, sessionId, workloadId)
+  CC->>FS: write leaves/LABEL.json — label · sessionId · workloadId · configDigest
   W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
   CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
   Note over SV,SB: leaf runs server-side — session pins to one pod on first turn
+  SV->>SB: apply config overlay — skills and commands from DIGEST
   SV->>CS: fetch frozen revision (lazy, cached per user+revision)
   CS-->>SV: bundle bytes (streamed, sha256-verified)
   SV->>SB: mount view at /workspace/.moca-context/runs/sid<br/>(read-only, or writable per-run copy)
@@ -134,6 +140,7 @@ primitive, and neither leaf knows a chain exists.
                 leaf 1 "diagnose"                      leaf 2 "fix"
          ┌──────────────────────────┐          ┌──────────────────────────┐
          │ session A                │          │ session B                │
+         │ config  DIGEST_PUBLIC    │          │ config  DIGEST_FULL      │
          │ workload WLID_A          │          │ workload WLID_B          │
          │   mounted READ-ONLY      │          │   WRITABLE per-run copy  │
          │ runs tests, reports      │          │ edits src/, runs tests   │
@@ -146,10 +153,13 @@ primitive, and neither leaf knows a chain exists.
                       └────────► leaves/fix.prompt.txt       └──► report to operator
 
    Each leaf has its own workload, packed and created at dispatch and
-   deleted after collection. The writable copy is per-run and discarded
-   on completion — nothing persists across runs (that is phase-2
-   workloads, https://github.com/rossoctl/moca/issues/476). No file
-   paths cross the leaf boundary.
+   deleted after collection, and boots with its own content-addressed
+   config bundle — same `mocactl spawn`, different posture. Each
+   child's identity is the triple (config digest, workload revision,
+   sessionId), all sha256-pinned and server-held. The writable copy is
+   per-run and discarded on completion — nothing persists across runs
+   (that is phase-2 workloads, https://github.com/rossoctl/moca/issues/476).
+   No file paths cross the leaf boundary.
 ```
 
 Isolation is substrate-enforced at the session level (each session
@@ -163,6 +173,7 @@ a sequential chain.
 | --- | --- | --- |
 | `Task` denied + `moca-delegate-task` skill | Subagent work cannot run in-process on the laptop | — |
 | `mocactl` owns auth (`~/.config/mocactl`, Read-denied) | Demo stores no secret; no token plumbing | — |
+| Promoted config bundle, sha256-pinned | The skills (and commands) a leaf boots with are content-addressed and server-held; two leaves can share one workload but differ in posture | Ships skills + commands only — a `CLAUDE.md` under the promoted dir is NOT included and does not travel to the sandbox |
 | Workload mount read-only (diagnose leaf) | The diagnose leaf cannot alter the shared revision | — |
 | Writable per-run copy (fix leaf) | Edits are isolated to that run and discarded on completion | **Not durable** — nothing survives to the next run; that is [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |
 | Server persists result before responding to `/v1/runs` | Quit Claude, close the laptop, reboot — result survives | Nothing: there is **no cancel** |

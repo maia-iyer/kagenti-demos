@@ -29,6 +29,18 @@ export SH_CONTROL_PLANE_URL="${CP_URL}"
 export SH_HARNESS_URL="${HARNESS_URL}"
 
 echo "==> Collecting this demo's leaf sessions..."
+# Config-bundle digests are written to MOCA.md by setup.sh; teardown reads
+# them back here so it can release both bundles at the end.
+MOCA_MD="${SCRATCH_DIR}/MOCA.md"
+DIGEST_PUBLIC=""
+DIGEST_FULL=""
+if [[ -f "${MOCA_MD}" ]]; then
+  DIGEST_PUBLIC="$(grep -E '^Config digest public:' "${MOCA_MD}" 2>/dev/null \
+    | sed -E 's/^Config digest public:[[:space:]]+//' | head -1 || true)"
+  DIGEST_FULL="$(grep -E '^Config digest full:' "${MOCA_MD}" 2>/dev/null \
+    | sed -E 's/^Config digest full:[[:space:]]+//' | head -1 || true)"
+fi
+
 SESSION_IDS=""
 if command -v mocactl >/dev/null 2>&1; then
   if listing="$(mocactl subagents --tag "${TAG}" --json 2>/dev/null)"; then
@@ -123,6 +135,25 @@ else
     done
   fi
 fi
+
+echo "==> Deleting the config bundles..."
+# Config bundles promoted at setup time; delete them to free the budget.
+delete_bundle() {
+  local digest="$1"
+  local label="$2"
+  if [[ -z "${digest}" ]]; then
+    echo "    (no ${label} digest in MOCA.md; nothing to delete)"
+    return
+  fi
+  if mocactl bundles delete "${digest}" >/dev/null 2>&1; then
+    echo "    deleted ${label}  ${digest}"
+  else
+    echo "    could not delete ${label}  ${digest} (already gone?)" >&2
+    echo "      delete it later with:  mocactl bundles delete ${digest}" >&2
+  fi
+}
+delete_bundle "${DIGEST_PUBLIC}" public-only
+delete_bundle "${DIGEST_FULL}"   full
 
 echo "==> Removing scratch directory ${SCRATCH_DIR}..."
 if [[ -d "${SCRATCH_DIR}" ]]; then

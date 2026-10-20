@@ -197,6 +197,65 @@ export SH_CONTROL_PLANE_URL=${CP_URL}
 export SH_HARNESS_URL=${HARNESS_URL}
 EOF
 
+echo "==> Promoting the two config bundles..."
+# Config bundles carry each leaf's skills + commands (NOT CLAUDE.md). They
+# travel server-held and content-addressed, picked up at dispatch time via
+# `mocactl spawn --config <digest>`. The diagnose leaf runs with the
+# public-only posture; the fix leaf runs with the full-access posture.
+# Workloads themselves are per-leaf and created by the agent at dispatch
+# time (not by setup) — see the moca-delegate-task skill.
+promote_bundle() {
+  local dir="$1"
+  local label="$2"
+  local json
+  json="$(SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" \
+    mocactl promote "${dir}" --json 2>/dev/null)"
+  local digest
+  digest="$(printf '%s' "${json}" | jq -r '.digest')"
+  if [[ -z "${digest}" || "${digest}" == "null" ]]; then
+    echo "    promote ${label} did not return a digest:" >&2
+    echo "    ${json}" >&2
+    exit 1
+  fi
+  printf '%s' "${digest}"
+}
+DIGEST_PUBLIC="$(promote_bundle "${SCRIPT_DIR}/bundles/public-only" public-only)"
+echo "    promoted public-only  ${DIGEST_PUBLIC}"
+DIGEST_FULL="$(promote_bundle "${SCRIPT_DIR}/bundles/full" full)"
+echo "    promoted full         ${DIGEST_FULL}"
+
+# Record the two digests + run facts in the scratch dir so a resumed Claude
+# session (or an operator driving the by-hand flow) can reconstruct them
+# without re-running `mocactl promote`.
+cat > "${SCRATCH_DIR}/MOCA.md" <<EOF
+# MOCA runtime facts for this demo run
+
+Control plane URL:     ${CP_URL}
+Harness URL:           ${HARNESS_URL}
+Config digest public:  ${DIGEST_PUBLIC}
+Config digest full:    ${DIGEST_FULL}
+Project to pack:       ./example_repo
+Leaves dir:            ./leaves
+
+Every mocactl command run from this directory needs the port-forward URLs
+in the environment (the staged .claude/settings.json does this for Claude;
+a plain shell picks them up via \`source .envrc\`).
+
+Notes:
+- The diagnose leaf dispatches with '--config ${DIGEST_PUBLIC}' (public-
+  posture skill, read-only workload). The fix leaf dispatches with
+  '--config ${DIGEST_FULL} --writable' (full-access skill, per-run
+  writable copy of the workload).
+- The agent packs ./example_repo and creates one workload per leaf at
+  dispatch time; those workloads are released after collection.
+- Each child's identity is (config digest, workload revision, sessionId) —
+  three sha256-pinned handles, all server-held, all reconstructable from
+  this file plus the mocactl ledger.
+- There is no cancel; a dispatched leaf runs to completion. Results persist
+  server-side for 24h — collect with 'mocactl get <sessionId>' inside that
+  window.
+EOF
+
 echo ""
 echo "Setup complete."
 echo ""
@@ -216,6 +275,7 @@ echo "     the flow by hand':"
 echo ""
 echo "       cd ${SCRATCH_DIR}"
 echo "       source .envrc    # or: export the two URLs by hand"
+echo "     The two config digests to dispatch leaves with are in MOCA.md."
 echo ""
 echo "  3. Or start Claude from the scratch dir and drive it with operator"
 echo "     prompts (the agent flow — see the README's 'Run a session'):"

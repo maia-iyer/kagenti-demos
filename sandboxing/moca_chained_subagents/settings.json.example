@@ -12,7 +12,8 @@
       "Bash(mocactl sessions*)",
       "Bash(mocactl workloads create*)",
       "Bash(mocactl workloads get*)",
-      "Bash(mocactl workloads delete*)"
+      "Bash(mocactl workloads delete*)",
+      "Bash(mocactl bundles delete*)"
     ]
   }
 }

@@ -11,3 +11,8 @@
 .codex/
 AGENTS.md
 CLAUDE.md
+
+# Exception: moca_chained_subagents promotes `.claude/` subtrees as config
+# bundles; those are first-class demo artifacts, not bd init leftovers.
+!moca_chained_subagents/bundles/*/.claude/
+!moca_chained_subagents/bundles/*/.claude/**
