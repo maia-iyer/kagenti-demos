@@ -181,15 +181,6 @@ find "${SCRATCH_DIR}/example_repo" \
   \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
   -prune -exec rm -rf {} +
 
-# .envrc gives operators driving the by-hand flow a one-line way to pick
-# up the port-forward URLs in a plain shell. Claude Code sessions still
-# inherit the same env via .claude/settings.json; this is the sibling
-# for `source .envrc` from a plain `bash`/`zsh`.
-cat > "${SCRATCH_DIR}/.envrc" <<EOF
-export SH_CONTROL_PLANE_URL=${CP_URL}
-export SH_HARNESS_URL=${HARNESS_URL}
-EOF
-
 echo "==> Promoting the two config bundles..."
 # Config bundles carry each leaf's skills + commands (NOT CLAUDE.md). They
 # travel server-held and content-addressed, picked up at dispatch time via
@@ -231,8 +222,11 @@ Project to pack:       ./example_repo
 Leaves dir:            ./leaves
 
 Every mocactl command run from this directory needs the port-forward URLs
-in the environment (the staged .claude/settings.json does this for Claude;
-a plain shell picks them up via \`source .envrc\`).
+in the environment. Claude sessions get them from .claude/settings.json;
+for a plain shell, export them by hand:
+
+    export SH_CONTROL_PLANE_URL=${CP_URL}
+    export SH_HARNESS_URL=${HARNESS_URL}
 
 Notes:
 - The diagnose leaf dispatches with '--config ${DIGEST_PUBLIC}' (public-
@@ -267,7 +261,11 @@ echo "     (spawn, collect, chain) is the demo README's 'Appendix: running"
 echo "     the flow by hand':"
 echo ""
 echo "       cd ${SCRATCH_DIR}"
-echo "       source .envrc    # or: export the two URLs by hand"
+echo "     Export the two port-forward URLs (also recorded in MOCA.md):"
+echo ""
+echo "       export SH_CONTROL_PLANE_URL=${CP_URL}"
+echo "       export SH_HARNESS_URL=${HARNESS_URL}"
+echo ""
 echo "     The two config digests to dispatch leaves with are in MOCA.md."
 echo ""
 echo "  3. Or start Claude from the scratch dir and drive it with operator"
