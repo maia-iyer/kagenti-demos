@@ -813,103 +813,97 @@ Start a completely fresh chain (new tag, fresh scratch):
 ./teardown.sh && ./setup.sh
 ```
 
-## Appendix: durability — parent Claude Code quits mid-chain
+## Appendix: narrated flow — state movement + optional durability beat
 
-Same four prompts, one interjection between prompts 1 and 2. Arc
-ends on `OK`.
+The four operator prompts, with state snapshots at natural beats and
+one optional interjection between prompts 1 and 2. All snapshots use
+`mocactl` from the operator's shell — no `kubectl exec`. Arc ends on
+`OK`.
 
-1. **Prompt 1** — dispatch diagnose.
-2. `exit` Claude (operator "closes the laptop").
-3. `cd ~/tmp/moca-chained-scratch && claude` → *"Any subagents still
-   pending from an earlier session?"*
-4. **Prompt 2** — collect; diagnosis lands.
-5. **Prompts 3 and 4** — fix leaf, `Ran 1 test / OK`.
+Three state types travel through the chain:
 
-What this shows: the scratch dir plus the mocactl ledger are the
-resumable state; the server-side result store carries the work.
+- **Subagent config** — sha256-pinned skills + commands on the
+  control plane. One per posture, promoted at `./setup.sh` time.
+- **Workload** — sha256-pinned fixture files in Context Service.
+  One per leaf, created at dispatch, released after collection.
+- **Session** — the per-subagent join of subagent config + workload
+  + sandbox pod on the control plane. 24h result TTL.
 
-**Not shown live: sandbox pod killed mid-leaf.** The session
-reconnects to the respawned pod, but the per-session mount is
-per-pod-instance and doesn't come back. The leaf eventually
-`respond`s with an honest-failure message explaining the context
-disappeared, but "eventually" is several minutes while the leaf's
-model retries its tools with growing backoff — too slow for a live
-beat. The "What survives" table above has the one-line summary.
-
-## Appendix: watching state move during the demo
-
-Three state types travel through this chain. All are reachable with
-`mocactl` from the operator's shell — no `kubectl exec`, no admin
-access to the cluster. Run these in a side terminal while the main
-chain runs.
-
-Set these once (also printed by `./setup.sh`; `MOCA.md` records them):
+### Setup once (per terminal)
 
 ```bash
 cd ~/tmp/moca-chained-scratch
 export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
 export SH_HARNESS_URL=http://127.0.0.1:8080
 TAG=moca-chained-subagents-demo
+```
+
+### Before prompt 1 — subagent configs are already live
+
+`./setup.sh` promoted two subagent configs (`mocactl promote` uploads
+a directory of `.claude/skills/` and `.claude/commands/` as a
+content-addressed bundle). `mocactl` has no `bundles list` yet, so
+the operator-visible record is the two digests setup wrote into
+`MOCA.md`:
+
+```bash
+grep '^Config digest' MOCA.md
+```
+
+### Prompt 1 — dispatch diagnose
+
+Paste the operator prompt from the "Run a session" section. Then grab
+the handles the agent wrote and watch the workload transition states:
+
+```bash
 SID=$(jq -r .sessionId leaves/diagnose.json)
 WLID=$(jq -r .workloadId leaves/diagnose.json)
-```
-
-### 1. Subagent config — sha256-pinned skills + commands (control plane)
-
-Each dispatched subagent boots with a **subagent config** (`mocactl
-promote` uploads a directory of `.claude/skills/` and `.claude/commands/`
-as a content-addressed, sha256-pinned bundle on the control plane).
-This demo promotes two at `./setup.sh` time — `public-only` for the
-diagnose leaf, `full` for the fix leaf — and spawn carries the digest
-on `--config`. `mocactl` has no `bundles list` yet, so the
-operator-visible record is the two digests setup wrote into `MOCA.md`,
-plus the `bundle` field on each session:
-
-```bash
-grep '^Config digest' MOCA.md             # the two promoted digests
-mocactl subagents --tag "$TAG" --json \
-  | jq -r '.subagents[] | select(.bundle != null) | "\(.sessionId[:12])  \(.bundle)"'
-```
-
-The `bundle` field on each row shows the digest that subagent booted
-with — tells you which posture it had. After `./teardown.sh`,
-`mocactl bundles delete` has freed both.
-
-### 2. Workload — sha256-pinned files (Context Service)
-
-Created per leaf at dispatch, released after collection. Carries the
-fixture tree the subagent mounts.
-
-```bash
 mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
+# status: creating → awaiting_upload → ready; revision is the sha256 of the files
 ```
 
-The `revision` is the sha256 of the file tree; the `status` moves
-`creating` → `awaiting_upload` → `ready` → `deleted`. Watch it
-transition during a dispatch by re-running the command.
+### Optional durability beat (between prompts 1 and 2)
 
-### 3. Session — the per-subagent join (control plane)
+Skip for a short recording; include to show the server owns the
+result.
 
-The record that ties this subagent to one subagent config + one
-workload + one sandbox pod. 24h TTL on the result.
+1. `exit` Claude (operator "closes the laptop").
+2. `cd ~/tmp/moca-chained-scratch && claude`.
+3. *"Any subagents still pending from an earlier session?"* Claude
+   runs `mocactl subagents --tag …` and reads `leaves/*.json` to
+   reconstruct the chain.
+
+Scratch dir + mocactl ledger are the resumable state; the server-side
+result store carries the actual work.
+
+### Prompt 2 — collect diagnose
+
+Paste the collect prompt. Then watch the session finalize and the
+result land:
 
 ```bash
 mocactl get "$SID" --json | jq .
 # status progresses: queued → responded (or failed / paused)
+cat leaves/"$SID".text | head
 ```
 
-Once the subagent has finished:
+### Prompts 3 and 4 — fix and collect
+
+Dispatch and collect the fix leaf. `Ran 1 test / OK` in its final
+message.
+
+### After the chain — whole-chain view
 
 ```bash
-mocactl subagents --tag "$TAG"              # ledger view: this run's subagents
-cat leaves/"$SID".text | head               # the subagent's final message
+mocactl subagents --tag "$TAG"
+mocactl subagents --tag "$TAG" --json \
+  | jq -r '.subagents[] | select(.bundle != null) | "\(.sessionId[:12])  \(.bundle)"'
 ```
 
-### What the demo tag scopes
-
-`moca-chained-subagents-demo` is the operator-side handle for *"this
-demo's subagents"*. Scopes `mocactl subagents --tag`, teardown's
-reconciler, and nothing else — it's not a server-side identity.
+The `bundle` field on each row shows which subagent config that
+dispatch booted with — tells you which posture it had. The demo tag
+is operator-side only (scopes `subagents --tag` and teardown); not a
+server-side identity.
 
 ### Logs: what you can and can't see while the demo runs
 
@@ -936,7 +930,3 @@ reconciler, and nothing else — it's not a server-side identity.
 - Which sandbox pod the session pinned to (lives in Redis
   `sh:sandbox:affinity:<sid>`; no client-side query today).
 - The audit stream (`session_created`, `credential_issued` events).
-- Supervisor / control plane / Context Service logs are silent at
-  steady state — they emit nothing per-request at default verbosity,
-  so there's no useful log tail to project. The visible state surface
-  is the three `mocactl` commands above, not log streams.
