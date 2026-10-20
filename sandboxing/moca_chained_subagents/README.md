@@ -150,11 +150,13 @@ CLONE_DIR=<parent-of-both-checkouts> \
 ```
 
 The script creates a kind cluster `moca`, runs MOCA's `deploy/k8s/setup.sh`,
-builds and loads the context-service image, and wires the two together.
-Re-runnable on a *clean* cluster: a partially-completed prior run leaves
-namespaces behind, and `kubectl apply` on the manifest then fails with
-`namespaces "moca-credentials" already exists`. If that happens, delete
-and recreate the kind cluster (`kind delete cluster --name moca`) before
+builds and loads the context-service image, wires the two together, and
+backgrounds the three port-forwards the demo needs (logs under
+`~/.local/state/moca-chained-demo/`). Re-runnable on a *clean* cluster:
+a partially-completed prior run leaves namespaces behind, and
+`kubectl apply` on the manifest then fails with
+`namespaces "moca-credentials" already exists`. If that happens, run
+`./prereqs-uninstall.sh` (or `kind delete cluster --name moca`) before
 re-running. Three things it fixes along the way worth knowing about:
 
 - **Flaky pod DNS on podman.** The Podman-network resolv.conf often
@@ -172,17 +174,19 @@ The `moca-context-service` Secret's `token` key is required by MOCA but
 not currently enforced by Context Service — the script uses a placeholder.
 Rotate it once trusted-route auth lands upstream.
 
-### Port-forwards (three terminals)
+### Port-forwards
 
-```bash
-kubectl --context kind-moca -n moca port-forward svc/moca-supervisor 8080:8080
-kubectl --context kind-moca -n moca port-forward svc/moca-control-plane 8090:8080
-kubectl --context kind-moca -n context-service port-forward svc/context-service 9090:8080
-```
+`prereqs-install.sh` backgrounds the three port-forwards itself —
+`moca-supervisor` on `127.0.0.1:8080`, `moca-control-plane` on `8090`,
+`context-service` on `9090`. Logs live at
+`~/.local/state/moca-chained-demo/`. The MOCA harness **must** be on
+local 8080 (the control plane advertises it there); Context Service's
+`public-url` in the ConfigMap matches `127.0.0.1:9090`. These ports are
+not freely configurable without re-running step 5 of the install.
 
-The MOCA harness **must** be on local 8080 (the control plane advertises
-it there). Context Service's `public-url` in the ConfigMap must match
-whichever port you choose for it (`9090` by default).
+To restart them, re-run `./prereqs-install.sh` (it kills stale
+port-forwards against `kind-moca` before relaunching). To kill them
+along with the cluster, use `./prereqs-uninstall.sh`.
 
 ### Log in (once per machine)
 
@@ -404,17 +408,35 @@ This deletes every leaf session of this demo's tag
 deletes any workloads still live from `leaves/*.json` (normally none —
 the agent deletes each workload after collecting its leaf's result),
 and removes the scratch directory. It does **not** touch MOCA, Context
-Service, your cluster, or your `mocactl` login. If the port-forwards
-are still running, `Ctrl-C` them.
+Service, your cluster, your `mocactl` login, or the backgrounded
+port-forwards. For a full tear-down (demo state + port-forwards + kind
+cluster), see `./prereqs-uninstall.sh` below.
+
+## Full uninstall
+
+```bash
+./prereqs-uninstall.sh
+```
+
+Runs `teardown.sh`, kills the three backgrounded port-forwards (matched
+by argv on `kubectl --context kind-moca ... port-forward`), and deletes
+the kind cluster `moca` — which takes MOCA, Context Service, loaded
+images, the CoreDNS patch, and all namespaces with it in one call. Does
+**not** touch your `mocactl` login + credentials or the two source
+checkouts; those are yours.
 
 ## Troubleshooting
 
 - **`mocactl` can't reach the control plane / connection refused.**
-  A port-forward isn't running. You need all three — MOCA harness on
-  8080, MOCA control plane on 8090, Context Service's public URL (as
-  configured in `moca-context-service`) — and
-  `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` exported (or the staged
-  settings' env block, in a Claude session).
+  A port-forward isn't running. `prereqs-install.sh` backgrounds all
+  three — supervisor on 8080, control plane on 8090, Context Service on
+  9090. Check they are up with
+  `pgrep -f 'kubectl --context kind-moca .* port-forward'` (expect
+  three PIDs); tail the logs under `~/.local/state/moca-chained-demo/`
+  for why one died. To restart them cleanly, re-run
+  `./prereqs-install.sh` (it kills stale ones first). Also make sure
+  `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` are exported (or inherited
+  via the staged settings in a Claude session).
 - **`setup.sh` fails at doctor.** Follow the fix doctor prints for
   each failing check — it covers reachability, login, credentials,
   and the harness.
@@ -474,7 +496,9 @@ you care about.
 
 ```
 README.md                  This file
-prereqs-install.sh         Stands up MOCA + Context Service on a local kind cluster; see Prerequisites
+prereqs-install.sh         Stands up MOCA + Context Service on a local kind cluster and
+                           backgrounds the three port-forwards; see Prerequisites
+prereqs-uninstall.sh       Runs teardown.sh, kills the port-forwards, deletes the kind cluster
 settings.json.example      Permission policy staged into the scratch dir: denies Task and
                            reading mocactl's config dir, allows the mocactl dispatch commands
 setup.sh                   Verifies prereqs via mocactl doctor, stages the scratch dir, and
