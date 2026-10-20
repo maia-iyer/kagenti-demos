@@ -22,16 +22,13 @@
 
 set -euo pipefail
 
-# Inputs. CLONE_DIR is a convenience: if set, MOCA_DIR and CONTEXT_SERVICE_DIR
-# default to $CLONE_DIR/moca and $CLONE_DIR/context-service. Either checkout
-# can still be pointed elsewhere by exporting its own variable.
-if [[ -n "${CLONE_DIR:-}" ]]; then
-  MOCA_DIR="${MOCA_DIR:-${CLONE_DIR}/moca}"
-  CONTEXT_SERVICE_DIR="${CONTEXT_SERVICE_DIR:-${CLONE_DIR}/context-service}"
-fi
+# Inputs. CLONE_DIR is the parent of both checkouts: MOCA at $CLONE_DIR/moca,
+# Context Service at $CLONE_DIR/context-service. Required, no default — point
+# it at wherever you cloned the two repos (see README > Checkouts).
+: "${CLONE_DIR:?CLONE_DIR is required: parent of the moca/ and context-service/ checkouts (see README > Checkouts)}"
 
-: "${MOCA_DIR:?MOCA_DIR is required (or set CLONE_DIR so MOCA_DIR defaults to \$CLONE_DIR/moca)}"
-: "${CONTEXT_SERVICE_DIR:?CONTEXT_SERVICE_DIR is required (or set CLONE_DIR so it defaults to \$CLONE_DIR/context-service)}"
+MOCA_DIR="${CLONE_DIR}/moca"
+CONTEXT_SERVICE_DIR="${CLONE_DIR}/context-service"
 
 KIND_CLUSTER="${KIND_CLUSTER:-moca}"
 KUBE_CONTEXT="kind-${KIND_CLUSTER}"

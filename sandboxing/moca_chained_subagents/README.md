@@ -137,9 +137,10 @@ git clone --recurse-submodules https://github.com/rossoctl/moca
 git clone https://github.com/rossoctl/context-service
 ```
 
-Point the install script at them with either `CLONE_DIR` (used as a prefix
-for both) or `MOCA_DIR` / `CONTEXT_SERVICE_DIR` individually. There are
-no defaults — at least one must be set.
+Set `CLONE_DIR` to the parent of both checkouts. The install script and
+`./setup.sh` both read it; MOCA is expected at `$CLONE_DIR/moca` and
+Context Service at `$CLONE_DIR/context-service`. Required — there is no
+default.
 
 ### Install the cluster-side pieces
 
@@ -224,8 +225,9 @@ This:
    `.claude/settings.json` (with the port-forward URLs injected as env),
    the `moca-delegate-task` skill (upstream SKILL.md, verbatim),
    `example_repo/` as a subdir (so the agent packs just the project,
-   not parent-side bookkeeping), an empty `leaves/`, and an `.envrc`
-   with the two port-forward URLs for by-hand shells.
+   not parent-side bookkeeping), and an empty `leaves/`. By-hand shells
+   export the two port-forward URLs themselves — the exact lines are
+   printed by `setup.sh` and recorded in `MOCA.md`.
 
 Setup creates **no workload, no session, and seeds nothing per pod** —
 the agent packs the scratch dir and runs `mocactl workloads create`
@@ -501,8 +503,7 @@ In the scratch dir after `setup.sh`:
 │   ├── settings.json      Permission policy + port-forward env for mocactl
 │   └── skills/
 │       └── moca-delegate-task/SKILL.md   Upstream SKILL.md, verbatim
-├── .envrc                 Written by setup.sh — `source .envrc` picks up the port-forward URLs in a plain shell
-├── MOCA.md                Written by setup.sh — the two promoted config digests + run facts
+├── MOCA.md                Written by setup.sh — the two promoted config digests + run facts (also prints the two `export` lines for by-hand shells)
 ├── example_repo/          src/ tests/ vendor/ docs/ README.md — the project the leaves pack
 └── leaves/                Leaf prompts, per-leaf .context bundles, notes (*.json), results (<sid>.text)
 ```
@@ -606,12 +607,9 @@ believed. Run it from a fresh `./setup.sh`.
 cd ~/tmp/moca-chained-scratch
 
 # mocactl reaches MOCA through the port-forwards (both must be up).
-# setup.sh writes .envrc with the two exports; source it, or export
-# them by hand:
-source .envrc
-# or:
-# export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
-# export SH_HARNESS_URL=http://127.0.0.1:8080
+# Export the two URLs (setup.sh prints these; they're also in MOCA.md):
+export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+export SH_HARNESS_URL=http://127.0.0.1:8080
 
 # Constant tag — scopes `mocactl subagents --tag` and teardown to
 # this demo's leaves on the machine-global ledger.

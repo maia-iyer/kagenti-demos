@@ -41,9 +41,10 @@ SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
 # operator prompts (one per leaf) carry the demo-specific details
 # (pack `./example_repo`, tag `moca-chained-subagents-demo`).
 # No default — operators clone rossoctl/moca themselves (see README
-# Prerequisites) and point MOCA_DIR at it. Same variable that
-# prereqs-install.sh reads.
-MOCA_DIR="${MOCA_DIR:-}"
+# Prerequisites) and point CLONE_DIR at the parent of that checkout.
+# Same variable that prereqs-install.sh reads; MOCA lives at $CLONE_DIR/moca.
+: "${CLONE_DIR:?CLONE_DIR is required: parent of the moca/ checkout (see README > Checkouts)}"
+MOCA_DIR="${CLONE_DIR}/moca"
 UPSTREAM_SKILL="${MOCA_DIR}/skills/moca-delegate-task/SKILL.md"
 
 echo "==> Prerequisite checks..."
@@ -86,18 +87,10 @@ if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
 fi
 echo "    ok: namespace ${MOCA_NS} exists"
 
-if [[ -z "${MOCA_DIR}" ]]; then
-  echo "    MOCA_DIR is not set. This demo stages upstream MOCA's" >&2
-  echo "    moca-delegate-task SKILL.md verbatim into the scratch dir." >&2
-  echo "    Point MOCA_DIR at your rossoctl/moca checkout:" >&2
-  echo "      MOCA_DIR=/path/to/rossoctl/moca ./setup.sh" >&2
-  echo "    (See README Prerequisites > Checkouts for the clone commands.)" >&2
-  exit 1
-fi
 if [[ ! -f "${UPSTREAM_SKILL}" ]]; then
   echo "    upstream skill not found: ${UPSTREAM_SKILL}" >&2
-  echo "    MOCA_DIR=${MOCA_DIR} does not look like a rossoctl/moca" >&2
-  echo "    checkout. Expected: \${MOCA_DIR}/skills/moca-delegate-task/SKILL.md" >&2
+  echo "    CLONE_DIR=${CLONE_DIR} does not contain a rossoctl/moca checkout" >&2
+  echo "    at moca/. Expected: \${CLONE_DIR}/moca/skills/moca-delegate-task/SKILL.md" >&2
   echo "    Verify the path and that the checkout is up to date (git pull)." >&2
   exit 1
 fi
@@ -188,15 +181,6 @@ find "${SCRATCH_DIR}/example_repo" \
   \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
   -prune -exec rm -rf {} +
 
-# .envrc gives operators driving the by-hand flow a one-line way to pick
-# up the port-forward URLs in a plain shell. Claude Code sessions still
-# inherit the same env via .claude/settings.json; this is the sibling
-# for `source .envrc` from a plain `bash`/`zsh`.
-cat > "${SCRATCH_DIR}/.envrc" <<EOF
-export SH_CONTROL_PLANE_URL=${CP_URL}
-export SH_HARNESS_URL=${HARNESS_URL}
-EOF
-
 echo "==> Promoting the two config bundles..."
 # Config bundles carry each leaf's skills + commands (NOT CLAUDE.md). They
 # travel server-held and content-addressed, picked up at dispatch time via
@@ -238,8 +222,11 @@ Project to pack:       ./example_repo
 Leaves dir:            ./leaves
 
 Every mocactl command run from this directory needs the port-forward URLs
-in the environment (the staged .claude/settings.json does this for Claude;
-a plain shell picks them up via \`source .envrc\`).
+in the environment. Claude sessions get them from .claude/settings.json;
+for a plain shell, export them by hand:
+
+    export SH_CONTROL_PLANE_URL=${CP_URL}
+    export SH_HARNESS_URL=${HARNESS_URL}
 
 Notes:
 - The diagnose leaf dispatches with '--config ${DIGEST_PUBLIC}' (public-
@@ -274,7 +261,11 @@ echo "     (spawn, collect, chain) is the demo README's 'Appendix: running"
 echo "     the flow by hand':"
 echo ""
 echo "       cd ${SCRATCH_DIR}"
-echo "       source .envrc    # or: export the two URLs by hand"
+echo "     Export the two port-forward URLs (also recorded in MOCA.md):"
+echo ""
+echo "       export SH_CONTROL_PLANE_URL=${CP_URL}"
+echo "       export SH_HARNESS_URL=${HARNESS_URL}"
+echo ""
 echo "     The two config digests to dispatch leaves with are in MOCA.md."
 echo ""
 echo "  3. Or start Claude from the scratch dir and drive it with operator"
