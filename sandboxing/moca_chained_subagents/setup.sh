@@ -104,11 +104,10 @@ echo "==> Running mocactl doctor..."
 if ! SH_CONTROL_PLANE_URL="${CP_URL}" SH_HARNESS_URL="${HARNESS_URL}" mocactl doctor; then
   echo "" >&2
   echo "    doctor failed. Its output above includes the fix for each failing" >&2
-  echo "    check. Both port-forwards must be running:" >&2
-  echo "      kubectl port-forward -n ${MOCA_NS} svc/moca-supervisor ${HARNESS_PORT}:8080" >&2
-  echo "      kubectl port-forward -n ${MOCA_NS} svc/moca-control-plane ${CP_PORT}:8080" >&2
-  echo "    Context Service's public URL must also be reachable (configured in" >&2
-  echo "    MOCA's moca-context-service ConfigMap). See README prerequisites." >&2
+  echo "    check. The three port-forwards must be running (prereqs-install.sh" >&2
+  echo "    backgrounds them; logs: ~/.local/state/moca-chained-demo/). Check:" >&2
+  echo "      pgrep -f 'kubectl --context kind-${KIND_CLUSTER:-moca} .* port-forward'" >&2
+  echo "    Re-run ./prereqs-install.sh to restart them cleanly." >&2
   exit 1
 fi
 
@@ -136,8 +135,10 @@ if [[ "${cs_probe_status}" == "000" || -z "${cs_probe_status}" ]]; then
   echo "    but the client-side bundle upload will then fail with" >&2
   echo "    'cannot reach Context Service: fetch failed'." >&2
   echo "" >&2
-  echo "    Start the third port-forward (keep it running):" >&2
-  echo "      kubectl port-forward -n ${CONTEXT_SERVICE_NS} svc/context-service ${cs_local_port:-9090}:8080" >&2
+  echo "    The context-service port-forward is backgrounded by" >&2
+  echo "    prereqs-install.sh — tail its log for why it died:" >&2
+  echo "      ~/.local/state/moca-chained-demo/context-service.log" >&2
+  echo "    Re-run ./prereqs-install.sh to restart all three cleanly." >&2
   exit 1
 fi
 echo "    ok: Context Service public URL reachable at ${CS_PUBLIC_URL}"
@@ -248,13 +249,9 @@ echo "Setup complete."
 echo ""
 echo "Next steps:"
 echo ""
-echo "  1. Keep BOTH port-forwards running in other terminals:"
-echo ""
-echo "       kubectl port-forward -n ${MOCA_NS} svc/moca-supervisor ${HARNESS_PORT}:8080"
-echo "       kubectl port-forward -n ${MOCA_NS} svc/moca-control-plane ${CP_PORT}:8080"
-echo ""
-echo "     Context Service's public URL (configured in moca-context-service)"
-echo "     must be reachable from this host too; see README prerequisites."
+echo "  1. Port-forwards are backgrounded by prereqs-install.sh (logs:"
+echo "     ~/.local/state/moca-chained-demo/). If any are down, re-run"
+echo "     ./prereqs-install.sh — it kills stale ones and restarts cleanly."
 echo ""
 echo "  2. Drive the demo by hand from the scratch dir — the full sequence"
 echo "     (spawn, collect, chain) is the demo README's 'Appendix: running"
