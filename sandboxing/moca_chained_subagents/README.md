@@ -865,21 +865,27 @@ mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
 ### Optional durability beat (between prompts 1 and 2)
 
 Skip for a short recording; include to show the server owns the
-result.
+result. Full mechanics are in [§ Pause and resume](#pause-and-resume).
 
 1. `exit` Claude (operator "closes the laptop").
-2. `cd ~/tmp/moca-chained-scratch && claude`.
-3. *"Any subagents still pending from an earlier session?"* Claude
-   runs `mocactl subagents --tag …` and reads `leaves/*.json` to
-   reconstruct the chain.
+2. `cd ~/tmp/moca-chained-scratch && claude` — this starts a **new**
+   Claude session (Claude Code doesn't persist chat state in the
+   scratch dir); the parent has to re-discover the chain from the
+   on-disk notes + mocactl ledger.
+3. The next operator prompt (prompt 2 below) carries the "find any
+   pending leaves and collect" instruction; no separate re-discovery
+   prompt is needed in the fresh-session case. If instead the operator
+   kept the Claude session alive (e.g. `claude --resume`), the parent
+   already has the chain in context and prompt 2 reads normally.
 
-Scratch dir + mocactl ledger are the resumable state; the server-side
-result store carries the actual work.
+The scratch dir + mocactl ledger are the resumable state; the
+server-side result store carries the actual work.
 
 ### Prompt 2 — collect diagnose
 
-Paste the collect prompt. Then watch the session finalize and the
-result land:
+Paste the collect prompt. In a resumed session the parent still has
+the sessionId in context; in a fresh session it reads it back from
+`leaves/diagnose.json`. Either way the collect reads the same way:
 
 ```bash
 mocactl get "$SID" --json | jq .
