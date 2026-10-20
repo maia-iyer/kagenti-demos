@@ -137,9 +137,10 @@ git clone --recurse-submodules https://github.com/rossoctl/moca
 git clone https://github.com/rossoctl/context-service
 ```
 
-Point the install script at them with either `CLONE_DIR` (used as a prefix
-for both) or `MOCA_DIR` / `CONTEXT_SERVICE_DIR` individually. There are
-no defaults — at least one must be set.
+Set `CLONE_DIR` to the parent of both checkouts. The install script and
+`./setup.sh` both read it; MOCA is expected at `$CLONE_DIR/moca` and
+Context Service at `$CLONE_DIR/context-service`. Required — there is no
+default.
 
 ### Install the cluster-side pieces
 

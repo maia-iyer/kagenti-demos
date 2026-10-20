@@ -41,9 +41,10 @@ SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
 # operator prompts (one per leaf) carry the demo-specific details
 # (pack `./example_repo`, tag `moca-chained-subagents-demo`).
 # No default — operators clone rossoctl/moca themselves (see README
-# Prerequisites) and point MOCA_DIR at it. Same variable that
-# prereqs-install.sh reads.
-MOCA_DIR="${MOCA_DIR:-}"
+# Prerequisites) and point CLONE_DIR at the parent of that checkout.
+# Same variable that prereqs-install.sh reads; MOCA lives at $CLONE_DIR/moca.
+: "${CLONE_DIR:?CLONE_DIR is required: parent of the moca/ checkout (see README > Checkouts)}"
+MOCA_DIR="${CLONE_DIR}/moca"
 UPSTREAM_SKILL="${MOCA_DIR}/skills/moca-delegate-task/SKILL.md"
 
 echo "==> Prerequisite checks..."
@@ -86,18 +87,10 @@ if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
 fi
 echo "    ok: namespace ${MOCA_NS} exists"
 
-if [[ -z "${MOCA_DIR}" ]]; then
-  echo "    MOCA_DIR is not set. This demo stages upstream MOCA's" >&2
-  echo "    moca-delegate-task SKILL.md verbatim into the scratch dir." >&2
-  echo "    Point MOCA_DIR at your rossoctl/moca checkout:" >&2
-  echo "      MOCA_DIR=/path/to/rossoctl/moca ./setup.sh" >&2
-  echo "    (See README Prerequisites > Checkouts for the clone commands.)" >&2
-  exit 1
-fi
 if [[ ! -f "${UPSTREAM_SKILL}" ]]; then
   echo "    upstream skill not found: ${UPSTREAM_SKILL}" >&2
-  echo "    MOCA_DIR=${MOCA_DIR} does not look like a rossoctl/moca" >&2
-  echo "    checkout. Expected: \${MOCA_DIR}/skills/moca-delegate-task/SKILL.md" >&2
+  echo "    CLONE_DIR=${CLONE_DIR} does not contain a rossoctl/moca checkout" >&2
+  echo "    at moca/. Expected: \${CLONE_DIR}/moca/skills/moca-delegate-task/SKILL.md" >&2
   echo "    Verify the path and that the checkout is up to date (git pull)." >&2
   exit 1
 fi
