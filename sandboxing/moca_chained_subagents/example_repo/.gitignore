@@ -1,0 +1,7 @@
+# Python bytecode left by an in-tree test run (e.g. verifying the fixture locally).
+# A .pyc file is tagged with the Python version that produced it; the sandbox's Python
+# may be a different minor version and would ignore or reject it. `contextctl ctx pack`
+# honors this file, so the bundle never ships these.
+__pycache__/
+*.pyc
+*.pyo

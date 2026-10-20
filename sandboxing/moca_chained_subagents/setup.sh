@@ -38,8 +38,8 @@ SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
 
 # Upstream MOCA checkout — holds the moca-delegate-task skill, staged
 # verbatim into the scratch dir. This demo adds no overrides: the two
-# operator prompts (one per leaf) carry the demo-specific details
-# (pack `./example_repo`, tag `moca-chained-subagents-demo`).
+# operator prompts (one per leaf) carry the demo-specific detail
+# (tag `moca-chained-subagents-demo`).
 # No default — operators clone rossoctl/moca themselves (see README
 # Prerequisites) and point CLONE_DIR at the parent of that checkout.
 # Same variable that prereqs-install.sh reads; MOCA lives at $CLONE_DIR/moca.
@@ -165,22 +165,31 @@ mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
 staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
 cp "${UPSTREAM_SKILL}" "${staged_skill}"
 
-# The project the leaves pack lives at ./example_repo in the scratch dir —
-# NOT at the scratch dir root. Keeping it as a subdir means `leaves/` and
-# `.claude/` (parent-side bookkeeping) do not get picked up when the agent
-# runs `contextctl ctx pack ./example_repo`. Each leaf's workload then
-# contains only the fixture, independent of how many leaves ran before.
-cp -R "${SCRIPT_DIR}/example_repo" "${SCRATCH_DIR}/example_repo"
+# Flatten the fixture into the scratch dir, so the parent's cwd IS the project.
+# This matches the upstream moca-delegate-task skill's "the project is in your
+# working directory" assumption; operator prompts can pack `.` instead of
+# `./example_repo`. Parent-side bookkeeping (`leaves/`, `MOCA.md`, `.envrc`)
+# is kept out of each leaf's workload by `.gitignore` below -- contextctl ctx
+# pack honors it. `.claude/` is skipped by contextctl directly. Python bytecode
+# (`__pycache__/`, `*.pyc`, `*.pyo`) is filtered by the fixture's own
+# .gitignore inside the project tree.
+cp -R "${SCRIPT_DIR}/example_repo/." "${SCRATCH_DIR}/"
 
-# Purge any Python bytecode left in the fixture from a prior in-tree test run
-# (e.g. verifying it locally). A .pyc file is tagged with the Python version
-# that produced it (e.g. greet.cpython-311.pyc); the sandbox's Python may be
-# a different minor version and would ignore or reject it. (`contextctl ctx
-# pack` does not yet honor .gitignore, so this purge is what keeps those
-# files out of the bundle.)
-find "${SCRATCH_DIR}/example_repo" \
-  \( -name '__pycache__' -o -name '*.pyc' -o -name '*.pyo' \) \
-  -prune -exec rm -rf {} +
+# `git init` on the scratch dir so contextctl's .gitignore walk finds both the
+# fixture's own rules (copied in above) and the bookkeeping-ignore rules below.
+# The .git/ itself is skipped by contextctl. (-q so the init line doesn't drown
+# out the summary; -b main so no "fallback to master" warning on newer git.)
+git -C "${SCRATCH_DIR}" init -q -b main
+# APPEND (not overwrite) -- example_repo/.gitignore already lives at the root
+# with the fixture's pyc rules; this adds the parent-side-bookkeeping lines.
+cat >> "${SCRATCH_DIR}/.gitignore" <<'EOF'
+
+# Parent-side bookkeeping (added by setup.sh). The scratch dir is also the
+# project, so these paths sit alongside src/, tests/, etc.
+/leaves/
+/MOCA.md
+/.envrc
+EOF
 
 echo "==> Promoting the two config bundles..."
 # Config bundles carry each leaf's skills + commands (NOT CLAUDE.md). They
@@ -219,7 +228,7 @@ Control plane URL:     ${CP_URL}
 Harness URL:           ${HARNESS_URL}
 Config digest public:  ${DIGEST_PUBLIC}
 Config digest full:    ${DIGEST_FULL}
-Project to pack:       ./example_repo
+Project to pack:       .   (the scratch dir IS the project)
 Leaves dir:            ./leaves
 
 Every mocactl command run from this directory needs the port-forward URLs
@@ -234,8 +243,8 @@ Notes:
   posture skill, read-only workload). The fix leaf dispatches with
   '--config ${DIGEST_FULL} --writable' (full-access skill, per-run
   writable copy of the workload).
-- The agent packs ./example_repo and creates one workload per leaf at
-  dispatch time; those workloads are released after collection.
+- The agent packs its cwd (this scratch dir) and creates one workload
+  per leaf at dispatch time; those workloads are released after collection.
 - Each child's identity is (config digest, workload revision, sessionId) —
   three sha256-pinned handles, all server-held, all reconstructable from
   this file plus the mocactl ledger.
