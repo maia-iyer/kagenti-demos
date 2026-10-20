@@ -843,36 +843,42 @@ Three state types travel through this chain. All are reachable with
 access to the cluster. Run these in a side terminal while the main
 chain runs.
 
-Set these once (either `source .envrc`, or paste from the scratch
-dir's `MOCA.md`):
+Set these once (also printed by `./setup.sh`; `MOCA.md` records them):
 
 ```bash
-cd ~/tmp/moca-chained-scratch && source .envrc
+cd ~/tmp/moca-chained-scratch
+export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+export SH_HARNESS_URL=http://127.0.0.1:8080
 TAG=moca-chained-subagents-demo
 SID=$(jq -r .sessionId leaves/diagnose.json)
 WLID=$(jq -r .workloadId leaves/diagnose.json)
 ```
 
-### 1. Config bundle — sha256-pinned skills (control plane)
+### 1. Subagent config — sha256-pinned skills + commands (control plane)
 
-Promoted at `./setup.sh` time; same handle for every dispatch until
-teardown. Carries skills + commands, nothing else. `mocactl` has no
-`bundles list` yet, so the operator-visible record is the two digests
-setup wrote into `MOCA.md`, plus the `bundle` field on each session:
+Each dispatched subagent boots with a **subagent config** (`mocactl
+promote` uploads a directory of `.claude/skills/` and `.claude/commands/`
+as a content-addressed, sha256-pinned bundle on the control plane).
+This demo promotes two at `./setup.sh` time — `public-only` for the
+diagnose leaf, `full` for the fix leaf — and spawn carries the digest
+on `--config`. `mocactl` has no `bundles list` yet, so the
+operator-visible record is the two digests setup wrote into `MOCA.md`,
+plus the `bundle` field on each session:
 
 ```bash
 grep '^Config digest' MOCA.md             # the two promoted digests
 mocactl subagents --tag "$TAG" --json \
-  | jq -r '.subagents[] | "\(.sessionId[:12])  \(.bundle)"'
+  | jq -r '.subagents[] | select(.bundle != null) | "\(.sessionId[:12])  \(.bundle)"'
 ```
 
-The bundle field on each row tells you which posture that leaf booted
-with. After `./teardown.sh`, `mocactl bundles delete` has freed both.
+The `bundle` field on each row shows the digest that subagent booted
+with — tells you which posture it had. After `./teardown.sh`,
+`mocactl bundles delete` has freed both.
 
 ### 2. Workload — sha256-pinned files (Context Service)
 
-Created per leaf at dispatch, released after collection. Carries
-the fixture tree the leaf mounts.
+Created per leaf at dispatch, released after collection. Carries the
+fixture tree the subagent mounts.
 
 ```bash
 mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
@@ -882,28 +888,48 @@ The `revision` is the sha256 of the file tree; the `status` moves
 `creating` → `awaiting_upload` → `ready` → `deleted`. Watch it
 transition during a dispatch by re-running the command.
 
-### 3. Session — the per-leaf join (control plane)
+### 3. Session — the per-subagent join (control plane)
 
-The record that ties this leaf to one config bundle + one workload +
-one sandbox pod. 24h TTL on the result.
+The record that ties this subagent to one subagent config + one
+workload + one sandbox pod. 24h TTL on the result.
 
 ```bash
 mocactl get "$SID" --json | jq .
 # status progresses: queued → responded (or failed / paused)
 ```
 
-Once the leaf has finished:
+Once the subagent has finished:
 
 ```bash
-mocactl subagents --tag "$TAG"              # ledger view: this run's leaves
-cat leaves/"$SID".text | head                # the leaf's final message
+mocactl subagents --tag "$TAG"              # ledger view: this run's subagents
+cat leaves/"$SID".text | head               # the subagent's final message
 ```
 
 ### What the demo tag scopes
 
 `moca-chained-subagents-demo` is the operator-side handle for *"this
-demo's leaves"*. Scopes `mocactl subagents --tag`, teardown's
+demo's subagents"*. Scopes `mocactl subagents --tag`, teardown's
 reconciler, and nothing else — it's not a server-side identity.
+
+### Logs: what you can and can't see while the demo runs
+
+- **Supervisor / control plane / context-service pod logs are silent
+  per-request at steady state** (verified: tailed `kubectl logs` on
+  all three through a full dispatch cycle, zero bytes of new output).
+  Only startup/shutdown events. Projecting log tails would show
+  nothing happening.
+- **Sandbox pod logs are not useful mid-leaf.** The sandbox pods are
+  ephemeral worker containers; they execute tool calls but don't
+  stream a transcript. `kubectl logs -n moca-sandbox moca-sandbox-N`
+  shows the sandbox-service process, not the subagent's reasoning or
+  tool calls.
+- **Server has the tool-call history but doesn't expose it.** The
+  harness coordinates with the sandbox for every tool call; that
+  history is not surfaced through any `mocactl` command today. The
+  only transcript-shaped artifact is the subagent's final message
+  (`leaves/<sid>.text`) — which is why the `full-access-fix` skill
+  requires verbatim test output in the final report: it's the only
+  way to see what the subagent did.
 
 ### What's NOT visible from the client
 
