@@ -297,22 +297,14 @@ export SH_HARNESS_URL=http://127.0.0.1:8080
 > after it, and do not wait. End the turn as soon as the note is
 > written.
 
-Claude should:
-
-1. Read the `moca-delegate-task` skill.
-2. **Not** invoke `Task` — if it tries, the deny fires and it
-   re-routes through the skill.
-3. Write the leaf's prompt to `leaves/diagnose.prompt.txt`, pack its
-   cwd (`contextctl ctx pack . --type workspace -o
-   leaves/diagnose.context`), create its workload (`mocactl workloads
-   create --context leaves/diagnose.context --json`), then run
-   `mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind prompt
-   --config "$DIGEST_PUBLIC" --workload "$WORKLOAD_ID" --tag
-   moca-chained-subagents-demo --json`. Each permission prompt shows
-   a legible command — clearly a dispatch, not a local execution.
-4. Write the note `leaves/diagnose.json` (with `sessionId` and
-   `workloadId`), report the session id, and **stop**. The leaf is now
-   running on the cluster; this turn is over.
+Claude reads the `moca-delegate-task` skill (if it tries `Task`
+first, the deny fires and it re-routes), then: writes
+`leaves/diagnose.prompt.txt`, packs its cwd (`contextctl ctx pack .`),
+creates the workload, and runs `mocactl spawn … --config
+"$DIGEST_PUBLIC" --workload "$WORKLOAD_ID" --tag
+moca-chained-subagents-demo`. Each permission prompt shows a legible
+dispatch command. Claude writes `leaves/diagnose.json` with the
+`sessionId` + `workloadId`, reports the id, and stops.
 
 *Peek at state:* grab the handles the agent wrote and watch the
 workload transition:
@@ -323,12 +315,10 @@ mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
 # status: creating → awaiting_upload → ready; revision is the sha256 of the files
 ```
 
-*Optional durability beat.* Skip for a short recording; include to
-show the server owns the result. `exit` Claude ("close the laptop"),
-then `cd ~/tmp/moca-chained-scratch && claude` for a fresh session —
-prompt 2 below carries the "find any pending leaves and collect"
-instruction, so no separate re-discovery prompt is needed. Full
-mechanics in [§ Pause and resume](#pause-and-resume).
+*Optional durability beat.* To show the server owns the result,
+`exit` Claude and restart it (`cd ~/tmp/moca-chained-scratch && claude`)
+before prompt 2 — the fresh session re-discovers the chain from
+`leaves/*.json`. See [§ Pause and resume](#pause-and-resume).
 
 **Prompt 2 — collect the diagnosis.** When you're ready (seconds to
 hours later, same session or a resumed one):
@@ -362,25 +352,17 @@ mocactl get "$SID" --json | jq .
 > after it, and do not wait. End the turn as soon as the note is
 > written.
 
-Claude dispatches a second leaf, which packs its cwd again and creates
-its own workload (**with `--writable`**), with the diagnosis from
-Prompt 2 embedded verbatim in the new leaf's prompt.
-No seeding — the writable copy is served by Context Service into the
-sandbox automatically.
+Claude dispatches a second leaf with its own workload (**with
+`--writable`**) and the diagnosis embedded verbatim in the prompt.
 
 **Prompt 4 — collect the fix result.**
 
 > Check on it.
 
-Claude collects and surfaces the change and test outcome, then runs
-`mocactl workloads delete "$WORKLOAD_ID"` for the fix leaf's workload.
-The fix leaf's final message is the only record of its edits — the
-writable copy is discarded when the run ends. `Ran 1 test / OK` should
-appear in the final message.
-
-> **Note on isolation.** Each leaf is its own session; the diagnose
-> leaf's mount is read-only, and the fix leaf's writable copy is
-> isolated to that run. What flows between leaves is prompt text only.
+Claude surfaces the change and test outcome (`Ran 1 test / OK` in the
+final message), then deletes the workload. The final message is the
+only record of the leaf's edits — the writable copy is discarded when
+the run ends. What flows between leaves is prompt text only.
 
 ### Observe the chain
 
@@ -393,10 +375,9 @@ mocactl subagents --tag "$TAG" --json \
   | jq -r '.subagents[] | select(.bundle != null) | "\(.sessionId[:12])  \(.bundle)"'
 ```
 
-The `bundle` field shows which subagent config each dispatch booted
-with — tells you which posture it had. The demo tag is operator-side
-only (scopes `subagents --tag` and teardown); not a server-side
-identity.
+The `bundle` field shows which posture each dispatch booted with.
+The demo tag is operator-side (scopes `subagents --tag` and
+teardown), not a server-side identity.
 
 While leaves run, in another terminal:
 
@@ -405,34 +386,21 @@ kubectl -n moca get pods
 kubectl -n moca logs -f deploy/moca-supervisor
 ```
 
-Both the supervisor and the sandbox pods are **warm**. What you're
-watching for is the work landing in a sandbox pod that your laptop
-never touches.
-
-**What logs show (and don't).** Control plane and supervisor pods
-emit one JSON audit line per lifecycle event on stdout — identifiers
-only (`subject`, `sessionId`, decision tag), never prompt text, file
-contents, or credential values. Control plane logs `session_created`,
-`credential_issued`, `session_deleted`, `config_bundle_uploaded`,
-`refresh_issued`/`refresh_rotated`; supervisor logs `run_started` and
-`run_finalized` around each run (with the `workloadId` the leaf
-mounted). Grep for one dispatch:
+The supervisor and sandbox pods are **warm** — the work lands in a
+sandbox pod your laptop never touches. Control plane and supervisor
+emit one JSON audit line per lifecycle event (identifiers only — no
+prompt text, file contents, or credentials); grep by sessionId:
 
 ```bash
 SID=$(jq -r .sessionId leaves/diagnose.json)
 kubectl --context kind-moca -n moca logs deploy/moca-supervisor | \
   jq -c "select(.event==\"audit\" and .sessionId==\"$SID\")"
-kubectl --context kind-moca -n moca logs deploy/moca-control-plane | \
-  jq -c "select(.event==\"audit\" and .sessionId==\"$SID\")"
 ```
 
-Context Service pod logs are silent per-request. Sandbox pod logs
-show the sandbox-service process, not the subagent's reasoning or
-tool calls — the server has the tool-call history but doesn't expose
-it today. The only transcript-shaped artifact is the subagent's final
-message (`leaves/<sid>.text`), which is why the `full-access-fix`
-skill requires verbatim test output in the final report. Which
-sandbox pod a session pinned to isn't visible from the client.
+Context Service and sandbox pods don't surface per-request detail;
+the only transcript-shaped artifact is the subagent's final message
+(`leaves/<sid>.text`), which is why the `full-access-fix` skill
+requires verbatim test output in the final report.
 
 ## Pause and resume
 
@@ -585,6 +553,13 @@ dir (`~/.config/mocactl`), outside the demo, and setup no longer
 modifies any cluster-wide setting. Still: don't point it at anything
 you care about.
 
+The sandbox is also not a security boundary between users. Workloads
+are per-user, but the sandboxes themselves are shared — tasks from
+different users can run on the same sandbox, as the same Linux user,
+one after another. Per-workload sandboxes are
+[rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476)
+(phase-2).
+
 ## Files in this directory
 
 ```
@@ -647,71 +622,6 @@ mocactl subagents --tag moca-chained-subagents-demo
 cat leaves/diagnose.json          # note: label -> sessionId
 cat leaves/<sessionId>.text       # the collected result
 ```
-
-## Appendix: what's honest and what isn't
-
-**What the workloads migration gained:**
-
-- **Fixture delivery is a service, not a hack.** Context Service
-  mounts the frozen revision at the leaf's cwd; the parent runs no
-  `kubectl cp`, and the demo needs no cluster-admin access on the
-  sandbox namespace.
-- **Writes are per-run.** The fix leaf's edits are isolated to its
-  own copy and discarded when the run ends; a re-dispatched fix (new
-  workload, packed again from the scratch dir) starts from the frozen
-  revision, not from the previous run's edits.
-- **No token plumbing.** mocactl owns all auth; the demo touches no
-  token and stores no secret.
-- **No local CLI.** The demo is prompt templates and shell snippets
-  over the official clients (`mocactl`, `contextctl`).
-- **Durability is server-side.** `/v1/runs` completes and stores the
-  result regardless of any local process — quit Claude, reboot, it
-  doesn't matter (collect within 24h).
-
-**What it lost:**
-
-- **Cancel.** There is no server-side cancel for `/v1/runs` and no
-  headless cancel command. A dispatched leaf runs to completion; if
-  it went wrong, let it finish and ignore it, or re-dispatch a fresh
-  leaf.
-- **The streamed transcript.** Results are the leaf's final text
-  only — there is no tool-call log. If you need the leaf's reasoning
-  or the diff it applied, ask for it in the prompt.
-
-**Standing caveats:**
-
-- **`spawn` / `subagents` / `get` / `workloads` are Preview** upstream,
-  not Stable.
-- **The sandbox is not a security boundary between users.** Workloads
-  are per-user, but the sandboxes themselves are shared. Tasks from
-  different users can run on the same sandbox, as the same Linux
-  user, one after another. Per-workload sandboxes are
-  [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476)
-  (phase-2).
-- **Workload content is not durable storage.** The workload's frozen
-  revision is read-only, and writable per-run copies are discarded on
-  completion. There is no cross-run shared state in phase-1 workloads.
-- **Every leaf gets the same tools.** The read-only diagnose leaf is
-  read-only because the mount is read-only AND the prompt says so;
-  the fix leaf is writable only because `--writable` was passed and
-  the prompt says to edit. There is no per-leaf tool allowlist on
-  this install.
-- **Chaining is parent-side.** MOCA has no "on complete, trigger X"
-  primitive; the parent Claude session does the sequencing between
-  the operator's prompts.
-- **Orphan workloads if the agent dies between `workloads create` and
-  the note write.** `teardown.sh` reconciles workload leftovers by
-  reading `workloadId` from `leaves/*.json`. A workload created but
-  never recorded in a note (because the agent process died in the
-  seconds-wide window between `mocactl workloads create` returning
-  and the parent writing `leaves/<label>.json`) is unrecoverable by
-  teardown — `mocactl workloads` has no `list` subcommand to walk,
-  and the orphan sits on the user's quota (5 live workloads by
-  default) until it ages out. If `workloads create` starts failing
-  with `429 workload_quota_exceeded` after many abandoned runs, that
-  is the symptom; `mocactl workloads delete <id>` by id is the only
-  remedy today. The structural fix is a `mocactl workloads list`
-  subcommand — not yet upstream.
 
 ## Appendix: running the flow by hand
 
