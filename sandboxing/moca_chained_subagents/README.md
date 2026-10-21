@@ -819,25 +819,138 @@ Start a completely fresh chain (new tag, fresh scratch):
 ./teardown.sh && ./setup.sh
 ```
 
-## Appendix: durability — parent Claude Code quits mid-chain
+## Appendix: narrated flow — state movement + optional durability beat
 
-Same four prompts, one interjection between prompts 1 and 2. Arc
-ends on `OK`.
+The four operator prompts, with state snapshots at natural beats and
+one optional interjection between prompts 1 and 2. All snapshots use
+`mocactl` from the operator's shell — no `kubectl exec`. Arc ends on
+`OK`.
 
-1. **Prompt 1** — dispatch diagnose.
-2. `exit` Claude (operator "closes the laptop").
-3. `cd ~/tmp/moca-chained-scratch && claude` → *"Any subagents still
-   pending from an earlier session?"*
-4. **Prompt 2** — collect; diagnosis lands.
-5. **Prompts 3 and 4** — fix leaf, `Ran 1 test / OK`.
+Three state types travel through the chain:
 
-What this shows: the scratch dir plus the mocactl ledger are the
-resumable state; the server-side result store carries the work.
+- **Subagent config** — sha256-pinned skills + commands on the
+  control plane. One per posture, promoted at `./setup.sh` time.
+- **Workload** — sha256-pinned fixture files in Context Service.
+  One per leaf, created at dispatch, released after collection.
+- **Session** — the per-subagent join of subagent config + workload
+  + sandbox pod on the control plane. 24h result TTL.
 
-**Not shown live: sandbox pod killed mid-leaf.** The session
-reconnects to the respawned pod, but the per-session mount is
-per-pod-instance and doesn't come back. The leaf eventually
-`respond`s with an honest-failure message explaining the context
-disappeared, but "eventually" is several minutes while the leaf's
-model retries its tools with growing backoff — too slow for a live
-beat. The "What survives" table above has the one-line summary.
+### Setup once (per terminal)
+
+```bash
+cd ~/tmp/moca-chained-scratch
+export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+export SH_HARNESS_URL=http://127.0.0.1:8080
+TAG=moca-chained-subagents-demo
+```
+
+### Before prompt 1 — subagent configs are already live
+
+`./setup.sh` promoted two subagent configs (`mocactl promote` uploads
+a directory of `.claude/skills/` and `.claude/commands/` as a
+content-addressed bundle). `mocactl` has no `bundles list` yet, so
+the operator-visible record is the two digests setup wrote into
+`MOCA.md`:
+
+```bash
+grep '^Config digest' MOCA.md
+```
+
+### Prompt 1 — dispatch diagnose
+
+Paste the operator prompt from the "Run a session" section. Then grab
+the handles the agent wrote and watch the workload transition states:
+
+```bash
+SID=$(jq -r .sessionId leaves/diagnose.json)
+WLID=$(jq -r .workloadId leaves/diagnose.json)
+mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
+# status: creating → awaiting_upload → ready; revision is the sha256 of the files
+```
+
+### Optional durability beat (between prompts 1 and 2)
+
+Skip for a short recording; include to show the server owns the
+result. Full mechanics are in [§ Pause and resume](#pause-and-resume).
+
+1. `exit` Claude (operator "closes the laptop").
+2. `cd ~/tmp/moca-chained-scratch && claude` — this starts a **new**
+   Claude session (Claude Code doesn't persist chat state in the
+   scratch dir); the parent has to re-discover the chain from the
+   on-disk notes + mocactl ledger.
+3. The next operator prompt (prompt 2 below) carries the "find any
+   pending leaves and collect" instruction; no separate re-discovery
+   prompt is needed in the fresh-session case. If instead the operator
+   kept the Claude session alive (e.g. `claude --resume`), the parent
+   already has the chain in context and prompt 2 reads normally.
+
+The scratch dir + mocactl ledger are the resumable state; the
+server-side result store carries the actual work.
+
+### Prompt 2 — collect diagnose
+
+Paste the collect prompt. In a resumed session the parent still has
+the sessionId in context; in a fresh session it reads it back from
+`leaves/diagnose.json`. Either way the collect reads the same way:
+
+```bash
+mocactl get "$SID" --json | jq .
+# status progresses: queued → responded (or failed / paused)
+cat leaves/"$SID".text | head
+```
+
+### Prompts 3 and 4 — fix and collect
+
+Dispatch and collect the fix leaf. `Ran 1 test / OK` in its final
+message.
+
+### After the chain — whole-chain view
+
+```bash
+mocactl subagents --tag "$TAG"
+mocactl subagents --tag "$TAG" --json \
+  | jq -r '.subagents[] | select(.bundle != null) | "\(.sessionId[:12])  \(.bundle)"'
+```
+
+The `bundle` field on each row shows which subagent config that
+dispatch booted with — tells you which posture it had. The demo tag
+is operator-side only (scopes `subagents --tag` and teardown); not a
+server-side identity.
+
+### Logs: what you can and can't see while the demo runs
+
+- **Control plane and supervisor pods emit one JSON audit line per
+  lifecycle event on stdout** — identifiers only (`subject`,
+  `sessionId`, decision tag), never prompt text, file contents, or
+  credential values. Control plane logs `session_created`,
+  `credential_issued`, `session_deleted`, `config_bundle_uploaded`,
+  `refresh_issued`/`refresh_rotated`; supervisor logs `run_started`
+  and `run_finalized` around each run. Grep for one dispatch:
+  ```bash
+  SID=$(jq -r .sessionId leaves/diagnose.json)
+  kubectl --context kind-moca -n moca logs deploy/moca-supervisor | \
+    jq -c "select(.event==\"audit\" and .sessionId==\"$SID\")"
+  kubectl --context kind-moca -n moca logs deploy/moca-control-plane | \
+    jq -c "select(.event==\"audit\" and .sessionId==\"$SID\")"
+  ```
+- **Context service pod logs are silent per-request.** The
+  `workloadId` a leaf mounted is visible on the supervisor's
+  `run_started` line.
+- **Sandbox pod logs are not useful mid-leaf.** The sandbox pods are
+  ephemeral worker containers; they execute tool calls but don't
+  stream a transcript. `kubectl logs -n moca-sandbox moca-sandbox-N`
+  shows the sandbox-service process, not the subagent's reasoning or
+  tool calls.
+- **Server has the tool-call history but doesn't expose it.** The
+  harness coordinates with the sandbox for every tool call; that
+  history is not surfaced through any `mocactl` command today. The
+  only transcript-shaped artifact is the subagent's final message
+  (`leaves/<sid>.text`) — which is why the `full-access-fix` skill
+  requires verbatim test output in the final report: it's the only
+  way to see what the subagent did.
+
+### What's NOT visible from the client
+
+- Which sandbox pod the session pinned to (lives in Redis
+  `sh:sandbox:affinity:<sid>`; no client-side query today, and the
+  pod-stdout audit mirror doesn't carry the sandbox pod name either).
