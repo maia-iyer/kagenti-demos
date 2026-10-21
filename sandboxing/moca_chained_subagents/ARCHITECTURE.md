@@ -19,7 +19,7 @@ flowchart LR
       SKILL["skill: moca-delegate-task<br/>(upstream, verbatim)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · bundles/public-only/ · bundles/full/<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
+    SCRATCH[("Scratch dir (IS the project)<br/>src/ · tests/ · vendor/ · docs/ · README.md · MOCA.md<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json · .gitignore")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
     CTXCTL["contextctl<br/>(ctx pack @ dispatch time, per leaf)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
