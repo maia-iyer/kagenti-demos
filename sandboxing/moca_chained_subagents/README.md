@@ -456,50 +456,14 @@ checkouts; those are yours.
 - **`setup.sh` fails at doctor.** Follow the fix doctor prints for
   each failing check — it covers reachability, login, credentials,
   and the harness.
-- **`setup.sh` says this mocactl is too old.** Your `mocactl` predates
-  the `workloads` subcommand. Reinstall from the install script with
-  `MOCACTL_VERSION=edge` (see the Prerequisites section).
-- **A dispatch fails at `contextctl ctx pack`, or `__pycache__/` ships
-  in the bundle.** Your `contextctl` predates workspace bundles or
-  `.gitignore` support. Rebuild from
-  [`rossoctl/context-service`](https://github.com/rossoctl/context-service)
-  main (`make build`); verify with
-  `contextctl ctx pack --help | grep -q no-ignore`.
 - **A dispatch fails at `mocactl workloads create` with "Context
   Service refused the upload".** Context Service's public URL may not
-  be reachable from this host, or the Context Service version may
-  predate workspace bundles. Check the `moca-context-service`
+  be reachable from this host. Check the `moca-context-service`
   ConfigMap and that your port-forward (or whatever makes `public-url`
-  reachable) is up. Setup still probes this once at startup; a mid-run
+  reachable) is up. Setup probes this once at startup; a mid-run
   outage can trigger the same failure.
-- **`get` says "has not finished yet" forever, and `subagents` shows
-  `unknown`.** The detached worker died before the server recorded
-  anything — typically the port-forward was down at dispatch, or the
-  supervisor restarted mid-run. The result will never land;
-  re-dispatch a fresh leaf (under a new label). The worker's log, if
-  you want the corpse: `~/.local/state/mocactl/spawn-<sessionId>.log`.
-- **`subagents` shows `failed` / `fetch failed` right at the five-minute
-  mark, but `get` still says `queued`.** Not necessarily a failure: the
-  spawn worker's sync `POST /v1/runs` carries Node's default 300-second
-  response timeout, so the worker's own fetch is cut off five minutes in
-  while the run keeps going on the server. Keep collecting — `get`
-  eventually printing `responded` means all is well (only the ledger
-  state is wrong, and it is sticky). If `get` stays `queued` well past
-  that, the run itself never finished server-side — re-dispatch under a
-  fresh label.
 - **`get` says `no session`.** Wrong session id, or the session was
   deleted / aged out past 24h.
-- **A fix leaf reports edits but you can't find them.** Writable
-  per-run copies are **discarded when the run ends.** The leaf's
-  final message is the only record. If a prompt forgot to ask for the
-  diff and test output verbatim, re-dispatch under a fresh label with
-  a prompt that does.
-- **Claude tries `Task` and gets denied, then stops.** The skill
-  wasn't found. Confirm
-  `~/tmp/moca-chained-scratch/.claude/skills/moca-delegate-task/SKILL.md`
-  exists; re-run `./setup.sh` if it doesn't.
-- **Re-dispatching after a failure.** Use a fresh label (`diagnose2`)
-  so the previous note and prompt files aren't overwritten.
 
 ## Security note
 
