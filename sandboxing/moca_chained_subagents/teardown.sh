@@ -42,30 +42,19 @@ if [[ -f "${MOCA_MD}" ]]; then
 fi
 
 SESSION_IDS=""
+WORKLOAD_IDS=""
 if command -v mocactl >/dev/null 2>&1; then
   if listing="$(mocactl subagents --tag "${TAG}" --json 2>/dev/null)"; then
     SESSION_IDS="$(printf '%s' "${listing}" \
       | jq -r '.subagents[]?.sessionId' 2>/dev/null || true)"
+    # workloadId is on the ledger row (`.workload`) atomically with the
+    # spawn, so a row with `.workload != null` is a workload teardown
+    # should attempt to release.
+    WORKLOAD_IDS="$(printf '%s' "${listing}" \
+      | jq -r '.subagents[]? | select(.workload != null) | .workload' 2>/dev/null || true)"
   else
     echo "    (mocactl could not list the tag's subagents — port-forward down?)" >&2
   fi
-fi
-# Union with the parent's per-leaf notes in the scratch dir, so teardown
-# still works when mocactl cannot reach the cluster. Workload ids live
-# only on the notes (one per leaf — there is no shared workload anymore).
-WORKLOAD_IDS=""
-if [[ -d "${SCRATCH_DIR}/leaves" ]]; then
-  for note in "${SCRATCH_DIR}"/leaves/*.json; do
-    [[ -e "${note}" ]] || continue
-    sid="$(jq -r '.sessionId // empty' "${note}" 2>/dev/null || true)"
-    if [[ -n "${sid}" ]]; then
-      SESSION_IDS="$(printf '%s\n%s' "${SESSION_IDS}" "${sid}")"
-    fi
-    wid="$(jq -r '.workloadId // empty' "${note}" 2>/dev/null || true)"
-    if [[ -n "${wid}" ]]; then
-      WORKLOAD_IDS="$(printf '%s\n%s' "${WORKLOAD_IDS}" "${wid}")"
-    fi
-  done
 fi
 SESSION_IDS="$(printf '%s\n' "${SESSION_IDS}" | sed '/^$/d' | sort -u)"
 WORKLOAD_IDS="$(printf '%s\n' "${WORKLOAD_IDS}" | sed '/^$/d' | sort -u)"
@@ -90,7 +79,7 @@ echo "==> Deleting leftover workloads..."
 # collected). Writable per-run copies are discarded when the run ends;
 # the shared read-only cache is released by DELETE /workloads/{id}.
 if [[ -z "${WORKLOAD_IDS}" ]]; then
-  echo "    (no workload ids in leaf notes; nothing to delete)"
+  echo "    (no workload ids on ledger rows for this tag; nothing to delete)"
 else
   for wid in ${WORKLOAD_IDS}; do
     if mocactl workloads delete "${wid}" >/dev/null 2>&1; then

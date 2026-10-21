@@ -77,7 +77,16 @@ if ! printf '%s' "${workloads_probe}" | grep -q 'workloads needs create, get or 
   echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
   exit 1
 fi
-echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + subagent commands present)"
+# --label is how the demo keys per-leaf tracking on the ledger instead of in
+# sidecar files. An old mocactl without --label would accept the flag's value
+# as part of the prompt and silently miss the mnemonic.
+label_probe="$(mocactl spawn --help 2>&1 || true; mocactl --help 2>&1 || true)"
+if ! printf '%s' "${label_probe}" | grep -q -- '--label'; then
+  echo "    this mocactl has no 'spawn --label' flag — too old." >&2
+  echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
+  exit 1
+fi
+echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + spawn --label present)"
 
 if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
   echo "    namespace '${MOCA_NS}' not found on current kubectl context." >&2

@@ -38,17 +38,16 @@ the only record of what it did — if you want a diff or test output,
 the prompt must ask for it as text (the templates in "Running the flow
 by hand" below already do).
 
-If you need to inspect a workload's frozen revision, read the leaf's
-note (`leaves/<label>.json`) for its `workloadId` and use
-`mocactl workloads get <workloadId>` — but only before the agent runs
-`workloads delete` on that leaf's workload after collection.
-
-Local leaf state lives in `leaves/` in the scratch dir:
+If you need to inspect a workload's frozen revision, look up its id
+from the ledger and use `mocactl workloads get <workloadId>` — but only
+before the agent runs `workloads delete` on that leaf's workload after
+collection.
 
 ```bash
 cd ~/tmp/moca-chained-scratch
 mocactl subagents --tag moca-chained-subagents-demo
-cat leaves/diagnose.json          # note: label -> sessionId
+mocactl subagents --tag moca-chained-subagents-demo --json \
+  | jq -r '.subagents[] | select(.label=="diagnose") | .workload'
 cat leaves/<sessionId>.text       # the collected result
 ```
 
@@ -100,38 +99,33 @@ DIAG_WORKLOAD_ID="$(mocactl workloads create \
 ```
 
 **3 — dispatch it.** Read-only, so just `--workload` (no `--writable`),
-and the public-posture config bundle via `--config`. `--json` prints one
-line on stdout (`{"type":"session","sessionId":"…","pid":…}`);
-diagnostics go to stderr:
+the public-posture config bundle via `--config`, and `--label diagnose`
+so a resumed session can find it by name. `--json` prints one line on
+stdout (`{"type":"session","sessionId":"…","pid":…}`); diagnostics go
+to stderr:
 
 ```bash
 mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind prompt \
   --config "$DIGEST_PUBLIC" \
-  --workload "$DIAG_WORKLOAD_ID" --tag "$TAG" --json
-SID="<paste the sessionId from that line>"
+  --workload "$DIAG_WORKLOAD_ID" --tag "$TAG" --label diagnose --json
 ```
 
-**4 — write the note** (this is what a resumed session reads):
+Then **stop**. The leaf is durable server-side; no sidecar note needed
+— `mocactl subagents --tag "$TAG" --json` reads back the label,
+sessionId, workloadId, bundle digest, and state. Durability spot-check
+(worth doing once): Ctrl-C the supervisor's port-forward while the
+leaf runs, restore it, and collect anyway — step 4 still works, because
+the server finishes the run no matter what your laptop did.
+
+**4 — collect** (later; re-run every minute or so until done — each
+check is free and does not disturb the leaf). Look up the sessionId
+and workloadId from the ledger by label:
 
 ```bash
-cat > leaves/diagnose.json <<EOF
-{"label":"diagnose","sessionId":"$SID","workloadId":"$DIAG_WORKLOAD_ID",
- "kind":"prompt","writable":false,
- "promptFile":"leaves/diagnose.prompt.txt",
- "dispatchedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
-EOF
-```
-
-Then **stop**. The leaf is durable server-side; there is nothing to
-babysit. Durability spot-check (worth doing once): Ctrl-C the
-supervisor's port-forward while the leaf runs, restore it, and
-collect anyway — step 5 still works, because the server finishes the
-run no matter what your laptop did.
-
-**5 — collect** (later; re-run every minute or so until done — each
-check is free and does not disturb the leaf):
-
-```bash
+SID=$(mocactl subagents --tag "$TAG" --json \
+  | jq -r '.subagents[] | select(.label=="diagnose") | .sessionId')
+WLID=$(mocactl subagents --tag "$TAG" --json \
+  | jq -r '.subagents[] | select(.label=="diagnose") | .workload')
 mocactl get "$SID" --out leaves --json
 ```
 
@@ -143,7 +137,7 @@ twin, and `mocactl subagents` calls both of them `done`:
 
 ```bash
 cat leaves/"$SID".text
-mocactl workloads delete "$DIAG_WORKLOAD_ID"
+mocactl workloads delete "$WLID"
 ```
 
 The diagnosis should name the renamed API: `src/greet.py` calls
@@ -152,7 +146,7 @@ exports only `new_name`. The sandbox image ships `python3` but no
 `pip`; the project is stdlib-only, so `python3 -m unittest` runs
 directly.
 
-**6 — chain the fix leaf.** Author its prompt with the diagnosis
+**5 — chain the fix leaf.** Author its prompt with the diagnosis
 inlined **verbatim** (never point one leaf at another leaf's files —
 each leaf has its own view / writable copy):
 
@@ -175,9 +169,9 @@ testing convention, the src/-not-vendor/ rule, the "no pip" rule, and
 the verbatim-test-output deliverable. The prompt only has to pass
 through the prior leaf's diagnosis.
 
-Pack a fresh workload for the fix leaf, dispatch it with `--writable`,
-then collect and release. `get` exit 1 with "has not finished yet"
-just means still running:
+Pack a fresh workload for the fix leaf, dispatch it with `--writable`
+and `--label fix`, then collect and release. `get` exit 1 with "has
+not finished yet" just means still running:
 
 ```bash
 contextctl ctx pack . --type workspace -o leaves/fix.context
@@ -186,16 +180,10 @@ FIX_WORKLOAD_ID="$(mocactl workloads create \
 
 mocactl spawn "$(cat leaves/fix.prompt.txt)" --kind prompt \
   --config "$DIGEST_FULL" \
-  --workload "$FIX_WORKLOAD_ID" --writable --tag "$TAG" --json
-FIX_SID="<paste the sessionId>"
+  --workload "$FIX_WORKLOAD_ID" --writable --tag "$TAG" --label fix --json
 
-cat > leaves/fix.json <<EOF
-{"label":"fix","sessionId":"$FIX_SID","workloadId":"$FIX_WORKLOAD_ID",
- "kind":"prompt","writable":true,
- "promptFile":"leaves/fix.prompt.txt",
- "dispatchedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
-EOF
-
+FIX_SID=$(mocactl subagents --tag "$TAG" --json \
+  | jq -r '.subagents[] | select(.label=="fix") | .sessionId')
 mocactl get "$FIX_SID" --out leaves --json
 cat leaves/"$FIX_SID".text
 mocactl workloads delete "$FIX_WORKLOAD_ID"
@@ -205,7 +193,7 @@ The report should say `src/greet.py` changed (`old_name` → `new_name`) and
 that the tests pass. There is no "inspect the sandbox" fallback: the
 writable copy is gone when the run ends.
 
-**7 — see the whole chain:**
+**6 — see the whole chain:**
 
 ```bash
 mocactl subagents --tag "$TAG"
@@ -217,7 +205,7 @@ a long leaf shows up here as `failed` / `fetch failed` even though it
 completed server-side (see "Pause and resume" in the README). `mocactl get`
 is the source of truth: `responded` means it finished.
 
-**8 — tear down:**
+**7 — tear down:**
 
 ```bash
 cd -   # back to the demo dir
@@ -235,7 +223,7 @@ FIX2_WORKLOAD_ID="$(mocactl workloads create \
   --context leaves/fix2.context --json | jq -r '.workloadId')"
 mocactl spawn "$(cat leaves/fix2.prompt.txt)" --kind prompt \
   --config "$DIGEST_FULL" \
-  --workload "$FIX2_WORKLOAD_ID" --writable --tag "$TAG" --json
+  --workload "$FIX2_WORKLOAD_ID" --writable --tag "$TAG" --label fix2 --json
 ```
 
 Start a completely fresh chain (new tag, fresh scratch):
