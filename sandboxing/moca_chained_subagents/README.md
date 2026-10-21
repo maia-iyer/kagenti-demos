@@ -66,20 +66,20 @@ Four pieces cooperate:
    leaf is being dispatched to MOCA, not run locally.
 
 - **Setup time.** `mocactl login` + an inference credential (verified
-  end-to-end by `mocactl doctor`), a scratch dir staged with the
-  example project at `./example_repo/` (not the scratch root — this
-  keeps parent-side bookkeeping like `leaves/` and `.claude/` out of
-  each leaf's workload bundle), and `mocactl promote` on each of
-  `bundles/public-only/` and `bundles/full/` so their sha256 digests
-  are in `MOCA.md` for the agent to reference. No workload is created
-  yet — the agent packs and creates one per leaf at dispatch.
+  end-to-end by `mocactl doctor`), the scratch dir staged **as the
+  project** (the fixture flattens into the scratch root; a `.gitignore`
+  excludes parent-side bookkeeping like `leaves/` and `MOCA.md`, and
+  `contextctl ctx pack` skips `.claude/` directly), and `mocactl
+  promote` on each of `bundles/public-only/` and `bundles/full/` so
+  their sha256 digests are in `MOCA.md` for the agent to reference. No
+  workload is created yet — the agent packs and creates one per leaf
+  at dispatch.
 - **Dispatch.** The parent authors `leaves/<label>.prompt.txt`, packs
-  the project subdir (`contextctl ctx pack ./example_repo --type
-  workspace -o leaves/<label>.context`), creates a workload for just
-  that leaf (`mocactl workloads create --context
-  leaves/<label>.context --json`), runs `mocactl spawn "$(cat
-  leaves/<label>.prompt.txt)" --kind prompt --config "$DIGEST"
-  --workload "$WORKLOAD_ID" [--writable] --tag
+  its cwd (`contextctl ctx pack . --type workspace -o
+  leaves/<label>.context`), creates a workload for just that leaf
+  (`mocactl workloads create --context leaves/<label>.context --json`),
+  runs `mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt
+  --config "$DIGEST" --workload "$WORKLOAD_ID" [--writable] --tag
   moca-chained-subagents-demo --json`, writes the note file (with the
   leaf's `workloadId` and `configDigest`), and **stops** — no waiting,
   no polling, no seeding. The diagnose leaf dispatches with
@@ -125,7 +125,8 @@ session reconstructs the picture from those notes plus
   Probe: `mocactl workloads` must say `workloads needs create, get or delete`.
 - [`contextctl`](https://github.com/rossoctl/context-service) with the
   `ctx pack` subcommand (build from main — `make build` — until a release
-  with workspace bundles ships). `make build` writes to
+  ships). The pack must honor `.gitignore`; verify with
+  `contextctl ctx pack --help | grep -q no-ignore`. `make build` writes to
   `<context-service>/bin/contextctl`; put that on `PATH`.
 
 ### Checkouts
@@ -225,13 +226,14 @@ This:
    and that the `moca` namespace exists.
 2. Runs `mocactl doctor` against the port-forwards — reachability,
    login, credential, harness, and an end-to-end scratch session.
-3. Stages the scratch dir at `~/tmp/moca-chained-scratch/`:
+3. Stages the scratch dir at `~/tmp/moca-chained-scratch/` **as the
+   project**: the fixture flattens into the scratch root alongside
    `.claude/settings.json` (with the port-forward URLs injected as env),
-   the `moca-delegate-task` skill (upstream SKILL.md, verbatim),
-   `example_repo/` as a subdir (so the agent packs just the project,
-   not parent-side bookkeeping), and an empty `leaves/`. By-hand shells
-   export the two port-forward URLs themselves — the exact lines are
-   printed by `setup.sh` and recorded in `MOCA.md`.
+   the `moca-delegate-task` skill (upstream SKILL.md, verbatim), an
+   empty `leaves/`, and a `.gitignore` that excludes `leaves/` and
+   `MOCA.md` so `contextctl ctx pack .` captures only the project.
+   By-hand shells export the two port-forward URLs themselves — the
+   exact lines are printed by `setup.sh` and recorded in `MOCA.md`.
 
 Setup creates **no workload, no session, and seeds nothing per pod** —
 the agent packs the scratch dir and runs `mocactl workloads create`
@@ -266,26 +268,26 @@ not encode the flow; you drive it.
 
 **Prompt 1 — start the diagnosis.** Paste something like:
 
-> Dispatch a subagent to diagnose why the project at `./example_repo`
-> is failing its tests. Pack `./example_repo`, dispatch with the
-> **public-only** config digest from `MOCA.md` (`--config $DIGEST_PUBLIC`),
-> read-only (no `--writable`), tag `moca-chained-subagents-demo`.
-> Tell the leaf to use its `public-research` skill. `mocactl spawn`
-> must be the last tool call of this turn — do not call `get`,
-> `subagents`, or `sleep` after it, and do not wait. End the turn as
-> soon as the note is written.
+> Dispatch a subagent to diagnose why this project is failing its
+> tests. Pack your cwd, dispatch with the **public-only** config digest
+> from `MOCA.md` (`--config $DIGEST_PUBLIC`), read-only (no
+> `--writable`), tag `moca-chained-subagents-demo`. Tell the leaf to
+> use its `public-research` skill. `mocactl spawn` must be the last
+> tool call of this turn — do not call `get`, `subagents`, or `sleep`
+> after it, and do not wait. End the turn as soon as the note is
+> written.
 
 Claude should:
 
 1. Read the `moca-delegate-task` skill.
 2. **Not** invoke `Task` — if it tries, the deny fires and it
    re-routes through the skill.
-3. Write the leaf's prompt to `leaves/diagnose.prompt.txt`, pack the
-   project subdir (`contextctl ctx pack ./example_repo --type
-   workspace -o leaves/diagnose.context`), create its workload
-   (`mocactl workloads create --context leaves/diagnose.context --json`),
-   then run `mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind
-   prompt --config "$DIGEST_PUBLIC" --workload "$WORKLOAD_ID" --tag
+3. Write the leaf's prompt to `leaves/diagnose.prompt.txt`, pack its
+   cwd (`contextctl ctx pack . --type workspace -o
+   leaves/diagnose.context`), create its workload (`mocactl workloads
+   create --context leaves/diagnose.context --json`), then run
+   `mocactl spawn "$(cat leaves/diagnose.prompt.txt)" --kind prompt
+   --config "$DIGEST_PUBLIC" --workload "$WORKLOAD_ID" --tag
    moca-chained-subagents-demo --json`. Each permission prompt shows
    a legible command — clearly a dispatch, not a local execution.
 4. Write the note `leaves/diagnose.json` (with `sessionId` and
@@ -306,9 +308,9 @@ record `collectedAt` / `deletedAt` on the note.
 
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
-> Good. Dispatch another subagent to apply that fix. Pack
-> `./example_repo`, dispatch with the **full** config digest from
-> `MOCA.md` (`--config $DIGEST_FULL`) and `--writable`, tag
+> Good. Dispatch another subagent to apply that fix. Pack your cwd,
+> dispatch with the **full** config digest from `MOCA.md`
+> (`--config $DIGEST_FULL`) and `--writable`, tag
 > `moca-chained-subagents-demo`. Tell the leaf to use its
 > `full-access-fix` skill and inline the previous leaf's diagnosis
 > verbatim into the prompt. `mocactl spawn` must be the last tool
@@ -316,9 +318,9 @@ record `collectedAt` / `deletedAt` on the note.
 > after it, and do not wait. End the turn as soon as the note is
 > written.
 
-Claude dispatches a second leaf, which packs the project subdir again
-and creates its own workload (**with `--writable`**), with the
-diagnosis from Prompt 2 embedded verbatim in the new leaf's prompt.
+Claude dispatches a second leaf, which packs its cwd again and creates
+its own workload (**with `--writable`**), with the diagnosis from
+Prompt 2 embedded verbatim in the new leaf's prompt.
 No seeding — the writable copy is served by Context Service into the
 sandbox automatically.
 
@@ -446,10 +448,12 @@ checkouts; those are yours.
 - **`setup.sh` says this mocactl is too old.** Your `mocactl` predates
   the `workloads` subcommand. Reinstall from the install script with
   `MOCACTL_VERSION=edge` (see the Prerequisites section).
-- **A dispatch fails at `contextctl ctx pack`.** Your `contextctl`
-  predates workspace bundles. Rebuild from
+- **A dispatch fails at `contextctl ctx pack`, or `__pycache__/` ships
+  in the bundle.** Your `contextctl` predates workspace bundles or
+  `.gitignore` support. Rebuild from
   [`rossoctl/context-service`](https://github.com/rossoctl/context-service)
-  main (`make build`).
+  main (`make build`); verify with
+  `contextctl ctx pack --help | grep -q no-ignore`.
 - **A dispatch fails at `mocactl workloads create` with "Context
   Service refused the upload".** Context Service's public URL may not
   be reachable from this host, or the Context Service version may
@@ -510,9 +514,9 @@ setup.sh                   Verifies prereqs via mocactl doctor, stages the scrat
 teardown.sh                Deletes the demo's leaf sessions, any leftover workloads, and
                            the two config bundles; removes the scratch dir
 example_repo/              The project the demo exercises — a stdlib-only Python project
-                           with a renamed-API bug. Staged into the scratch dir as the
-                           `./example_repo/` subdir at setup time; the parent packs that
-                           at each dispatch.
+                           with a renamed-API bug. Its contents flatten into the scratch
+                           dir at setup time, so the parent's cwd IS the project; the
+                           parent packs that cwd at each dispatch.
 bundles/                   Two config bundles promoted at setup time: `public-only/`
                            (public-posture skill for the diagnose leaf) and `full/`
                            (full-access skill for the fix leaf). Each is a `.claude/skills/`
@@ -523,13 +527,15 @@ bundles/                   Two config bundles promoted at setup time: `public-on
 In the scratch dir after `setup.sh`:
 
 ```
-~/tmp/moca-chained-scratch/
+~/tmp/moca-chained-scratch/   The scratch dir IS the project — the fixture is flattened here.
 ├── .claude/
 │   ├── settings.json      Permission policy + port-forward env for mocactl
 │   └── skills/
 │       └── moca-delegate-task/SKILL.md   Upstream SKILL.md, verbatim
-├── MOCA.md                Written by setup.sh — the two promoted config digests + run facts (also prints the two `export` lines for by-hand shells)
-├── example_repo/          src/ tests/ vendor/ docs/ README.md — the project the leaves pack
+├── .git/                  So `.gitignore` is honored by `contextctl ctx pack`
+├── .gitignore             Keeps `leaves/`, `MOCA.md` out of each leaf's workload
+├── MOCA.md                Written by setup.sh — the two promoted config digests + run facts
+├── README.md src/ tests/ vendor/ docs/   The fixture, at the scratch root
 └── leaves/                Leaf prompts, per-leaf .context bundles, notes (*.json), results (<sid>.text)
 ```
 
@@ -662,7 +668,7 @@ to name the task.
 **2 — pack the project subdir and create this leaf's workload:**
 
 ```bash
-contextctl ctx pack ./example_repo --type workspace \
+contextctl ctx pack . --type workspace \
   -o leaves/diagnose.context
 DIAG_WORKLOAD_ID="$(mocactl workloads create \
   --context leaves/diagnose.context --json | jq -r '.workloadId')"
@@ -749,7 +755,7 @@ then collect and release. `get` exit 1 with "has not finished yet"
 just means still running:
 
 ```bash
-contextctl ctx pack ./example_repo --type workspace -o leaves/fix.context
+contextctl ctx pack . --type workspace -o leaves/fix.context
 FIX_WORKLOAD_ID="$(mocactl workloads create \
   --context leaves/fix.context --json | jq -r '.workloadId')"
 
@@ -799,7 +805,7 @@ prompt file and edit as needed):
 
 ```bash
 cp leaves/fix.prompt.txt leaves/fix2.prompt.txt
-contextctl ctx pack ./example_repo --type workspace -o leaves/fix2.context
+contextctl ctx pack . --type workspace -o leaves/fix2.context
 FIX2_WORKLOAD_ID="$(mocactl workloads create \
   --context leaves/fix2.context --json | jq -r '.workloadId')"
 mocactl spawn "$(cat leaves/fix2.prompt.txt)" --kind prompt \
