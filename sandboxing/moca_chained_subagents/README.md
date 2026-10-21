@@ -913,11 +913,23 @@ server-side identity.
 
 ### Logs: what you can and can't see while the demo runs
 
-- **Supervisor / control plane / context-service pod logs are silent
-  per-request at steady state** (verified: tailed `kubectl logs` on
-  all three through a full dispatch cycle, zero bytes of new output).
-  Only startup/shutdown events. Projecting log tails would show
-  nothing happening.
+- **Control plane and supervisor pods emit one JSON audit line per
+  lifecycle event on stdout** — identifiers only (`subject`,
+  `sessionId`, decision tag), never prompt text, file contents, or
+  credential values. Control plane logs `session_created`,
+  `credential_issued`, `session_deleted`, `config_bundle_uploaded`,
+  `refresh_issued`/`refresh_rotated`; supervisor logs `run_started`
+  and `run_finalized` around each run. Grep for one dispatch:
+  ```bash
+  SID=$(jq -r .sessionId leaves/diagnose.json)
+  kubectl --context kind-moca -n moca logs deploy/moca-supervisor | \
+    jq -c "select(.event==\"audit\" and .sessionId==\"$SID\")"
+  kubectl --context kind-moca -n moca logs deploy/moca-control-plane | \
+    jq -c "select(.event==\"audit\" and .sessionId==\"$SID\")"
+  ```
+- **Context service pod logs are silent per-request.** The
+  `workloadId` a leaf mounted is visible on the supervisor's
+  `run_started` line.
 - **Sandbox pod logs are not useful mid-leaf.** The sandbox pods are
   ephemeral worker containers; they execute tool calls but don't
   stream a transcript. `kubectl logs -n moca-sandbox moca-sandbox-N`
@@ -934,5 +946,5 @@ server-side identity.
 ### What's NOT visible from the client
 
 - Which sandbox pod the session pinned to (lives in Redis
-  `sh:sandbox:affinity:<sid>`; no client-side query today).
-- The audit stream (`session_created`, `credential_issued` events).
+  `sh:sandbox:affinity:<sid>`; no client-side query today, and the
+  pod-stdout audit mirror doesn't carry the sandbox pod name either).
