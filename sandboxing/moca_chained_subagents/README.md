@@ -26,89 +26,46 @@ and the model composes multi-leaf flows from the operator's requests.
 
 Four pieces cooperate:
 
-1. **A skill (`moca-delegate-task`)** — upstream MOCA's delegation
-   skill, staged verbatim. Tells Claude how to invoke `contextctl ctx
-   pack` / `mocactl workloads create` / `mocactl spawn` / `get` /
-   `subagents` / `mocactl workloads delete`, how to compose leaf
-   prompts (project-is-at-your-cwd, read-only vs writable, "end your
-   turn with the full report"), and how to chain leaves by inlining
-   the previous leaf's collected text verbatim into the next prompt.
-   The two demo-specific details — pack `.` (the scratch dir *is* the
-   project), tag every spawn `moca-chained-subagents-demo` so teardown
-   can find the leaves — live in the operator's prompts, not the
-   skill. The skill does **not** prescribe how many leaves to run or
-   in what order — that also comes from the operator's prompts.
-2. **`mocactl`** — the official MOCA client, on your `PATH` (never
-   staged or wrapped by the demo). It owns **all** auth: the GitHub
-   device-flow login, the API token, and the per-session tokens it
-   mints itself, all in `~/.config/mocactl` outside this demo. The
-   subagent commands it provides: `spawn` (new session per leaf +
-   detached worker + a row in the machine-global ledger at
-   `~/.local/state/mocactl/subagents.jsonl`), `get` (writes result
-   files), `subagents` (lists the ledger joined with live state).
-   The `workloads create / get / delete` subcommands manage the
-   context-service bundle each leaf mounts — this demo creates one
-   workload per leaf at dispatch and deletes it after collection.
-   `mocactl promote` / `bundles delete` manage the per-leaf config
-   bundles described next.
+1. **The `moca-delegate-task` skill** — upstream MOCA's delegation skill,
+   staged verbatim. Tells Claude how to pack, dispatch, collect, and
+   chain leaves (inline the previous leaf's text verbatim into the next
+   prompt). Demo-specific details — pack `.`, tag every spawn
+   `moca-chained-subagents-demo` — come from the operator's prompts, not
+   the skill.
+2. **`mocactl`** — the official MOCA client on your `PATH`. Owns all
+   auth in `~/.config/mocactl`. Provides `spawn` / `get` / `subagents`
+   for sessions, `workloads create / get / delete` for the per-leaf
+   context-service bundle, and `promote` / `bundles delete` for config
+   bundles.
 3. **Two promoted config bundles** — `bundles/public-only/` and
-   `bundles/full/`. Each is a directory of `.claude/skills/` content
-   that `mocactl promote` uploads as a content-addressed, sha256-pinned
-   bundle (**not** `CLAUDE.md`; `promote` only ships skills and
-   commands). The diagnose leaf dispatches with the public-posture
-   bundle; the fix leaf with the full-access bundle. Different leaf
-   behavior, same `mocactl spawn`. Setup promotes both and writes the
-   two digests to `MOCA.md` in the scratch dir; teardown deletes them.
+   `bundles/full/`, each a `.claude/skills/` tree uploaded by `mocactl
+   promote` as a sha256-pinned bundle. Diagnose dispatches with
+   public-only; fix with full. Setup writes both digests to `MOCA.md`;
+   teardown deletes them.
 4. **A denied `Task` tool** — `.claude/settings.json` denies the
-   built-in subagent tool, so the model has to route through the skill
-   instead of forking in-process. The permission prompt on each
-   `mocactl spawn …` is the operator's visual confirmation that the
-   leaf is being dispatched to MOCA, not run locally.
+   built-in subagent, forcing the model through the skill. Each
+   `mocactl spawn` permission prompt is the operator's visual
+   confirmation that work is going to MOCA, not running locally.
 
-- **Setup time.** `mocactl login` + an inference credential (verified
-  end-to-end by `mocactl doctor`), the scratch dir staged **as the
-  project** (the fixture flattens into the scratch root; a `.gitignore`
-  excludes parent-side bookkeeping like `leaves/` and `MOCA.md`, and
-  `contextctl ctx pack` skips `.claude/` directly), and `mocactl
-  promote` on each of `bundles/public-only/` and `bundles/full/` so
-  their sha256 digests are in `MOCA.md` for the agent to reference. No
-  workload is created yet — the agent packs and creates one per leaf
-  at dispatch.
-- **Dispatch.** The parent authors `leaves/<label>.prompt.txt`, packs
-  its cwd (`contextctl ctx pack . --type workspace -o
-  leaves/<label>.context`), creates a workload for just that leaf
-  (`mocactl workloads create --context leaves/<label>.context --json`),
-  runs `mocactl spawn "$(cat leaves/<label>.prompt.txt)" --kind prompt
-  --config "$DIGEST" --workload "$WORKLOAD_ID" [--writable] --tag
-  moca-chained-subagents-demo --json`, writes the note file (with the
-  leaf's `workloadId` and `configDigest`), and **stops** — no waiting,
-  no polling, no seeding. The diagnose leaf dispatches with
-  `--config $DIGEST_PUBLIC` and read-only workload; the fix leaf with
-  `--config $DIGEST_FULL --writable`, getting its own per-run copy of
-  the files, discarded when the run ends. Each child's identity is
-  the triple `(config digest, workload revision, sessionId)` —
-  three sha256-pinned handles, server-held.
-- **Execution.** The detached worker holds the synchronous
-  `POST /v1/runs`; the server runs the leaf to completion and stores
-  the result **before** responding, with no client-disconnect abort.
-  The leaf's bash cwd is the workload's view (read-only) or its own
-  writable copy — the project is at `./`, so leaf prompts never need
-  to contain a path.
-- **Return.** The result — the leaf's final message — is stored
-  server-side for 24h. `mocactl get <sid> --out leaves` writes
-  `leaves/<sid>.text`. In a writable run, the per-run copy is already
-  gone by the time you collect; if you want a diff or a test log, the
-  leaf's prompt must have asked for it as text. Once the result is
-  written the parent runs `mocactl workloads delete "$WORKLOAD_ID"`
-  for that leaf and records `deletedAt` on the note.
+Per-leaf lifecycle: the parent writes `leaves/<label>.prompt.txt`, runs
+`contextctl ctx pack . -o leaves/<label>.context`, creates a workload
+from it, then `mocactl spawn … --config $DIGEST --workload $WID
+[--writable] --tag moca-chained-subagents-demo`, writes a note
+(`leaves/<label>.json`) mapping label → sessionId → workloadId →
+configDigest, and **stops**. Each child's identity is the triple
+`(config digest, workload revision, sessionId)` — server-held.
 
-Leaf bookkeeping lives in `leaves/` in the scratch dir, written by the
-parent: `leaves/<label>.prompt.txt` (the prompt sent),
-`leaves/<label>.context` (the bundle uploaded; a transient cache),
-`leaves/<label>.json` (a note mapping label → sessionId → workloadId → configDigest),
-and `leaves/<sessionId>.text` (the collected result). A resumed Claude
-session reconstructs the picture from those notes plus
-`mocactl subagents --tag moca-chained-subagents-demo`.
+The detached worker holds the synchronous `POST /v1/runs`; the server
+runs the leaf to completion and stores the result **before**
+responding, so there is no client-disconnect abort. The result lives
+server-side for 24h. `mocactl get <sid> --out leaves` writes
+`leaves/<sid>.text`; the parent then deletes the workload. Writable
+copies are discarded when the run ends — the final message is the only
+record, so prompts must ask for diffs and test output as text.
+
+A resumed Claude session reconstructs the chain from `leaves/*.json`
+plus `mocactl subagents --tag moca-chained-subagents-demo`. The scratch
+dir **is** the resumable state.
 
 ## Prerequisites
 
