@@ -208,7 +208,10 @@ Environment overrides (set before running):
 
 - `MOCA_NS` — namespace (default `moca`).
 - `HARNESS_PORT` / `CP_PORT` — local port-forward ports (default
-  `8080` / `8090`). Changing `HARNESS_PORT` breaks discovery.
+  `8080` / `8090`). Changing `HARNESS_PORT` breaks discovery today
+  because MOCA's `deploy/k8s/setup.sh` hardcodes `SH_PUBLIC_HARNESS_URL`
+  to `http://127.0.0.1:8080` — see Troubleshooting if 8080 conflicts
+  with another service on your host.
 - `SCRATCH_DIR` — scratch dir path.
 
 > **Re-running setup discards the previous scratch dir.** The demo tag
@@ -403,7 +406,7 @@ tracking metadata. Nothing lives in the Claude Code session identifier.
 | Wait up to 24h | Yes (server-side result TTL) |
 | Wait past 24h | No — the stored result is gone |
 | Port-forwards down mid-leaf | Yes — the leaf still completes; restore the port-forward to collect |
-| Supervisor restarts mid-leaf | Possibly never — `subagents` shows `unknown`; re-dispatch |
+| Supervisor restarts mid-leaf | Yes within ~30–100 s — the server reaps the orphan as `failed` / `owner_lost`; re-dispatch under a fresh `--label` |
 | Sandbox pod killed mid-leaf | Eventually (minutes) — session reconnects and the leaf reports the mount is gone; re-dispatch |
 | `./teardown.sh` | No — deletes the sessions and any leftover workloads |
 
@@ -415,8 +418,9 @@ tracking metadata. Nothing lives in the Claude Code session identifier.
   collected.
 - **`unknown` is an infrastructure outcome, not a finding.** It means
   the worker died before the server recorded anything (port-forward
-  down at dispatch, or a supervisor restart mid-run). Re-dispatch a
-  fresh leaf.
+  down at dispatch). A supervisor restart mid-run is now reaped as
+  `failed` / `owner_lost` within ~30–100 s, not `unknown`. Either way,
+  re-dispatch under a fresh `--label`.
 - **A leaf that runs longer than five minutes looks failed locally.**
   The spawn worker's sync `POST /v1/runs` carries Node's default
   300-second response timeout, so `subagents` records

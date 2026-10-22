@@ -26,6 +26,23 @@ gets stuck.
   ConfigMap and that your port-forward (or whatever makes `public-url`
   reachable) is up. Setup probes this once at startup; a mid-run
   outage can trigger the same failure.
+- **Intermittent `the harness refused: 404 http_404` on macOS (Rancher
+  Desktop).** Rancher Desktop's lima SSH mux binds `*:8080` and races
+  with the supervisor port-forward on `127.0.0.1:8080`. Some requests
+  reach the harness (401/200), some reach the mux (404 with
+  `server: istio-envoy`). Detect: `lsof -nP -iTCP:8080` showing an
+  `ssh` process alongside `kubectl`. No clean workaround today —
+  MOCA's `deploy/k8s/setup.sh` hardcodes `SH_PUBLIC_HARNESS_URL` to
+  `http://127.0.0.1:8080`; killing the mux takes the whole lima VM
+  down. When `SH_PUBLIC_HARNESS_URL` becomes operator-overridable
+  upstream, re-deploy MOCA with
+  `PUBLIC_HARNESS_URL=http://127.0.0.1:18080 ./deploy/k8s/setup.sh
+  --target kind --build`, set `HARNESS_PORT=18080` when running this
+  demo's `prereqs-install.sh` and `setup.sh`, and export
+  `SH_HARNESS_URL=http://127.0.0.1:18080` for by-hand shells.
+- **A supervisor restart mid-run.** The run is reaped as
+  `failed` / `owner_lost` within ~30–100 s and `mocactl get` surfaces
+  that terminal state; re-dispatch under a fresh `--label`.
 - **`get` says `no session`.** Wrong session id, or the session was
   deleted / aged out past 24h.
 
