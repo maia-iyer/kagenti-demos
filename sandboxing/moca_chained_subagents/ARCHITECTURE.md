@@ -19,7 +19,7 @@ flowchart LR
       SKILL["skill: moca-delegate-task<br/>(upstream, verbatim)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir<br/>MOCA.md · example_repo/ · bundles/public-only/ · bundles/full/<br/>leaves/*.prompt.txt · *.context · *.json · *.text<br/>.claude/settings.json")]
+    SCRATCH[("Scratch dir (IS the project)<br/>src/ · tests/ · vendor/ · docs/ · README.md · MOCA.md<br/>leaves/*.prompt.txt · *.context · *.text<br/>.claude/settings.json · .gitignore")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
     CTXCTL["contextctl<br/>(ctx pack @ dispatch time, per leaf)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
@@ -93,6 +93,7 @@ sequenceDiagram
   participant CS as Context Service
   participant SB as sandbox pod
   participant FS as scratch leaves dir
+  participant LEDGER as mocactl ledger<br/>(~/.local/state/mocactl/<br/>subagents.jsonl)
 
   OP->>CC: "Dispatch a subagent to diagnose…"
   CC->>FS: write leaves/LABEL.prompt.txt
@@ -100,13 +101,13 @@ sequenceDiagram
   CC->>MC: mocactl workloads create --context leaves/LABEL.context --json
   MC->>CS: upload bundle
   MC-->>CC: workloadId WLID
-  CC->>MC: mocactl spawn --kind prompt --config DIGEST --workload WLID [--writable] --tag TAG --json
-  Note over CC,MC: permission prompt = operator's visual confirmation<br/>digest and workload id visible on the command line
+  CC->>MC: mocactl spawn --kind prompt --config DIGEST --workload WLID [--writable] --tag TAG --label LABEL --json
+  Note over CC,MC: permission prompt = operator's visual confirmation<br/>digest, workload id and label visible on the command line
   MC->>SV: create session with configRef and workloadId
   SV-->>MC: sessionId
+  MC->>LEDGER: append row — label · sessionId · workloadId · bundle · tag · submittedAt
   MC->>W: fork (detached)
   MC-->>CC: stdout — type=session, sessionId, pid
-  CC->>FS: write leaves/LABEL.json — label · sessionId · workloadId · configDigest
   W->>SV: POST /v1/runs (synchronous, no disconnect-abort)
   CC-->>OP: dispatched, sessionId=… then STOPS (no polling)
 
@@ -122,6 +123,10 @@ sequenceDiagram
 
   Note over OP,CC: minutes or hours later — may be a brand-new Claude session
   OP->>CC: "Check on that subagent."
+  CC->>MC: mocactl subagents --tag TAG --json (look up label=LABEL)
+  MC->>LEDGER: read rows
+  LEDGER-->>MC: {sessionId, workloadId, state, …}
+  MC-->>CC: sessionId SID, workloadId WLID
   CC->>MC: mocactl get SID --out leaves --json
   MC->>SV: fetch result
   SV-->>MC: status — queued, responded, failed or paused
