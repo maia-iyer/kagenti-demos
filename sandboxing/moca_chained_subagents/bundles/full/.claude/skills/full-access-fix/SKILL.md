@@ -1,6 +1,6 @@
 ---
 name: full-access-fix
-description: Apply a diagnosed fix to a project and verify it against the organization's testing conventions. Assumes insider knowledge of how tests are expected to be run and what counts as a clean pass. Use this skill when the task is "take this diagnosis, make the fix stick."
+description: Apply a diagnosed fix to a project and verify it against the organization's testing conventions. Assumes insider knowledge of how tests are expected to be run and what counts as a clean pass. Use this skill for any task that asks you to apply, implement, fix or verify a fix once a diagnosis is already in hand; it is the default here when no other posture is named.
 ---
 
 # Full-access-fix posture

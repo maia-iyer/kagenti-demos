@@ -256,10 +256,7 @@ export SH_HARNESS_URL=http://127.0.0.1:8080
 > tests. Pack your cwd, dispatch with the **public-only** config digest
 > from `MOCA.md` (`--config $DIGEST_PUBLIC`), read-only (no
 > `--writable`), tag `moca-chained-subagents-demo`, label `diagnose`.
-> Tell the leaf to use its `public-research` skill. `mocactl spawn`
-> must be the last tool call of this turn — do not call `get`,
-> `subagents`, or `sleep` after it, and do not wait. End the turn as
-> soon as the dispatch is done.
+> End the turn as soon as `mocactl spawn` returns.
 
 Claude reads the `moca-delegate-task` skill (if it tries `Task`
 first, the deny fires and it re-routes), then: writes
@@ -315,12 +312,9 @@ mocactl get "$SID" --json | jq .
 > Good. Dispatch another subagent to apply that fix. Pack your cwd,
 > dispatch with the **full** config digest from `MOCA.md`
 > (`--config $DIGEST_FULL`) and `--writable`, tag
-> `moca-chained-subagents-demo`, label `fix`. Tell the leaf to use
-> its `full-access-fix` skill and inline the previous leaf's diagnosis
-> verbatim into the prompt. `mocactl spawn` must be the last tool
-> call of this turn — do not call `get`, `subagents`, or `sleep`
-> after it, and do not wait. End the turn as soon as the dispatch is
-> done.
+> `moca-chained-subagents-demo`, label `fix`. Inline the previous
+> leaf's diagnosis verbatim into the prompt. End the turn as soon as
+> `mocactl spawn` returns.
 
 Claude dispatches a second leaf with its own workload (**with
 `--writable`**) and the diagnosis embedded verbatim in the prompt.

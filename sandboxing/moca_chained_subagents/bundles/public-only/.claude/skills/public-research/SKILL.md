@@ -1,6 +1,6 @@
 ---
 name: public-research
-description: Diagnose a failing test suite using only sources a public contributor would have — the project's own code, its tests, and migration/CHANGELOG docs shipped with the project. Do not invoke internal tooling or private conventions. Use this skill when the task is "figure out why this fails" without implying inside knowledge.
+description: Diagnose a failing test suite using only sources a public contributor would have — the project's own code, its tests, and migration/CHANGELOG docs shipped with the project. Do not invoke internal tooling or private conventions. Use this skill for any task that asks you to figure out, diagnose, investigate or explain why a project's tests fail; it is the default here when no other posture is named.
 ---
 
 # Public-research posture
