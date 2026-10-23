@@ -1,10 +1,19 @@
-# Local Claude Code driving chained MOCA subagents
+# Local coding agent driving chained MOCA subagents
 
-Claude Code runs on your laptop and has no built-in way to offload
-work to the cloud — its `Task` subagent runs in-process, in the same
-session. This demo denies `Task` and delegates instead through a skill
-that dispatches an isolated leaf to [MOCA](https://github.com/rossoctl/moca)
+A local coding agent (**Claude Code** or **OpenCode** — pick one with
+`PARENT=claude|opencode`) runs on your laptop and has no built-in way
+to offload work to the cloud. Its in-process subagent tool (`Task` for
+Claude, `task` for OpenCode) runs in the same session. This demo
+**denies that tool** and delegates instead through a skill that
+dispatches an isolated leaf to [MOCA](https://github.com/rossoctl/moca)
 via the official client **`mocactl`**.
+
+The pedagogical point is that the choice of parent agent is the
+**operator's**, and the delegation seam is the same regardless. The
+same `moca-delegate-task` skill, the same `mocactl` commands, the same
+four operator prompts work for both. What differs is only the parent
+agent's config dir name and format — see the
+[parent-agent differences](#parent-agent-differences) table.
 
 The orchestration shape is the **operator's**, not the skill's. For
 this demo the operator issues prompts in sequence:
@@ -27,11 +36,11 @@ and the model composes multi-leaf flows from the operator's requests.
 Four pieces cooperate:
 
 1. **The `moca-delegate-task` skill** — upstream MOCA's delegation skill,
-   staged verbatim. Tells Claude how to pack, dispatch, collect, and
-   chain leaves (inline the previous leaf's text verbatim into the next
-   prompt). Demo-specific details — pack `.`, tag every spawn
-   `moca-chained-subagents-demo` — come from the operator's prompts, not
-   the skill.
+   staged verbatim. Tells the parent agent how to pack, dispatch,
+   collect, and chain leaves (inline the previous leaf's text verbatim
+   into the next prompt). Demo-specific details — pack `.`, tag every
+   spawn `moca-chained-subagents-demo` — come from the operator's
+   prompts, not the skill.
 2. **`mocactl`** — the official MOCA client on your `PATH`. Owns all
    auth in `~/.config/mocactl`. Provides `spawn` / `get` / `subagents`
    for sessions, `workloads create / get / delete` for the per-leaf
@@ -42,10 +51,12 @@ Four pieces cooperate:
    promote` as a sha256-pinned bundle. Diagnose dispatches with
    public-only; fix with full. Setup writes both digests to `MOCA.md`;
    teardown deletes them.
-4. **A denied `Task` tool** — `.claude/settings.json` denies the
-   built-in subagent, forcing the model through the skill. Each
-   `mocactl spawn` permission prompt is the operator's visual
-   confirmation that work is going to MOCA, not running locally.
+4. **A denied in-process subagent tool** — the parent agent's config
+   (`.claude/settings.json` for Claude, `.opencode/opencode.jsonc` for
+   OpenCode) denies the built-in subagent (`Task` / `task`), forcing
+   the model through the skill. Each `mocactl spawn` permission prompt
+   is the operator's visual confirmation that work is going to MOCA,
+   not running locally.
 
 Per-leaf lifecycle: the parent writes `leaves/<label>.prompt.txt`, runs
 `contextctl ctx pack . -o leaves/<label>.context`, creates a workload
@@ -67,8 +78,8 @@ record, so prompts must ask for diffs and test output as text.
 
 `leaves/` in the scratch dir holds only inputs and outputs
 (`<label>.prompt.txt`, `<label>.context`, `<sid>.text`); per-leaf
-tracking state lives on the mocactl ledger. A resumed Claude session
-reconstructs the chain from `mocactl subagents --tag
+tracking state lives on the mocactl ledger. A resumed parent-agent
+session reconstructs the chain from `mocactl subagents --tag
 moca-chained-subagents-demo --json` alone.
 
 ## Prerequisites
@@ -77,7 +88,9 @@ moca-chained-subagents-demo --json` alone.
 
 - `kind` ≥ 0.24.0 (NetworkPolicy-enforcing CNI is a hard requirement:
   sandbox isolation **is** NetworkPolicy), `kubectl`, `docker` (or
-  podman's `docker` CLI), `jq`, Claude Code CLI.
+  podman's `docker` CLI), `jq`, and your choice of parent coding agent
+  CLI on PATH: `claude` (Claude Code) or `opencode` (OpenCode 1.19.x+
+  — tested on 1.19.4).
 - [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
   (Node 22+), **with the `workloads` subcommand and `spawn --label`**:
   ```bash
@@ -178,7 +191,8 @@ mocactl doctor
 From this directory:
 
 ```bash
-./setup.sh
+./setup.sh                  # Claude Code (default)
+PARENT=opencode ./setup.sh  # OpenCode
 ```
 
 This:
@@ -189,13 +203,16 @@ This:
 2. Runs `mocactl doctor` against the port-forwards — reachability,
    login, credential, harness, and an end-to-end scratch session.
 3. Stages the scratch dir at `~/tmp/moca-chained-scratch/` **as the
-   project**: the fixture flattens into the scratch root alongside
-   `.claude/settings.json` (with the port-forward URLs injected as env),
-   the `moca-delegate-task` skill (upstream SKILL.md, verbatim), an
-   empty `leaves/`, and a `.gitignore` that excludes `leaves/` and
-   `MOCA.md` so `contextctl ctx pack .` captures only the project.
-   By-hand shells export the two port-forward URLs themselves — the
-   exact lines are printed by `setup.sh` and recorded in `MOCA.md`.
+   project**: the fixture flattens into the scratch root alongside the
+   parent agent's config (`.claude/settings.json` for Claude Code —
+   port-forward URLs injected natively via `env`; `.opencode/opencode.jsonc`
+   plus a `run-opencode.sh` wrapper for OpenCode — URLs exported by the
+   wrapper), the `moca-delegate-task` skill (upstream SKILL.md,
+   verbatim), an empty `leaves/`, and a `.gitignore` that excludes
+   `leaves/` and `MOCA.md` so `contextctl ctx pack .` captures only
+   the project. By-hand shells export the two port-forward URLs
+   themselves — the exact lines are printed by `setup.sh` and recorded
+   in `MOCA.md`.
 
 Setup creates **no workload, no session, and seeds nothing per pod** —
 the agent packs the scratch dir and runs `mocactl workloads create`
@@ -206,6 +223,8 @@ workload after collecting the result.
 
 Environment overrides (set before running):
 
+- `PARENT` — parent coding agent to stage config for: `claude`
+  (default) or `opencode`.
 - `MOCA_NS` — namespace (default `moca`).
 - `HARNESS_PORT` / `CP_PORT` — local port-forward ports (default
   `8080` / `8090`). Changing `HARNESS_PORT` breaks discovery today
@@ -224,7 +243,13 @@ Environment overrides (set before running):
 ## Run a session
 
 ```bash
+# Claude Code:
 cd ~/tmp/moca-chained-scratch && claude
+
+# OpenCode (use the wrapper so SH_CONTROL_PLANE_URL / SH_HARNESS_URL
+# are exported into the session; OpenCode has no settings.json `env`
+# equivalent):
+~/tmp/moca-chained-scratch/run-opencode.sh
 ```
 
 The demo flow is **operator prompts, in sequence**. The skill does
@@ -261,14 +286,15 @@ export SH_HARNESS_URL=http://127.0.0.1:8080
 > `subagents`, or `sleep` after it, and do not wait. End the turn as
 > soon as the dispatch is done.
 
-Claude reads the `moca-delegate-task` skill (if it tries `Task`
-first, the deny fires and it re-routes), then: writes
+The parent agent reads the `moca-delegate-task` skill (if it tries
+the in-process subagent tool first, the deny fires and it re-routes),
+then: writes
 `leaves/diagnose.prompt.txt`, packs its cwd (`contextctl ctx pack .`),
 creates the workload, and runs `mocactl spawn … --config
 "$DIGEST_PUBLIC" --workload "$WORKLOAD_ID" --tag
 moca-chained-subagents-demo --label diagnose`. Each permission prompt
 shows a legible dispatch command. The ledger row that `spawn` writes
-carries the label, sessionId, workloadId and bundle digest; Claude
+carries the label, sessionId, workloadId and bundle digest; the agent
 reports the id and stops.
 
 *Peek at state:* look up the workload from the ledger and watch it
@@ -282,24 +308,24 @@ mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
 ```
 
 *Optional durability beat.* To show the server owns the result,
-`exit` Claude and restart it (`cd ~/tmp/moca-chained-scratch && claude`)
-before prompt 2 — the fresh session re-discovers the chain from
-`mocactl subagents --tag moca-chained-subagents-demo --json`. See
-[§ Pause and resume](#pause-and-resume).
+quit the parent agent and relaunch it (`claude` or
+`./run-opencode.sh`) before prompt 2 — the fresh session re-discovers
+the chain from `mocactl subagents --tag moca-chained-subagents-demo
+--json`. See [§ Pause and resume](#pause-and-resume).
 
 **Prompt 2 — collect the diagnosis.** When you're ready (seconds to
 hours later, same session or a resumed one):
 
 > Check on that subagent and report the diagnosis.
 
-Claude looks up the diagnose leaf's `sessionId` and `workloadId` from
-`mocactl subagents --tag moca-chained-subagents-demo --json` (filtering
-by `.label=="diagnose"`), runs `mocactl get <sessionId> --out leaves
---json` and branches on the printed `status`: `queued` → report "still
-running" and stop (one check per turn — the leaf is durable
-server-side, no polling); `responded` → read `leaves/<sessionId>.text`,
-surface the diagnosis, run `mocactl workloads delete "$WORKLOAD_ID"`
-for that leaf.
+The agent looks up the diagnose leaf's `sessionId` and `workloadId`
+from `mocactl subagents --tag moca-chained-subagents-demo --json`
+(filtering by `.label=="diagnose"`), runs `mocactl get <sessionId>
+--out leaves --json` and branches on the printed `status`: `queued` →
+report "still running" and stop (one check per turn — the leaf is
+durable server-side, no polling); `responded` → read
+`leaves/<sessionId>.text`, surface the diagnosis, run `mocactl
+workloads delete "$WORKLOAD_ID"` for that leaf.
 
 *Peek at state:* same handles, from the operator's shell:
 
@@ -322,19 +348,20 @@ mocactl get "$SID" --json | jq .
 > after it, and do not wait. End the turn as soon as the dispatch is
 > done.
 
-Claude dispatches a second leaf with its own workload (**with
+The agent dispatches a second leaf with its own workload (**with
 `--writable`**) and the diagnosis embedded verbatim in the prompt.
 
 **Prompt 4 — collect the fix result.**
 
 > Check on it.
 
-Claude looks up the fix leaf's handles from `mocactl subagents --tag
-moca-chained-subagents-demo --json` (filtering by `.label=="fix"`),
-collects, surfaces the change and test outcome (`Ran 1 test / OK` in
-the final message), then deletes the workload. The final message is
-the only record of the leaf's edits — the writable copy is discarded
-when the run ends. What flows between leaves is prompt text only.
+The agent looks up the fix leaf's handles from `mocactl subagents
+--tag moca-chained-subagents-demo --json` (filtering by
+`.label=="fix"`), collects, surfaces the change and test outcome
+(`Ran 1 test / OK` in the final message), then deletes the workload.
+The final message is the only record of the leaf's edits — the
+writable copy is discarded when the run ends. What flows between
+leaves is prompt text only.
 
 ### Observe the chain
 
@@ -378,30 +405,31 @@ requires verbatim test output in the final report.
 ## Pause and resume
 
 Because the server completes the run and stores the result before
-responding — with no client-disconnect abort — you can quit Claude
-any time after a dispatch. Nothing local is holding the leaf open
-(the detached worker dies with your login session; the server
-doesn't care).
+responding — with no client-disconnect abort — you can quit the
+parent agent any time after a dispatch. Nothing local is holding the
+leaf open (the detached worker dies with your login session; the
+server doesn't care).
 
-To resume: start Claude again from the scratch dir
-(`cd ~/tmp/moca-chained-scratch && claude`) and ask:
+To resume: relaunch the parent agent from the scratch dir
+(`claude` or `./run-opencode.sh`) and ask:
 
 > Any subagents still pending from an earlier session?
 
-Claude runs `mocactl subagents --tag moca-chained-subagents-demo
+The agent runs `mocactl subagents --tag moca-chained-subagents-demo
 --json` and reconstructs the picture from the ledger rows (each row
 carries label, sessionId, workloadId, bundle digest, state). For
 anything still running, a later `mocactl get` collects it.
 
 The machine-global mocactl ledger **is** the resumable state. The
 scratch dir's `leaves/` holds leaf prompts and collected results, not
-tracking metadata. Nothing lives in the Claude Code session identifier.
+tracking metadata. Nothing lives in the parent agent's session
+identifier.
 
 **What survives and what doesn't:**
 
 | Event | Result collectable? |
 | --- | --- |
-| Quit Claude Code | Yes |
+| Quit the parent agent | Yes |
 | Reboot the laptop | Yes — the worker dies, the server finishes the run |
 | Wait up to 24h | Yes (server-side result TTL) |
 | Wait past 24h | No — the stored result is gone |
@@ -459,6 +487,22 @@ images, the CoreDNS patch, and all namespaces with it in one call. Does
 **not** touch your `mocactl` login + credentials or the two source
 checkouts; those are yours.
 
+## Parent-agent differences
+
+Both Claude Code and OpenCode drive the same `moca-delegate-task`
+skill, same `mocactl` commands, same four operator prompts. Only the
+parent-side config dir, config file, and env-injection mechanism
+differ:
+
+| Dimension | Claude Code | OpenCode |
+| --- | --- | --- |
+| Config dir | `.claude/` | `.opencode/` |
+| Config file | `settings.json` (jq-merged by setup.sh) | `opencode.jsonc` (cp'd by setup.sh) |
+| In-process subagent to deny | `Task` | `task` |
+| Env injection | native (`settings.json` `env` key) | wrapper (`run-opencode.sh` exports then execs) |
+| Project-level instructions | `CLAUDE.md` (not shipped — operator prompts carry the discipline) | `AGENTS.md` (not shipped — same shape) |
+| Tested version | current Claude Code | 1.19.4 |
+
 ## Troubleshooting
 
 Known failure modes, how to inspect state in the sandbox, and the
@@ -488,16 +532,19 @@ one after another. Per-workload sandboxes are
 README.md                  This file
 TROUBLESHOOTING.md         Known failure modes, how to inspect sandbox state, and the
                            by-hand flow (acceptance test + fallback when the agent is stuck)
+ARCHITECTURE.md            Components, dispatch/collect sequence, trust boundaries
 prereqs-install.sh         Stands up MOCA + Context Service on a local kind cluster and
                            backgrounds the three port-forwards; see Prerequisites
 prereqs-uninstall.sh       Runs teardown.sh, kills the port-forwards, deletes the kind cluster
-settings.json.example      Permission policy staged into the scratch dir: denies Task and
-                           reading mocactl's config dir, allows the mocactl dispatch commands
-setup.sh                   Verifies prereqs via mocactl doctor, stages the scratch dir, and
-                           promotes the two config bundles (pack + workload create happen
-                           per leaf at dispatch time)
+setup.sh                   Verifies prereqs via mocactl doctor, stages the scratch dir
+                           (parent-aware), and promotes the two config bundles
 teardown.sh                Deletes the demo's leaf sessions, any leftover workloads, and
                            the two config bundles; removes the scratch dir
+parents/                   Parent-agent-specific config staged by setup.sh:
+  claude/settings.json.example      Claude Code permission policy + env injection
+  opencode/opencode.jsonc.example   OpenCode permission policy
+  opencode/run-opencode.sh.in       Launcher template — renders to run-opencode.sh with
+                                    port-forward URLs substituted at setup time
 example_repo/              The project the demo exercises — a stdlib-only Python project
                            with a renamed-API bug. Its contents flatten into the scratch
                            dir at setup time, so the parent's cwd IS the project; the
@@ -506,10 +553,11 @@ bundles/                   Two config bundles promoted at setup time: `public-on
                            (public-posture skill for the diagnose leaf) and `full/`
                            (full-access skill for the fix leaf). Each is a `.claude/skills/`
                            directory tree passed to `mocactl promote` and referenced by
-                           sha256 digest at dispatch.
+                           sha256 digest at dispatch. The directory name is historical —
+                           both parent agents consume the same bundle format.
 ```
 
-In the scratch dir after `setup.sh`:
+In the scratch dir after `setup.sh` (Claude Code):
 
 ```
 ~/tmp/moca-chained-scratch/   The scratch dir IS the project — the fixture is flattened here.
@@ -523,3 +571,8 @@ In the scratch dir after `setup.sh`:
 ├── README.md src/ tests/ vendor/ docs/   The fixture, at the scratch root
 └── leaves/                Leaf prompts, per-leaf .context bundles, results (<sid>.text)
 ```
+
+With `PARENT=opencode`: `.claude/` is replaced by `.opencode/opencode.jsonc`
+and `.opencode/skills/moca-delegate-task/SKILL.md`, and a `run-opencode.sh`
+wrapper is added at the scratch root. Both are listed in `.gitignore` so
+`contextctl ctx pack .` keeps them out of each leaf's workload.

@@ -15,8 +15,9 @@ gets stuck.
   three PIDs); tail the logs under `~/.local/state/moca-chained-demo/`
   for why one died. To restart them cleanly, re-run
   `./prereqs-install.sh` (it kills stale ones first). Also make sure
-  `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` are exported (or inherited
-  via the staged settings in a Claude session).
+  `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` are exported (Claude Code
+  inherits them via `.claude/settings.json`'s `env`; OpenCode inherits
+  them only when launched via `./run-opencode.sh`).
 - **`setup.sh` fails at doctor.** Follow the fix doctor prints for
   each failing check — it covers reachability, login, credentials,
   and the harness.
@@ -46,6 +47,22 @@ gets stuck.
 - **`get` says `no session`.** Wrong session id, or the session was
   deleted / aged out past 24h.
 
+## OpenCode-specific (`PARENT=opencode`)
+
+- **OpenCode launched directly, mocactl fails with "missing
+  control-plane URL".** OpenCode has no `settings.json` `env`
+  equivalent; the staged `run-opencode.sh` wrapper exports
+  `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` before execing opencode.
+  Either launch via `./run-opencode.sh` from the scratch dir, or
+  `export` the two URLs by hand first (recorded in `MOCA.md`).
+- **A compound shell command is auto-rejected under `opencode run`**
+  with `permission requested: external_directory (/var/folders/...)`.
+  The upstream `moca-delegate-task` skill tells the agent to use
+  `mktemp -d`, and OpenCode gates any shell operation on paths outside
+  the project root. Workaround: tell the agent to use `leaves/` for
+  packs and results (e.g. "write to `leaves/<name>.result` — not
+  `/tmp` or `/var/folders`").
+
 ## Inspecting state in the sandbox
 
 Writable runs discard their copies when the run ends, and read-only
@@ -70,10 +87,10 @@ cat leaves/<sessionId>.text       # the collected result
 
 ## Running the flow by hand
 
-What Claude is meant to run for each operator prompt, without the
-agent noise — and the acceptance test for the mechanics: this
-sequence must run clean in a plain terminal before anything else is
-believed. Run it from a fresh `./setup.sh`.
+What the parent agent is meant to run for each operator prompt,
+without the agent noise — and the acceptance test for the mechanics:
+this sequence must run clean in a plain terminal before anything else
+is believed. Run it from a fresh `./setup.sh`.
 
 ```bash
 cd ~/tmp/moca-chained-scratch

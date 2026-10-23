@@ -1,10 +1,11 @@
 # Architecture
 
-How the pieces of this demo fit together: a local Claude Code session
-(the **parent**) dispatches isolated **leaves** to MOCA on a kind
-cluster via `mocactl`, against a workload Context Service holds the
-files for and promoted config bundles the control plane holds the
-skills for, and collects their results later.
+How the pieces of this demo fit together: a local **parent coding
+agent** session (Claude Code or OpenCode — picked at setup time with
+`PARENT=`) dispatches isolated **leaves** to MOCA on a kind cluster
+via `mocactl`, against a workload Context Service holds the files for
+and promoted config bundles the control plane holds the skills for,
+and collects their results later.
 
 ## Components
 
@@ -13,13 +14,13 @@ flowchart LR
   subgraph laptop["Operator's laptop"]
     direction TB
     OP["Operator<br/>(issues prompts in sequence)"]
-    subgraph cc["Claude Code — parent session<br/>cwd = ~/tmp/moca-chained-scratch"]
+    subgraph cc["Parent coding agent — Claude Code or OpenCode<br/>cwd = ~/tmp/moca-chained-scratch"]
       direction TB
-      TASK["Task tool<br/>DENIED"]:::denied
+      TASK["In-process subagent tool<br/>Task / task — DENIED"]:::denied
       SKILL["skill: moca-delegate-task<br/>(upstream, verbatim)"]
       BASH["Bash"]
     end
-    SCRATCH[("Scratch dir (IS the project)<br/>src/ · tests/ · vendor/ · docs/ · README.md · MOCA.md<br/>leaves/*.prompt.txt · *.context · *.text<br/>.claude/settings.json · .gitignore")]
+    SCRATCH[("Scratch dir (IS the project)<br/>src/ · tests/ · vendor/ · docs/ · README.md · MOCA.md<br/>leaves/*.prompt.txt · *.context · *.text<br/>.claude/settings.json OR .opencode/opencode.jsonc · .gitignore")]
     MOCACTL["mocactl<br/>(official client, owns all auth)"]
     CTXCTL["contextctl<br/>(ctx pack @ dispatch time, per leaf)"]
     LEDGER[("~/.local/state/mocactl/<br/>subagents.jsonl")]
@@ -77,8 +78,10 @@ flowchart LR
   classDef denied stroke-dasharray: 4 3,color:#b00,stroke:#b00
 ```
 
-Key: dashed red = deliberately blocked by `.claude/settings.json`
-(`Task` tool, and reading mocactl's token dir).
+Key: dashed red = deliberately blocked by the parent agent's config
+(`.claude/settings.json` for Claude Code, `.opencode/opencode.jsonc`
+for OpenCode) — the in-process subagent tool (`Task` / `task`) and
+reading mocactl's token dir.
 
 ## Dispatch / collect sequence (one leaf)
 
@@ -86,7 +89,7 @@ Key: dashed red = deliberately blocked by `.claude/settings.json`
 sequenceDiagram
   autonumber
   actor OP as Operator
-  participant CC as Claude Code (parent)
+  participant CC as Parent agent (Claude/OpenCode)
   participant MC as mocactl
   participant W as detached worker
   participant SV as MOCA supervisor
@@ -121,7 +124,7 @@ sequenceDiagram
   SV->>SV: persist result BEFORE responding (24h TTL)
   SV-->>W: 200 (worker may already be dead — irrelevant)
 
-  Note over OP,CC: minutes or hours later — may be a brand-new Claude session
+  Note over OP,CC: minutes or hours later — may be a brand-new parent-agent session
   OP->>CC: "Check on that subagent."
   CC->>MC: mocactl subagents --tag TAG --json (look up label=LABEL)
   MC->>LEDGER: read rows
@@ -176,12 +179,12 @@ a sequential chain.
 
 | Boundary | What it guarantees | What it does not |
 | --- | --- | --- |
-| `Task` denied + `moca-delegate-task` skill | Subagent work cannot run in-process on the laptop | — |
+| In-process subagent tool (`Task` / `task`) denied + `moca-delegate-task` skill | Subagent work cannot run in-process on the laptop | — |
 | `mocactl` owns auth (`~/.config/mocactl`, Read-denied) | Demo stores no secret; no token plumbing | — |
 | Promoted config bundle, sha256-pinned | The skills (and commands) a leaf boots with are content-addressed and server-held; two leaves can share one workload but differ in posture | Ships skills + commands only — a `CLAUDE.md` under the promoted dir is NOT included and does not travel to the sandbox |
 | Workload mount read-only (diagnose leaf) | The diagnose leaf cannot alter the shared revision | — |
 | Writable per-run copy (fix leaf) | Edits are isolated to that run and discarded on completion | **Not durable** — nothing survives to the next run; that is [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |
-| Server persists result before responding to `/v1/runs` | Quit Claude, close the laptop, reboot — result survives | Nothing: there is **no cancel** |
+| Server persists result before responding to `/v1/runs` | Quit the parent agent, close the laptop, reboot — result survives | Nothing: there is **no cancel** |
 | Server-side result store | Collectable for **24h** | Past 24h, or after `teardown.sh`, it's gone |
 | Context Service frozen revision | Sha256-pinned, immutable upload; later uploads to the same workload are rejected | — |
 | Shared sandbox pool | Workloads and sandbox caches are per user | **Not a security boundary** between users — tasks share the sandbox as the same Linux user. Per-workload sandboxes are [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |

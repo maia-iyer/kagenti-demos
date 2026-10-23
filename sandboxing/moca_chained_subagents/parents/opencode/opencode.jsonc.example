@@ -1,0 +1,37 @@
+// Permission policy staged into the scratch dir as .opencode/opencode.jsonc.
+//
+// `task` denied: forces delegation through the moca-delegate-task skill rather than opencode's
+// built-in subagent (the pedagogical point of the demo — work goes to MOCA, not an in-process fork).
+//
+// `shell` is per-command: wildcards allow the mocactl + contextctl calls the skill issues, and
+// nothing else runs without asking. Edits and file writes are denied — the parent only orchestrates,
+// never touches the scratch dir beyond leaves/ bookkeeping.
+//
+// Setup injects the port-forward URLs below via `.env` (opencode reads it from the project root).
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "task": "deny",
+    "edit": "deny",
+    "patch": "deny",
+    "write": {
+      "*": "deny",
+      "leaves/*.prompt.txt": "allow",
+      "leaves/*.context": "allow"
+    },
+    "shell": {
+      "*": "ask",
+      "mocactl spawn *": "allow",
+      "mocactl get *": "allow",
+      "mocactl subagents *": "allow",
+      "mocactl workloads create *": "allow",
+      "mocactl workloads get *": "allow",
+      "mocactl workloads delete *": "allow",
+      "mocactl sessions *": "allow",
+      "mocactl bundles delete *": "allow",
+      "contextctl ctx pack *": "allow",
+      "cat leaves/*": "allow",
+      "jq *": "allow"
+    }
+  }
+}

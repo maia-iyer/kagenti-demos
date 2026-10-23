@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Launch opencode from the scratch dir with the port-forward URLs exported.
+# Rendered by setup.sh with __CP_URL__ and __HARNESS_URL__ substituted.
+set -euo pipefail
+export SH_CONTROL_PLANE_URL=__CP_URL__
+export SH_HARNESS_URL=__HARNESS_URL__
+cd "$(dirname "$0")"
+exec opencode "$@"
