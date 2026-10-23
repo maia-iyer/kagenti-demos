@@ -232,6 +232,7 @@ cat >> "${SCRATCH_DIR}/.gitignore" <<'EOF'
 /leaves/
 /MOCA.md
 /.envrc
+/.moca-delegate/
 EOF
 # Parent-specific ignores: contextctl auto-skips .claude/ but NOT .opencode/,
 # so without this the parent-side skill + permission config would leak into

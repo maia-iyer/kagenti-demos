@@ -17,10 +17,12 @@
     "write": {
       "*": "deny",
       "leaves/*.prompt.txt": "allow",
-      "leaves/*.context": "allow"
+      ".moca-delegate/*.context": "allow"
     },
     "shell": {
       "*": "ask",
+      "mkdir -p .moca-delegate": "allow",
+      "rm -r .moca-delegate": "allow",
       "mocactl spawn *": "allow",
       "mocactl get *": "allow",
       "mocactl subagents *": "allow",
