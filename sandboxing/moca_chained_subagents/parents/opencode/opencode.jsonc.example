@@ -17,7 +17,7 @@
     "write": {
       "*": "deny",
       "leaves/*.prompt.txt": "allow",
-      ".moca-delegate/*.context": "allow"
+      ".moca-delegate/**": "allow"
     },
     "shell": {
       "*": "ask",
