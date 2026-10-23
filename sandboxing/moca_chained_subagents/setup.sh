@@ -10,8 +10,9 @@
 #   2. Stage a scratch dir whose contents are the example_repo project
 #      (so `./` at the parent's cwd matches `./` at the leaf's cwd),
 #      plus a leaves/ dir for prompts/notes/results, a moca-delegate-task
-#      skill (upstream SKILL.md, verbatim),
-#      and Claude Code settings pointing at this run.
+#      skill (upstream SKILL.md, verbatim), and the parent coding agent's
+#      config pointing at this run (Claude Code or OpenCode — pick with
+#      PARENT=claude|opencode, default claude).
 #
 # Pack + workload create + workload delete happen per leaf at dispatch
 # time, driven by the agent through the skill — not by this script.
@@ -35,6 +36,19 @@ CP_PORT="${CP_PORT:-8090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
+
+# Which parent coding agent to stage config for. Claude Code is the default
+# (settings.json with native `env` injection); OpenCode uses opencode.jsonc
+# plus a run-opencode.sh wrapper that exports the port-forward URLs before
+# execing opencode (OpenCode has no equivalent of settings.json's `env` key).
+PARENT="${PARENT:-claude}"
+case "${PARENT}" in
+  claude|opencode) ;;
+  *)
+    echo "    PARENT='${PARENT}' not supported (expected: claude, opencode)" >&2
+    exit 1
+    ;;
+esac
 
 # Upstream MOCA checkout — holds the moca-delegate-task skill, staged
 # verbatim into the scratch dir. This demo adds no overrides: the two
@@ -152,36 +166,66 @@ if [[ "${cs_probe_status}" == "000" || -z "${cs_probe_status}" ]]; then
 fi
 echo "    ok: Context Service public URL reachable at ${CS_PUBLIC_URL}"
 
-echo "==> Staging scratch dir at ${SCRATCH_DIR}..."
+echo "==> Staging scratch dir at ${SCRATCH_DIR} (parent: ${PARENT})..."
 # Fresh staging on every run: the demo tag is per-run, so notes and results
 # from an earlier run would be orphaned. Collect results before re-running.
 rm -rf "${SCRATCH_DIR}"
-mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-delegate-task" \
-         "${SCRATCH_DIR}/leaves"
+mkdir -p "${SCRATCH_DIR}/leaves"
 
-# Claude Code settings, patched to point mocactl at the port-forwards.
-# mocactl itself is already on PATH — verified above, not patched.
-cp "${SCRIPT_DIR}/settings.json.example" "${SCRATCH_DIR}/.claude/settings.json"
-settings_tmp="$(mktemp)"
-jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" \
-   '.env = ((.env // {}) + {SH_CONTROL_PLANE_URL: $cp, SH_HARNESS_URL: $harness})' \
-   "${SCRATCH_DIR}/.claude/settings.json" >"${settings_tmp}"
-mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
-
-# Stage the skill verbatim from upstream. The demo's two operator
-# prompts carry what's specific here (which directory to pack, which
-# tag to use); the skill itself needs no demo-local override.
-staged_skill="${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
-cp "${UPSTREAM_SKILL}" "${staged_skill}"
+# Stage parent-specific config + skill. Both agents consume the SAME upstream
+# SKILL.md verbatim; only the config dir name, config file format, and
+# env-injection mechanism differ.
+case "${PARENT}" in
+  claude)
+    mkdir -p "${SCRATCH_DIR}/.claude/skills/moca-delegate-task"
+    # Claude Code settings, patched to point mocactl at the port-forwards.
+    # mocactl itself is already on PATH — verified above, not patched.
+    cp "${SCRIPT_DIR}/parents/claude/settings.json.example" \
+       "${SCRATCH_DIR}/.claude/settings.json"
+    settings_tmp="$(mktemp)"
+    jq --arg cp "${CP_URL}" --arg harness "${HARNESS_URL}" \
+       '.env = ((.env // {}) + {SH_CONTROL_PLANE_URL: $cp, SH_HARNESS_URL: $harness})' \
+       "${SCRATCH_DIR}/.claude/settings.json" >"${settings_tmp}"
+    mv -f "${settings_tmp}" "${SCRATCH_DIR}/.claude/settings.json"
+    cp "${UPSTREAM_SKILL}" \
+       "${SCRATCH_DIR}/.claude/skills/moca-delegate-task/SKILL.md"
+    ;;
+  opencode)
+    mkdir -p "${SCRATCH_DIR}/.opencode/skills/moca-delegate-task"
+    # OpenCode permission policy — no env-injection in the config, so port-
+    # forward URLs are exported by the run-opencode.sh wrapper (below).
+    cp "${SCRIPT_DIR}/parents/opencode/opencode.jsonc.example" \
+       "${SCRATCH_DIR}/.opencode/opencode.jsonc"
+    cp "${UPSTREAM_SKILL}" \
+       "${SCRATCH_DIR}/.opencode/skills/moca-delegate-task/SKILL.md"
+    # Render the wrapper template with the port-forward URLs substituted.
+    # Refuse URLs containing sed metacharacters (|, &, \) before substitution:
+    # a port-forward URL carrying those would corrupt the resulting wrapper.
+    for u in "${CP_URL}" "${HARNESS_URL}"; do
+      case "${u}" in
+        *[\|\&\\]*)
+          echo "    PARENT=opencode: URL '${u}' contains a sed metacharacter (|, &, or \\\\); set CP_URL/HARNESS_URL without one" >&2
+          exit 1
+          ;;
+      esac
+    done
+    sed -e "s|__CP_URL__|${CP_URL}|g" \
+        -e "s|__HARNESS_URL__|${HARNESS_URL}|g" \
+        "${SCRIPT_DIR}/parents/opencode/run-opencode.sh.in" \
+        > "${SCRATCH_DIR}/run-opencode.sh"
+    chmod +x "${SCRATCH_DIR}/run-opencode.sh"
+    ;;
+esac
 
 # Flatten the fixture into the scratch dir, so the parent's cwd IS the project.
 # This matches the upstream moca-delegate-task skill's "the project is in your
 # working directory" assumption; operator prompts can pack `.` instead of
 # `./example_repo`. Parent-side bookkeeping (`leaves/`, `MOCA.md`, `.envrc`)
 # is kept out of each leaf's workload by `.gitignore` below -- contextctl ctx
-# pack honors it. `.claude/` is skipped by contextctl directly. Python bytecode
-# (`__pycache__/`, `*.pyc`, `*.pyo`) is filtered by the fixture's own
-# .gitignore inside the project tree.
+# pack honors it. `.claude/` is skipped by contextctl directly; `.opencode/`
+# is not, so it is listed in the gitignore below for the opencode parent.
+# Python bytecode (`__pycache__/`, `*.pyc`, `*.pyo`) is filtered by the
+# fixture's own .gitignore inside the project tree.
 cp -R "${SCRIPT_DIR}/example_repo/." "${SCRATCH_DIR}/"
 
 # `git init` on the scratch dir so contextctl's .gitignore walk finds both the
@@ -199,6 +243,15 @@ cat >> "${SCRATCH_DIR}/.gitignore" <<'EOF'
 /MOCA.md
 /.envrc
 EOF
+# Parent-specific ignores: contextctl auto-skips .claude/ but NOT .opencode/,
+# so without this the parent-side skill + permission config would leak into
+# every leaf's workload. The run-opencode.sh wrapper is parent-side only too.
+if [[ "${PARENT}" == "opencode" ]]; then
+  cat >> "${SCRATCH_DIR}/.gitignore" <<'EOF'
+/.opencode/
+/run-opencode.sh
+EOF
+fi
 
 echo "==> Promoting the two config bundles..."
 # Config bundles carry each leaf's skills + commands (NOT CLAUDE.md). They
@@ -227,12 +280,17 @@ echo "    promoted public-only  ${DIGEST_PUBLIC}"
 DIGEST_FULL="$(promote_bundle "${SCRIPT_DIR}/bundles/full" full)"
 echo "    promoted full         ${DIGEST_FULL}"
 
-# Record the two digests + run facts in the scratch dir so a resumed Claude
-# session (or an operator driving the by-hand flow) can reconstruct them
-# without re-running `mocactl promote`.
+# Record the two digests + run facts in the scratch dir so a resumed parent
+# agent session (or an operator driving the by-hand flow) can reconstruct
+# them without re-running `mocactl promote`.
+case "${PARENT}" in
+  claude)   PARENT_ENV_NOTE="Claude sessions get them from .claude/settings.json;" ;;
+  opencode) PARENT_ENV_NOTE="OpenCode sessions get them via ./run-opencode.sh (the wrapper staged by setup.sh — it exports the two URLs then execs opencode);" ;;
+esac
 cat > "${SCRATCH_DIR}/MOCA.md" <<EOF
 # MOCA runtime facts for this demo run
 
+Parent coding agent:   ${PARENT}
 Control plane URL:     ${CP_URL}
 Harness URL:           ${HARNESS_URL}
 Config digest public:  ${DIGEST_PUBLIC}
@@ -241,7 +299,7 @@ Project to pack:       .   (the scratch dir IS the project)
 Leaves dir:            ./leaves
 
 Every mocactl command run from this directory needs the port-forward URLs
-in the environment. Claude sessions get them from .claude/settings.json;
+in the environment. ${PARENT_ENV_NOTE}
 for a plain shell, export them by hand:
 
     export SH_CONTROL_PLANE_URL=${CP_URL}
@@ -283,7 +341,18 @@ echo "       export SH_HARNESS_URL=${HARNESS_URL}"
 echo ""
 echo "     The two config digests to dispatch leaves with are in MOCA.md."
 echo ""
-echo "  3. Or start Claude from the scratch dir and drive it with operator"
-echo "     prompts (the agent flow — see the README's 'Run a session'):"
-echo ""
-echo "       cd ${SCRATCH_DIR} && claude"
+case "${PARENT}" in
+  claude)
+    echo "  3. Or start Claude from the scratch dir and drive it with operator"
+    echo "     prompts (the agent flow — see the README's 'Run a session'):"
+    echo ""
+    echo "       cd ${SCRATCH_DIR} && claude"
+    ;;
+  opencode)
+    echo "  3. Or start OpenCode from the scratch dir and drive it with operator"
+    echo "     prompts (the agent flow — see the README's 'Run a session'). The"
+    echo "     wrapper exports the port-forward URLs before launching:"
+    echo ""
+    echo "       ${SCRATCH_DIR}/run-opencode.sh"
+    ;;
+esac

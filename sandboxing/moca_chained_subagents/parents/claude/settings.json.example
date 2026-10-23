@@ -5,6 +5,7 @@
       "Read(~/.config/mocactl/**)"
     ],
     "allow": [
+      "Bash(mktemp -d)",
       "Bash(contextctl ctx pack*)",
       "Bash(mocactl spawn*)",
       "Bash(mocactl get*)",
