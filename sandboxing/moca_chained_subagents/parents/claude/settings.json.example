@@ -6,7 +6,6 @@
     ],
     "allow": [
       "Bash(mktemp -d)",
-      "Bash(rm -r*)",
       "Bash(contextctl ctx pack*)",
       "Bash(mocactl spawn*)",
       "Bash(mocactl get*)",

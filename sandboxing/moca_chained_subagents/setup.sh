@@ -199,6 +199,16 @@ case "${PARENT}" in
     cp "${UPSTREAM_SKILL}" \
        "${SCRATCH_DIR}/.opencode/skills/moca-delegate-task/SKILL.md"
     # Render the wrapper template with the port-forward URLs substituted.
+    # Refuse URLs containing sed metacharacters (|, &, \) before substitution:
+    # a port-forward URL carrying those would corrupt the resulting wrapper.
+    for u in "${CP_URL}" "${HARNESS_URL}"; do
+      case "${u}" in
+        *[\|\&\\]*)
+          echo "    PARENT=opencode: URL '${u}' contains a sed metacharacter (|, &, or \\\\); set CP_URL/HARNESS_URL without one" >&2
+          exit 1
+          ;;
+      esac
+    done
     sed -e "s|__CP_URL__|${CP_URL}|g" \
         -e "s|__HARNESS_URL__|${HARNESS_URL}|g" \
         "${SCRIPT_DIR}/parents/opencode/run-opencode.sh.in" \
