@@ -5,7 +5,7 @@
       "Read(~/.config/mocactl/**)"
     ],
     "allow": [
-      "Bash(mkdir -p .moca-delegate)",
+      "Bash(rm -rf .moca-delegate && mkdir .moca-delegate)",
       "Bash(rm -r .moca-delegate)",
       "Bash(contextctl ctx pack*)",
       "Bash(mocactl spawn*)",

@@ -21,7 +21,7 @@
     },
     "shell": {
       "*": "ask",
-      "mkdir -p .moca-delegate": "allow",
+      "rm -rf .moca-delegate && mkdir .moca-delegate": "allow",
       "rm -r .moca-delegate": "allow",
       "mocactl spawn *": "allow",
       "mocactl get *": "allow",
