@@ -90,12 +90,11 @@ moca-chained-subagents-demo --json` alone.
 ### Tools on your PATH
 
 - `kind` ≥ 0.24.0 serving Kubernetes 1.30+ (ValidatingAdmissionPolicy
-  is required by the phase-2 workload provisioner, and
-  NetworkPolicy-enforcing CNI is a hard requirement: sandbox isolation
-  **is** NetworkPolicy). `kubectl`, `docker` (or podman's `docker`
-  CLI), `jq`, and your choice of parent coding agent CLI on PATH:
-  `claude` (Claude Code) or `opencode` (OpenCode 1.19.x+ — tested on
-  1.19.4).
+  is required by the workload provisioner, and NetworkPolicy-enforcing
+  CNI is a hard requirement: sandbox isolation **is** NetworkPolicy).
+  `kubectl`, `docker` (or podman's `docker` CLI), `jq`, and your choice
+  of parent coding agent CLI on PATH: `claude` (Claude Code) or
+  `opencode` (OpenCode 1.19.x+ — tested on 1.19.4).
 - [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
   (Node 22+), **with the `workloads` subcommand and `spawn --label`**:
   ```bash

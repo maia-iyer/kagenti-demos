@@ -100,7 +100,17 @@ if ! printf '%s' "${label_probe}" | grep -q -- '--label'; then
   echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
   exit 1
 fi
-echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + spawn --label present)"
+# --sandboxes / --mount are the workload-sandboxes flags the demo relies on. An
+# old mocactl silently falls back to a shared-pool workload (no per-workload PVC)
+# when the agent passes them, with no error — the demo degrades without an
+# obvious signal.
+sandboxes_probe="$(mocactl workloads create 2>&1 || true)"
+if ! printf '%s' "${sandboxes_probe}" | grep -q -- '--sandboxes'; then
+  echo "    this mocactl has no 'workloads create --sandboxes' flag — too old." >&2
+  echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
+  exit 1
+fi
+echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + --label + --sandboxes present)"
 
 if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
   echo "    namespace '${MOCA_NS}' not found on current kubectl context." >&2
