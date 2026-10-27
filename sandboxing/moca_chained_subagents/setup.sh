@@ -28,11 +28,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MOCA_NS="${MOCA_NS:-moca}"
 CONTEXT_SERVICE_NS="${CONTEXT_SERVICE_NS:-context-service}"
-# The control plane tells clients where the harness is, and deploy/k8s
-# advertises it as http://127.0.0.1:8080 — so the supervisor's port-forward
-# must use local port 8080 specifically.
-HARNESS_PORT="${HARNESS_PORT:-8080}"
-CP_PORT="${CP_PORT:-8090}"
+# Port-forward ports; keep defaults identical to prereqs-install.sh. If you
+# override these, set the same env vars before running ./prereqs-install.sh.
+# deploy/k8s/setup.sh is invoked by prereqs-install.sh with
+# SH_PUBLIC_HARNESS_URL=http://127.0.0.1:${HARNESS_PORT}, so the control
+# plane advertises the port chosen here.
+HARNESS_PORT="${HARNESS_PORT:-18080}"
+CP_PORT="${CP_PORT:-18090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
