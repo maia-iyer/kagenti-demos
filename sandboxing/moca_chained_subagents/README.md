@@ -283,14 +283,11 @@ export SH_HARNESS_URL=http://127.0.0.1:8080
 
 **Prompt 1 — start the diagnosis.** Paste something like:
 
-> Dispatch a subagent to diagnose why this project is failing its
-> tests. Pack your cwd, create a workload with `--sandboxes 1 --mount
-> read-only`, then dispatch with the **public-only** config digest from
-> `MOCA.md` (`--config $DIGEST_PUBLIC`), tag
-> `moca-chained-subagents-demo`, label `diagnose`. Tell the leaf to use
-> its `public-research` skill. `mocactl spawn` must be the last tool
-> call of this turn — do not call `get`, `subagents`, or `sleep` after
-> it, and do not wait. End the turn as soon as the dispatch is done.
+> Dispatch a diagnose subagent on its own read-only sandbox
+> (`--sandboxes 1 --mount read-only`). Config: `$DIGEST_PUBLIC` (from
+> `MOCA.md`), tag `moca-chained-subagents-demo`, label `diagnose`.
+> Have the leaf use its `public-research` skill. End the turn after
+> `mocactl spawn` — do not call `get`, `subagents`, or `sleep`.
 
 The parent agent reads the `moca-delegate-task` skill (if it tries
 the in-process subagent tool first, the deny fires and it re-routes),
@@ -355,15 +352,13 @@ mocactl get "$SID" --json | jq .
 
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
-> Good. Dispatch another subagent to apply that fix. Pack your cwd,
-> create a workload with `--sandboxes 1 --mount writable`, then
-> dispatch with the **full** config digest from `MOCA.md` (`--config
-> $DIGEST_FULL`), tag `moca-chained-subagents-demo`, label `fix`. Tell
-> the leaf to use its `full-access-fix` skill, and pass the previous
-> leaf's diagnosis verbatim as its prompt (use `--prompt-file` if your
-> shell won't accept inlining). `mocactl spawn` must be the last tool
-> call of this turn — do not call `get`, `subagents`, or `sleep` after
-> it, and do not wait. End the turn as soon as the dispatch is done.
+> Dispatch a fix subagent on its own writable sandbox (`--sandboxes 1
+> --mount writable`). Config: `$DIGEST_FULL` (from `MOCA.md`), tag
+> `moca-chained-subagents-demo`, label `fix`. Have the leaf use its
+> `full-access-fix` skill, with the previous diagnosis verbatim as its
+> prompt (use `--prompt-file` if your shell refuses the inline form).
+> End the turn after `mocactl spawn` — do not call `get`, `subagents`,
+> or `sleep`.
 
 The agent dispatches a second leaf with its own writable-mount workload
 and the diagnosis delivered as the leaf's prompt. Edits made inside
