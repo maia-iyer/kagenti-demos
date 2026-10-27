@@ -72,9 +72,12 @@ The detached worker holds the synchronous `POST /v1/runs`; the server
 runs the leaf to completion and stores the result **before**
 responding, so there is no client-disconnect abort. The result lives
 server-side for 24h. `mocactl get <sid> --out leaves` writes
-`leaves/<sid>.text`; the parent then deletes the workload. Writable
-copies are discarded when the run ends — the final message is the only
-record, so prompts must ask for diffs and test output as text.
+`leaves/<sid>.text`; the parent then deletes the workload, which
+reaps the workload's StatefulSet and PVC. For a workload created with
+`--mount writable`, edits a leaf makes persist on the PVC until the
+`workloads delete` — so a follow-up `mocactl spawn` on the same
+workload sees them. A read-only workload has no writable mount; its
+leaves return findings in the final message.
 
 `leaves/` in the scratch dir holds only inputs and outputs
 (`<label>.prompt.txt`, `<label>.context`, `<sid>.text`); per-leaf
@@ -86,11 +89,12 @@ moca-chained-subagents-demo --json` alone.
 
 ### Tools on your PATH
 
-- `kind` ≥ 0.24.0 (NetworkPolicy-enforcing CNI is a hard requirement:
-  sandbox isolation **is** NetworkPolicy), `kubectl`, `docker` (or
-  podman's `docker` CLI), `jq`, and your choice of parent coding agent
-  CLI on PATH: `claude` (Claude Code) or `opencode` (OpenCode 1.19.x+
-  — tested on 1.19.4).
+- `kind` ≥ 0.24.0 serving Kubernetes 1.30+ (ValidatingAdmissionPolicy
+  is required by the workload provisioner, and NetworkPolicy-enforcing
+  CNI is a hard requirement: sandbox isolation **is** NetworkPolicy).
+  `kubectl`, `docker` (or podman's `docker` CLI), `jq`, and your choice
+  of parent coding agent CLI on PATH: `claude` (Claude Code) or
+  `opencode` (OpenCode 1.19.x+ — tested on 1.19.4).
 - [`mocactl`](https://github.com/rossoctl/moca/tree/main/packages/mocactl)
   (Node 22+), **with the `workloads` subcommand and `spawn --label`**:
   ```bash
@@ -126,9 +130,11 @@ CLONE_DIR=<parent-of-both-checkouts> \
   ./prereqs-install.sh
 ```
 
-The script creates a kind cluster `moca`, runs MOCA's `deploy/k8s/setup.sh`,
-builds and loads the context-service image, wires the two together, and
-backgrounds the three port-forwards the demo needs (logs under
+The script creates a kind cluster `moca`, runs MOCA's `deploy/k8s/setup.sh`
+with `SH_WORKLOAD_SANDBOXES=1` (which also installs `moca-provisioner` and
+the `moca-sandbox` namespace it manages), builds and loads the
+context-service image, wires the two together, and backgrounds the three
+port-forwards the demo needs (logs under
 `~/.local/state/moca-chained-demo/`). Re-runnable on a *clean* cluster:
 a partially-completed prior run leaves namespaces behind, and
 `kubectl apply` on the manifest then fails with
@@ -278,13 +284,13 @@ export SH_HARNESS_URL=http://127.0.0.1:8080
 **Prompt 1 — start the diagnosis.** Paste something like:
 
 > Dispatch a subagent to diagnose why this project is failing its
-> tests. Pack your cwd, dispatch with the **public-only** config digest
-> from `MOCA.md` (`--config $DIGEST_PUBLIC`), read-only (no
-> `--writable`), tag `moca-chained-subagents-demo`, label `diagnose`.
-> Tell the leaf to use its `public-research` skill. `mocactl spawn`
-> must be the last tool call of this turn — do not call `get`,
-> `subagents`, or `sleep` after it, and do not wait. End the turn as
-> soon as the dispatch is done.
+> tests. Pack your cwd, create a workload with `--sandboxes 1 --mount
+> read-only`, then dispatch with the **public-only** config digest from
+> `MOCA.md` (`--config $DIGEST_PUBLIC`), tag
+> `moca-chained-subagents-demo`, label `diagnose`. Tell the leaf to use
+> its `public-research` skill. `mocactl spawn` must be the last tool
+> call of this turn — do not call `get`, `subagents`, or `sleep` after
+> it, and do not wait. End the turn as soon as the dispatch is done.
 
 The parent agent reads the `moca-delegate-task` skill (if it tries
 the in-process subagent tool first, the deny fires and it re-routes),
@@ -305,6 +311,17 @@ WLID=$(mocactl subagents --tag moca-chained-subagents-demo --json \
   | jq -r '.subagents[] | select(.label=="diagnose") | .workload')
 mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
 # status: creating → awaiting_upload → ready; revision is the sha256 of the files
+```
+
+*Peek at the per-workload pod and PVC:* `mocactl workloads create`
+blocks for ~tens of seconds while the provisioner creates the
+StatefulSet, seeds the PVC from the frozen revision, and the pod
+attaches. During and after that window, in a side terminal:
+
+```bash
+kubectl -n moca-sandbox get pods,pvc,sts
+# one pod + one PVC + one StatefulSet per live workload (plus the
+# shared pool). All disappear when `mocactl workloads delete` runs.
 ```
 
 *Optional durability beat.* To show the server owns the result,
@@ -339,17 +356,19 @@ mocactl get "$SID" --json | jq .
 **Prompt 3 — start the fix.** After reviewing the diagnosis:
 
 > Good. Dispatch another subagent to apply that fix. Pack your cwd,
-> dispatch with the **full** config digest from `MOCA.md`
-> (`--config $DIGEST_FULL`) and `--writable`, tag
-> `moca-chained-subagents-demo`, label `fix`. Tell the leaf to use
-> its `full-access-fix` skill and inline the previous leaf's diagnosis
-> verbatim into the prompt. `mocactl spawn` must be the last tool
-> call of this turn — do not call `get`, `subagents`, or `sleep`
-> after it, and do not wait. End the turn as soon as the dispatch is
-> done.
+> create a workload with `--sandboxes 1 --mount writable`, then
+> dispatch with the **full** config digest from `MOCA.md` (`--config
+> $DIGEST_FULL`), tag `moca-chained-subagents-demo`, label `fix`. Tell
+> the leaf to use its `full-access-fix` skill and inline the previous
+> leaf's diagnosis verbatim into the prompt. `mocactl spawn` must be
+> the last tool call of this turn — do not call `get`, `subagents`, or
+> `sleep` after it, and do not wait. End the turn as soon as the
+> dispatch is done.
 
-The agent dispatches a second leaf with its own workload (**with
-`--writable`**) and the diagnosis embedded verbatim in the prompt.
+The agent dispatches a second leaf with its own writable-mount workload
+and the diagnosis embedded verbatim in the prompt. Edits made inside
+the leaf land on the workload's own PVC, so a follow-up `mocactl spawn`
+on the same workload sees them.
 
 **Prompt 4 — collect the fix result.**
 
@@ -359,9 +378,11 @@ The agent looks up the fix leaf's handles from `mocactl subagents
 --tag moca-chained-subagents-demo --json` (filtering by
 `.label=="fix"`), collects, surfaces the change and test outcome
 (`Ran 1 test / OK` in the final message), then deletes the workload.
-The final message is the only record of the leaf's edits — the
-writable copy is discarded when the run ends. What flows between
-leaves is prompt text only.
+The edits also sit on the workload's writable PVC until that delete,
+so a follow-up `mocactl spawn` on the same workload would see them.
+What flows between leaves is still prompt text only — each leaf is a
+separate session, and the parent inlines the previous leaf's answer
+into the next prompt.
 
 ### Observe the chain
 
@@ -519,12 +540,11 @@ dir (`~/.config/mocactl`), outside the demo, and setup no longer
 modifies any cluster-wide setting. Still: don't point it at anything
 you care about.
 
-The sandbox is also not a security boundary between users. Workloads
-are per-user, but the sandboxes themselves are shared — tasks from
-different users can run on the same sandbox, as the same Linux user,
-one after another. Per-workload sandboxes are
-[rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476)
-(phase-2).
+Each workload gets its own StatefulSet and PVC under the
+`moca-sandbox` namespace, so two users' workloads do not share a
+sandbox. Writes stay on the workload's PVC until the workload is
+deleted. The provisioner holds the RBAC in that namespace; the control
+plane and the harness do not.
 
 ## Files in this directory
 

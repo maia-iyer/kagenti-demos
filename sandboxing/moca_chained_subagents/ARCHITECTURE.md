@@ -70,7 +70,7 @@ flowchart LR
   CP --- BUNDLES
   SUP --- RESULTS
   CS --- REV
-  SUP -->|"fetch frozen revision<br/>(read-only or writable copy)"| CS
+  SUP -->|"seed workload PVC from frozen revision<br/>(mount: read-only or writable)"| CS
   SUP -->|"apply config overlay<br/>(skills from DIGEST)"| POD0
   SUP -->|"mount workload view at<br/>/workspace/.moca-context/runs/&lt;sid&gt;"| POD0
   SUP --> POD1
@@ -164,16 +164,18 @@ primitive, and neither leaf knows a chain exists.
    deleted after collection, and boots with its own content-addressed
    config bundle — same `mocactl spawn`, different posture. Each
    child's identity is the triple (config digest, workload revision,
-   sessionId), all sha256-pinned and server-held. The writable copy is
-   per-run and discarded on completion — nothing persists across runs
-   (that is phase-2 workloads, https://github.com/rossoctl/moca/issues/476).
-   No file paths cross the leaf boundary.
+   sessionId), all sha256-pinned and server-held. A workload created
+   with `--mount writable` keeps edits on its own PVC until the
+   workload is deleted, so a follow-up spawn on the same workload sees
+   them; a `--mount read-only` workload exposes an immutable view and
+   leaves return findings in the final message. No file paths cross
+   the leaf boundary.
 ```
 
-Isolation is substrate-enforced at the session level (each session
-gets its own view, and each writable run gets its own per-run copy),
-so leaves *could* fan out concurrently; this demo deliberately stays
-a sequential chain.
+Isolation is substrate-enforced at the workload level (each workload
+gets its own StatefulSet and PVC under `moca-sandbox`, provisioned on
+activate), so leaves *could* fan out concurrently; this demo
+deliberately stays a sequential chain.
 
 ## Trust and durability boundaries
 
@@ -182,10 +184,10 @@ a sequential chain.
 | In-process subagent tool (`Task` / `task`) denied + `moca-delegate-task` skill | Subagent work cannot run in-process on the laptop | — |
 | `mocactl` owns auth (`~/.config/mocactl`, Read-denied) | Demo stores no secret; no token plumbing | — |
 | Promoted config bundle, sha256-pinned | The skills (and commands) a leaf boots with are content-addressed and server-held; two leaves can share one workload but differ in posture | Ships skills + commands only — a `CLAUDE.md` under the promoted dir is NOT included and does not travel to the sandbox |
-| Workload mount read-only (diagnose leaf) | The diagnose leaf cannot alter the shared revision | — |
-| Writable per-run copy (fix leaf) | Edits are isolated to that run and discarded on completion | **Not durable** — nothing survives to the next run; that is [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |
+| Workload mount read-only (diagnose leaf) | The leaf cannot alter the frozen revision | — |
+| Workload mount writable (fix leaf) | Each workload gets its own PVC; edits persist across runs on that workload until the workload is deleted | A workload's edits are visible to any spawn on the same workload — a leaf cannot assume the PVC starts at the frozen revision mid-chain |
+| Per-workload StatefulSet and PVC under `moca-sandbox` | Two users' workloads do not share a sandbox or disk; `workloads delete` reaps both | — |
 | Server persists result before responding to `/v1/runs` | Quit the parent agent, close the laptop, reboot — result survives | Nothing: there is **no cancel** |
 | Server-side result store | Collectable for **24h** | Past 24h, or after `teardown.sh`, it's gone |
 | Context Service frozen revision | Sha256-pinned, immutable upload; later uploads to the same workload are rejected | — |
-| Shared sandbox pool | Workloads and sandbox caches are per user | **Not a security boundary** between users — tasks share the sandbox as the same Linux user. Per-workload sandboxes are [rossoctl/moca#476](https://github.com/rossoctl/moca/issues/476) |
 | NetworkPolicy between `moca-sandbox` and everything else | Sandbox network isolation | Requires a NetworkPolicy-enforcing CNI (kind ≥ 0.24.0) |

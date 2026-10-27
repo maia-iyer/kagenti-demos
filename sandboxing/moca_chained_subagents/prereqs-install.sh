@@ -68,7 +68,12 @@ else
 fi
 
 echo "==> 2/6 MOCA deploy/k8s/setup.sh"
-(cd "${MOCA_DIR}" && ./deploy/k8s/setup.sh --target kind --build)
+# SH_WORKLOAD_SANDBOXES=1 turns on moca-provisioner: workloads created with
+# `--sandboxes N` get their own StatefulSet + PVC, instead of running on the
+# shared pool with a per-run writable overlay. Needs Kubernetes 1.30+ (kind
+# ships 1.31). The demo's two workload creates (diagnose read-only, fix
+# writable) rely on this path.
+(cd "${MOCA_DIR}" && SH_WORKLOAD_SANDBOXES=1 ./deploy/k8s/setup.sh --target kind --build)
 
 echo "==> 3/6 CoreDNS -> 1.1.1.1 / 8.8.8.8 (podman resolv.conf workaround)"
 # Idempotent: if forward is already patched, this is a no-op apply.
