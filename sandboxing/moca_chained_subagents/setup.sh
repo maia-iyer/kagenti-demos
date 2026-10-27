@@ -110,7 +110,15 @@ if ! printf '%s' "${sandboxes_probe}" | grep -q -- '--sandboxes'; then
   echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
   exit 1
 fi
-echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + --label + --sandboxes present)"
+# --prompt-file lets prompt 3 chain the diagnose leaf's output into the fix leaf
+# without inlining it on argv — Claude Code's Bash tool refuses inline prompts
+# with `#` or multi-line content. Without this flag the chain stalls at prompt 3.
+if ! printf '%s' "${label_probe}" | grep -q -- '--prompt-file'; then
+  echo "    this mocactl has no 'spawn --prompt-file' flag — too old." >&2
+  echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
+  exit 1
+fi
+echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + --label + --sandboxes + --prompt-file present)"
 
 if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
   echo "    namespace '${MOCA_NS}' not found on current kubectl context." >&2

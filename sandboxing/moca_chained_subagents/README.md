@@ -359,14 +359,14 @@ mocactl get "$SID" --json | jq .
 > create a workload with `--sandboxes 1 --mount writable`, then
 > dispatch with the **full** config digest from `MOCA.md` (`--config
 > $DIGEST_FULL`), tag `moca-chained-subagents-demo`, label `fix`. Tell
-> the leaf to use its `full-access-fix` skill and inline the previous
-> leaf's diagnosis verbatim into the prompt. `mocactl spawn` must be
-> the last tool call of this turn — do not call `get`, `subagents`, or
-> `sleep` after it, and do not wait. End the turn as soon as the
-> dispatch is done.
+> the leaf to use its `full-access-fix` skill, and pass the previous
+> leaf's diagnosis verbatim as its prompt (use `--prompt-file` if your
+> shell won't accept inlining). `mocactl spawn` must be the last tool
+> call of this turn — do not call `get`, `subagents`, or `sleep` after
+> it, and do not wait. End the turn as soon as the dispatch is done.
 
 The agent dispatches a second leaf with its own writable-mount workload
-and the diagnosis embedded verbatim in the prompt. Edits made inside
+and the diagnosis delivered as the leaf's prompt. Edits made inside
 the leaf land on the workload's own PVC, so a follow-up `mocactl spawn`
 on the same workload sees them.
 
