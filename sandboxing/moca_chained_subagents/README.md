@@ -305,7 +305,7 @@ transition:
 
 ```bash
 WLID=$(mocactl subagents --tag moca-chained-subagents-demo --json \
-  | jq -r '.subagents[] | select(.label=="diagnose") | .workload')
+  | jq -r '[.subagents[] | select(.label=="diagnose")] | sort_by(.submittedAt) | last | .workload')
 mocactl workloads get "$WLID" --json | jq '{status,contextType,revision}'
 # status: creating → awaiting_upload → ready; revision is the sha256 of the files
 ```
@@ -345,7 +345,7 @@ workloads delete "$WORKLOAD_ID"` for that leaf.
 
 ```bash
 SID=$(mocactl subagents --tag moca-chained-subagents-demo --json \
-  | jq -r '.subagents[] | select(.label=="diagnose") | .sessionId')
+  | jq -r '[.subagents[] | select(.label=="diagnose")] | sort_by(.submittedAt) | last | .sessionId')
 mocactl get "$SID" --json | jq .
 # status progresses: queued → responded (or failed / paused)
 ```
@@ -381,18 +381,16 @@ into the next prompt.
 
 ### Observe the chain
 
-The whole chain, with each dispatch's subagent config visible:
-
 ```bash
 TAG=moca-chained-subagents-demo
 mocactl subagents --tag "$TAG"
-mocactl subagents --tag "$TAG" --json \
-  | jq -r '.subagents[] | select(.bundle != null) | "\(.sessionId[:12])  \(.bundle)"'
 ```
 
-The `bundle` field shows which posture each dispatch booted with.
-The demo tag is operator-side (scopes `subagents --tag` and
-teardown), not a server-side identity.
+The `BUNDLE` column shows which posture each dispatch booted with
+(`$DIGEST_PUBLIC` for diagnose, `$DIGEST_FULL` for fix) — the chain's
+trust boundary is sha256-pinned, not operator-trust. The demo tag is
+operator-side (scopes `subagents --tag` and teardown), not a
+server-side identity.
 
 While leaves run, in another terminal:
 
@@ -408,9 +406,9 @@ prompt text, file contents, or credentials); grep by sessionId:
 
 ```bash
 SID=$(mocactl subagents --tag moca-chained-subagents-demo --json \
-  | jq -r '.subagents[] | select(.label=="diagnose") | .sessionId')
+  | jq -r '[.subagents[] | select(.label=="diagnose")] | sort_by(.submittedAt) | last | .sessionId')
 kubectl --context kind-moca -n moca logs deploy/moca-supervisor | \
-  jq -c "select(.event==\"audit\" and .sessionId==\"$SID\")"
+  jq -c -R "fromjson? | select(.event==\"audit\" and .sessionId==\"$SID\")"
 ```
 
 Context Service and sandbox pods don't surface per-request detail;
@@ -427,14 +425,26 @@ leaf open (the detached worker dies with your login session; the
 server doesn't care).
 
 To resume: relaunch the parent agent from the scratch dir
-(`claude` or `./run-opencode.sh`) and ask:
+(`claude` or `./run-opencode.sh`) and continue the flow — the next
+operator prompt (e.g. prompt 2 if you paused after prompt 1) picks up
+from the ledger. The parent agent runs `mocactl subagents --tag
+moca-chained-subagents-demo --json` to find the leaf and `mocactl get`
+to collect; nothing extra is needed.
+
+If you want an explicit inventory check first (useful when you've lost
+track of where you are), ask:
 
 > Any subagents still pending from an earlier session?
 
-The agent runs `mocactl subagents --tag moca-chained-subagents-demo
---json` and reconstructs the picture from the ledger rows (each row
-carries label, sessionId, workloadId, bundle digest, state). For
-anything still running, a later `mocactl get` collects it.
+The agent reads the ledger (each row carries label, sessionId,
+workloadId, bundle digest, state) and tells you what's live without
+collecting.
+
+To verify from the operator shell directly (readable form):
+
+```bash
+mocactl subagents --tag moca-chained-subagents-demo --json | jq .
+```
 
 The machine-global mocactl ledger **is** the resumable state. The
 scratch dir's `leaves/` holds leaf prompts and collected results, not

@@ -7,17 +7,27 @@ gets stuck.
 
 ## Known failure modes
 
-- **`mocactl` can't reach the control plane / connection refused.**
-  A port-forward isn't running. `prereqs-install.sh` backgrounds all
-  three — supervisor on 8080, control plane on 8090, Context Service on
-  9090. Check they are up with
+- **`mocactl` can't reach the control plane / connection refused, or
+  `mocactl login` fails with "the control plane closed the connection
+  (a proxy idle timeout?)".** A port-forward isn't running, or its
+  pinned pod rotated and the forward died mid-flight (common after any
+  cluster-side restart). `prereqs-install.sh` backgrounds all three —
+  supervisor on 8080, control plane on 8090, Context Service on 9090.
+  Check they are up with
   `pgrep -f 'kubectl --context kind-moca .* port-forward'` (expect
-  three PIDs); tail the logs under `~/.local/state/moca-chained-demo/`
-  for why one died. To restart them cleanly, re-run
-  `./prereqs-install.sh` (it kills stale ones first). Also make sure
-  `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` are exported (Claude Code
-  inherits them via `.claude/settings.json`'s `env`; OpenCode inherits
-  them only when launched via `./run-opencode.sh`).
+  three PIDs) and that something is listening on each port
+  (`lsof -nP -iTCP:8090 -sTCP:LISTEN`); tail the logs under
+  `~/.local/state/moca-chained-demo/` for why one died — a `kubectl
+  port-forward` process whose pod was replaced logs `error forwarding
+  port … failed to find sandbox` and `lost connection to pod`, and may
+  leave the local port in a half-closed state that blocks a naive
+  restart. To restart cleanly, re-run `./prereqs-install.sh` (it kills
+  stale forwards first); if a port is still bound,
+  `lsof -nP -iTCP:<port> -sTCP:LISTEN -t | xargs -r kill -9` and
+  re-run. Also make sure `SH_CONTROL_PLANE_URL` / `SH_HARNESS_URL` are
+  exported (Claude Code inherits them via `.claude/settings.json`'s
+  `env`; OpenCode inherits them only when launched via
+  `./run-opencode.sh`).
 - **`setup.sh` fails at doctor.** Follow the fix doctor prints for
   each failing check — it covers reachability, login, credentials,
   and the harness.
