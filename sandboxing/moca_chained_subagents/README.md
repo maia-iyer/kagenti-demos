@@ -92,6 +92,8 @@ alone.
   curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/scripts/install-mocactl.sh | MOCACTL_VERSION=edge sh
   ```
   `./setup.sh` probes all four and refuses to run on an older build.
+  Tested against `edge-4206293`; pin with
+  `MOCACTL_VERSION=edge-4206293` if a newer edge regresses.
 - [`contextctl`](https://github.com/rossoctl/context-service) v0.3.0+
   with the `ctx pack` subcommand (build from main — `make build` — until
   a release ships). The upstream `moca-delegate-task` skill assumes
