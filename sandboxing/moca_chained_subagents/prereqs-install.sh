@@ -162,6 +162,26 @@ mkdir -p "${PF_LOG_DIR}"
 # whole VM down (see Troubleshooting > "the harness refused: 404").
 pkill -f "kubectl --context ${KUBE_CONTEXT} .* port-forward" 2>/dev/null || true
 
+# A port-forward whose pod rotated dies with "lost connection to pod" but can
+# leave the local port bound to the stale kubectl process, blocking a fresh
+# bind with "address already in use". Reap any kubectl PID still listening on
+# a demo port — target `kubectl` by command name, not whatever's on the port.
+free_stale_pf() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    local pid
+    for pid in $(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true); do
+      if [[ "$(ps -o comm= -p "${pid}" 2>/dev/null || true)" == *kubectl* ]]; then
+        echo "    freeing stale kubectl on ${port} (pid ${pid})"
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+    done
+  fi
+}
+free_stale_pf "${HARNESS_PORT}"
+free_stale_pf "${CP_PORT}"
+free_stale_pf "${CS_PORT}"
+
 start_pf() {
   local ns="$1" svc="$2" local_port="$3" remote_port="$4" log_name="$5"
   nohup kubectl --context "${KUBE_CONTEXT}" -n "${ns}" port-forward \
@@ -184,7 +204,7 @@ sleep 2
 probe_pf() {
   local port="$1" log_name="$2"
   local status
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in {1..10}; do
     status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
       "http://127.0.0.1:${port}/" 2>/dev/null || true)"
     if [[ "${status}" != "000" && -n "${status}" ]]; then
