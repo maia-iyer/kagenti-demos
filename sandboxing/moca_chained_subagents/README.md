@@ -257,20 +257,6 @@ OpenCode — the wrapper exports `SH_CONTROL_PLANE_URL` /
 ~/tmp/moca-chained-scratch/run-opencode.sh
 ```
 
-The demo flow is **operator prompts, in sequence**. The skill does
-not encode the flow; you drive it.
-
-Three state types travel through the chain, and you can peek at each
-from the operator's shell:
-
-- **Subagent config** — sha256-pinned skills + commands on the
-  control plane. Two were promoted at `./setup.sh` time; their digests
-  are in `MOCA.md` (`grep '^Config digest' MOCA.md`).
-- **Workload** — sha256-pinned fixture files in Context Service.
-  One per leaf, created at dispatch, released after collection.
-- **Session** — the per-subagent join of subagent config + workload
-  + sandbox pod on the control plane. 24h result TTL.
-
 In a side terminal, export the port-forward URLs so `mocactl` can
 reach MOCA (also printed by `setup.sh`):
 
@@ -288,13 +274,10 @@ export SH_HARNESS_URL=http://127.0.0.1:18080
 > Have the leaf use its `public-research` skill. End the turn after
 > `mocactl spawn` — do not call `get`, `subagents`, or `sleep`.
 
-The parent agent reads `moca-delegate-task` (if it tries the
-in-process subagent tool first, the deny fires and it re-routes),
-packs cwd to `.moca-delegate/repo.context`, creates the workload,
-and runs `mocactl spawn … --config "$DIGEST_PUBLIC" --workload
-"$WORKLOAD_ID" --tag moca-chained-subagents-demo --label diagnose`.
-Each permission prompt shows a legible dispatch command; the ledger
-row carries label, sessionId, workloadId, bundle digest.
+The parent agent re-routes through `moca-delegate-task` (the deny
+on its in-process subagent tool fires first) and follows the skill:
+pack, workload-create, `mocactl spawn`. Each permission prompt shows
+a legible dispatch command.
 
 *Peek at state:* look up the workload from the ledger and watch it
 transition:
@@ -358,19 +341,17 @@ mocactl get "$SID" --json | jq .
 > End the turn after `mocactl spawn` — do not call `get`, `subagents`,
 > or `sleep`.
 
-The agent dispatches a second leaf with its own writable-mount
-workload, delivering the diagnosis as the leaf's prompt via
-`--prompt-file`. Edits land on the workload's own PVC.
+The fix leaf runs on its own writable-mount workload; edits land on
+that PVC.
 
 **Prompt 4 — collect the fix result.**
 
 > Check on it.
 
-The agent looks up the fix leaf's handles (filtering by
-`.label=="fix"`), collects, surfaces the change and test outcome
-(`Ran 1 test / OK`), then deletes the workload. Each leaf is a
-separate session; what flows between them is prompt text only, passed
-via `--prompt-file` so the parent's shell never sees multi-line argv.
+The agent collects the fix leaf (filtering ledger by
+`.label=="fix"`), surfaces the change and test outcome (`Ran 1 test /
+OK`), then deletes the workload. Each leaf is a separate session;
+between them, only prompt text flows (via `--prompt-file`).
 
 ### Observe the chain
 
