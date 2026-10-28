@@ -208,7 +208,7 @@ Prereqs installed. Port-forwards are running in the background; logs:
 
 Next, once per machine:
 
-  export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+  export SH_CONTROL_PLANE_URL=http://127.0.0.1:${CP_PORT}
   mocactl login
   # ANTHROPIC_BASE_URL points at an Anthropic-compatible endpoint (e.g. a
   # LiteLLM gateway); ANTHROPIC_AUTH_TOKEN is the bearer token for it.

@@ -160,12 +160,13 @@ Rotate it once trusted-route auth lands upstream.
 ### Port-forwards
 
 `prereqs-install.sh` backgrounds the three port-forwards itself —
-`moca-supervisor` on `127.0.0.1:8080`, `moca-control-plane` on `8090`,
-`context-service` on `9090`. Logs live at
-`~/.local/state/moca-chained-demo/`. The MOCA harness **must** be on
-local 8080 (the control plane advertises it there); Context Service's
-`public-url` in the ConfigMap matches `127.0.0.1:9090`. These ports are
-not freely configurable without re-running step 5 of the install.
+`moca-supervisor` on `127.0.0.1:${HARNESS_PORT:-18080}`,
+`moca-control-plane` on `${CP_PORT:-18090}`, `context-service` on
+`${CS_PORT:-19090}`. Logs live at `~/.local/state/moca-chained-demo/`.
+Override by exporting those env vars before running
+`./prereqs-install.sh` and `./setup.sh`; the control plane is told the
+chosen harness port via `SH_PUBLIC_HARNESS_URL`, and the
+`moca-context-service` ConfigMap's `public-url` matches `CS_PORT`.
 
 To restart them, re-run `./prereqs-install.sh` (it kills stale
 port-forwards against `kind-moca` before relaunching). To kill them
@@ -174,7 +175,7 @@ along with the cluster, use `./prereqs-uninstall.sh`.
 ### Log in (once per machine)
 
 ```bash
-export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+export SH_CONTROL_PLANE_URL=http://127.0.0.1:18090
 mocactl login
 # ANTHROPIC_BASE_URL points at an Anthropic-compatible endpoint (e.g. a
 # LiteLLM gateway); ANTHROPIC_AUTH_TOKEN is the bearer token for it.
@@ -232,11 +233,12 @@ Environment overrides (set before running):
 - `PARENT` — parent coding agent to stage config for: `claude`
   (default) or `opencode`.
 - `MOCA_NS` — namespace (default `moca`).
-- `HARNESS_PORT` / `CP_PORT` — local port-forward ports (default
-  `8080` / `8090`). Changing `HARNESS_PORT` breaks discovery today
-  because MOCA's `deploy/k8s/setup.sh` hardcodes `SH_PUBLIC_HARNESS_URL`
-  to `http://127.0.0.1:8080` — see Troubleshooting if 8080 conflicts
-  with another service on your host.
+- `HARNESS_PORT` / `CP_PORT` / `CS_PORT` — local port-forward ports
+  (default `18080` / `18090` / `19090`). `prereqs-install.sh` passes
+  `SH_PUBLIC_HARNESS_URL=http://127.0.0.1:${HARNESS_PORT}` to MOCA's
+  `deploy/k8s/setup.sh` so the control plane advertises the chosen
+  port. If you override, set the same env vars before running
+  `./prereqs-install.sh` and `./setup.sh`.
 - `SCRATCH_DIR` — scratch dir path.
 
 > **Re-running setup discards the previous scratch dir.** The demo tag
@@ -277,8 +279,8 @@ reach MOCA (also printed by `setup.sh`):
 
 ```bash
 cd ~/tmp/moca-chained-scratch
-export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
-export SH_HARNESS_URL=http://127.0.0.1:8080
+export SH_CONTROL_PLANE_URL=http://127.0.0.1:18090
+export SH_HARNESS_URL=http://127.0.0.1:18080
 ```
 
 **Prompt 1 — start the diagnosis.** Paste something like:
