@@ -355,12 +355,21 @@ between them, only prompt text flows (via `--prompt-file`).
 
 ### Observe the chain
 
+The tag is stable across runs, so `mocactl subagents --tag` shows
+every dispatch under it ever. For just the current run (newest
+diagnose + anything after), filter by `submittedAt`:
+
 ```bash
 TAG=moca-chained-subagents-demo
-mocactl subagents --tag "$TAG"
+mocactl subagents --tag "$TAG" --json | jq '
+  .subagents
+  | [.[] | select(.label=="diagnose")] as $diag
+  | ($diag | sort_by(.submittedAt) | last | .submittedAt) as $start
+  | map(select(.submittedAt >= $start))
+'
 ```
 
-The `BUNDLE` column shows which posture each dispatch booted with
+Each row's `bundle` shows which posture that dispatch booted with
 (`$DIGEST_PUBLIC` for diagnose, `$DIGEST_FULL` for fix) — the chain's
 trust boundary is sha256-pinned, not operator-trust. The demo tag is
 operator-side (scopes `subagents --tag` and teardown), not a
