@@ -36,6 +36,13 @@ CONTEXT_SERVICE_DIR="${CLONE_DIR}/context-service"
 KIND_CLUSTER="${KIND_CLUSTER:-moca}"
 KUBE_CONTEXT="kind-${KIND_CLUSTER}"
 
+# Local port-forward ports. If you override these, set the same env vars
+# before running ./setup.sh.
+HARNESS_PORT="${HARNESS_PORT:-18080}"
+CP_PORT="${CP_PORT:-18090}"
+CS_PORT="${CS_PORT:-19090}"
+HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}"
+
 if [[ -z "${SH_GITHUB_CLIENT_ID:-}" ]]; then
   echo "SH_GITHUB_CLIENT_ID is required (GitHub OAuth app, device-flow enabled)." >&2
   exit 1
@@ -73,7 +80,9 @@ echo "==> 2/6 MOCA deploy/k8s/setup.sh"
 # shared pool with a per-run writable overlay. Needs Kubernetes 1.30+ (kind
 # ships 1.31). The demo's two workload creates (diagnose read-only, fix
 # writable) rely on this path.
-(cd "${MOCA_DIR}" && SH_WORKLOAD_SANDBOXES=1 ./deploy/k8s/setup.sh --target kind --build)
+(cd "${MOCA_DIR}" && \
+  SH_WORKLOAD_SANDBOXES=1 SH_PUBLIC_HARNESS_URL="${HARNESS_URL}" \
+  ./deploy/k8s/setup.sh --target kind --build)
 
 echo "==> 3/6 CoreDNS -> 1.1.1.1 / 8.8.8.8 (podman resolv.conf workaround)"
 # Idempotent: if forward is already patched, this is a no-op apply.
@@ -120,7 +129,7 @@ CS_TOKEN="demo-token-unchecked"
 kubectl --context "${KUBE_CONTEXT}" -n moca create configmap moca-context-service \
   --from-literal=enabled=1 \
   --from-literal=url=http://context-service.context-service.svc:8080 \
-  --from-literal=public-url=http://127.0.0.1:9090 \
+  --from-literal=public-url=http://127.0.0.1:${CS_PORT} \
   --from-literal=namespace=context-service \
   --dry-run=client -o yaml |
   kubectl --context "${KUBE_CONTEXT}" apply -f - >/dev/null
@@ -140,17 +149,38 @@ kubectl --context "${KUBE_CONTEXT}" -n moca rollout status deployment/moca-super
 echo "==> 6/6 Background port-forwards (supervisor, control plane, context-service)"
 # Why these three: mocactl talks to the control plane and the harness
 # (supervisor), and the client-side bundle upload during `mocactl workloads
-# create` targets context-service's public URL. The MOCA harness MUST be on
-# local 8080 — the control plane advertises it there — and context-service's
-# public-url ConfigMap entry is 127.0.0.1:9090 (see step 5), so these ports
-# are not freely configurable.
+# create` targets context-service's public URL. The harness local port is
+# whatever SH_PUBLIC_HARNESS_URL names (set in step 2); the context-service
+# public-url ConfigMap entry (step 5) matches CS_PORT above.
 PF_LOG_DIR="${PF_LOG_DIR:-${HOME}/.local/state/moca-chained-demo}"
 mkdir -p "${PF_LOG_DIR}"
 
 # Re-running the script must not stack duplicate port-forwards. Match on
 # the full argv — do NOT simplify to `pkill kubectl`, which would nuke
-# unrelated port-forwards on this machine.
+# unrelated port-forwards on this machine, and do NOT lsof-kill by port:
+# on Rancher Desktop, lima's SSH mux binds *:8080 and killing it takes the
+# whole VM down (see Troubleshooting > "the harness refused: 404").
 pkill -f "kubectl --context ${KUBE_CONTEXT} .* port-forward" 2>/dev/null || true
+
+# A port-forward whose pod rotated dies with "lost connection to pod" but can
+# leave the local port bound to the stale kubectl process, blocking a fresh
+# bind with "address already in use". Reap any kubectl PID still listening on
+# a demo port — target `kubectl` by command name, not whatever's on the port.
+free_stale_pf() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    local pid
+    for pid in $(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true); do
+      if [[ "$(ps -o comm= -p "${pid}" 2>/dev/null || true)" == *kubectl* ]]; then
+        echo "    freeing stale kubectl on ${port} (pid ${pid})"
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+    done
+  fi
+}
+free_stale_pf "${HARNESS_PORT}"
+free_stale_pf "${CP_PORT}"
+free_stale_pf "${CS_PORT}"
 
 start_pf() {
   local ns="$1" svc="$2" local_port="$3" remote_port="$4" log_name="$5"
@@ -159,28 +189,37 @@ start_pf() {
     >"${PF_LOG_DIR}/${log_name}.log" 2>&1 &
   disown
 }
-start_pf moca            moca-supervisor      8080 8080 moca-supervisor
-start_pf moca            moca-control-plane   8090 8080 moca-control-plane
-start_pf context-service context-service      9090 8080 context-service
+start_pf moca            moca-supervisor      "${HARNESS_PORT}" 8080 moca-supervisor
+start_pf moca            moca-control-plane   "${CP_PORT}"      8080 moca-control-plane
+start_pf context-service context-service      "${CS_PORT}"      8080 context-service
 
-# Give kubectl a moment to establish the forwards before probing.
+# Give kubectl a moment to establish the forwards before probing. The retry
+# loop below is the real safety net — this is just so the common case prints
+# "up" on the first try instead of after a visible pause.
 sleep 2
 
+# Port-forwards to a svc/ depend on the service's endpoints being ready,
+# which can lag by up to ~30 s after `deploy/k8s/setup.sh --build` rolls the
+# supervisor. Poll with backoff for ~20 s before giving up.
 probe_pf() {
   local port="$1" log_name="$2"
   local status
-  status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
-    "http://127.0.0.1:${port}/" 2>/dev/null || true)"
-  if [[ "${status}" == "000" || -z "${status}" ]]; then
-    echo "    port-forward on 127.0.0.1:${port} is not reachable." >&2
-    echo "    See log:  ${PF_LOG_DIR}/${log_name}.log" >&2
-    return 1
-  fi
-  echo "    127.0.0.1:${port} up (HTTP ${status})"
+  for _ in {1..10}; do
+    status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
+      "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+    if [[ "${status}" != "000" && -n "${status}" ]]; then
+      echo "    127.0.0.1:${port} up (HTTP ${status})"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "    port-forward on 127.0.0.1:${port} is not reachable after ~20s." >&2
+  echo "    See log:  ${PF_LOG_DIR}/${log_name}.log" >&2
+  return 1
 }
-probe_pf 8080 moca-supervisor
-probe_pf 8090 moca-control-plane
-probe_pf 9090 context-service
+probe_pf "${HARNESS_PORT}" moca-supervisor
+probe_pf "${CP_PORT}"      moca-control-plane
+probe_pf "${CS_PORT}"      context-service
 
 cat <<EOF
 
@@ -189,7 +228,7 @@ Prereqs installed. Port-forwards are running in the background; logs:
 
 Next, once per machine:
 
-  export SH_CONTROL_PLANE_URL=http://127.0.0.1:8090
+  export SH_CONTROL_PLANE_URL=http://127.0.0.1:${CP_PORT}
   mocactl login
   # ANTHROPIC_BASE_URL points at an Anthropic-compatible endpoint (e.g. a
   # LiteLLM gateway); ANTHROPIC_AUTH_TOKEN is the bearer token for it.

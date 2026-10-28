@@ -85,7 +85,9 @@ else
     if mocactl workloads delete "${wid}" >/dev/null 2>&1; then
       echo "    deleted workload ${wid}"
     else
-      echo "    could not delete workload ${wid} (already gone?)"
+      # Expected when the agent followed the moca-delegate-task skill and ran
+      # `mocactl workloads delete` after collecting each leaf's result.
+      echo "    workload ${wid} already deleted (reaped mid-demo)"
     fi
   done
 fi

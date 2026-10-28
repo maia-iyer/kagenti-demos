@@ -9,10 +9,10 @@
 #      end (mocactl doctor).
 #   2. Stage a scratch dir whose contents are the example_repo project
 #      (so `./` at the parent's cwd matches `./` at the leaf's cwd),
-#      plus a leaves/ dir for prompts/notes/results, a moca-delegate-task
-#      skill (upstream SKILL.md, verbatim), and the parent coding agent's
-#      config pointing at this run (Claude Code or OpenCode — pick with
-#      PARENT=claude|opencode, default claude).
+#      plus a moca-delegate-task skill (upstream SKILL.md, verbatim)
+#      and the parent coding agent's config pointing at this run
+#      (Claude Code or OpenCode — pick with PARENT=claude|opencode,
+#      default claude).
 #
 # Pack + workload create + workload delete happen per leaf at dispatch
 # time, driven by the agent through the skill — not by this script.
@@ -28,11 +28,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MOCA_NS="${MOCA_NS:-moca}"
 CONTEXT_SERVICE_NS="${CONTEXT_SERVICE_NS:-context-service}"
-# The control plane tells clients where the harness is, and deploy/k8s
-# advertises it as http://127.0.0.1:8080 — so the supervisor's port-forward
-# must use local port 8080 specifically.
-HARNESS_PORT="${HARNESS_PORT:-8080}"
-CP_PORT="${CP_PORT:-8090}"
+# Port-forward ports; keep defaults identical to prereqs-install.sh. If you
+# override these, set the same env vars before running ./prereqs-install.sh.
+# deploy/k8s/setup.sh is invoked by prereqs-install.sh with
+# SH_PUBLIC_HARNESS_URL=http://127.0.0.1:${HARNESS_PORT}, so the control
+# plane advertises the port chosen here.
+HARNESS_PORT="${HARNESS_PORT:-18080}"
+CP_PORT="${CP_PORT:-18090}"
 HARNESS_URL="${HARNESS_URL:-http://127.0.0.1:${HARNESS_PORT}}"
 CP_URL="${CP_URL:-http://127.0.0.1:${CP_PORT}}"
 SCRATCH_DIR="${SCRATCH_DIR:-$HOME/tmp/moca-chained-scratch}"
@@ -110,7 +112,15 @@ if ! printf '%s' "${sandboxes_probe}" | grep -q -- '--sandboxes'; then
   echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
   exit 1
 fi
-echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + --label + --sandboxes present)"
+# --prompt-file lets prompt 3 chain the diagnose leaf's output into the fix leaf
+# without inlining it on argv — Claude Code's Bash tool refuses inline prompts
+# with `#` or multi-line content. Without this flag the chain stalls at prompt 3.
+if ! printf '%s' "${label_probe}" | grep -q -- '--prompt-file'; then
+  echo "    this mocactl has no 'spawn --prompt-file' flag — too old." >&2
+  echo "    Reinstall with the install script above (MOCACTL_VERSION=edge)." >&2
+  exit 1
+fi
+echo "    ok: kubectl, jq, contextctl, mocactl on PATH (workloads + --label + --sandboxes + --prompt-file present)"
 
 if ! kubectl get ns "${MOCA_NS}" >/dev/null 2>&1; then
   echo "    namespace '${MOCA_NS}' not found on current kubectl context." >&2
@@ -180,7 +190,7 @@ echo "==> Staging scratch dir at ${SCRATCH_DIR} (parent: ${PARENT})..."
 # Fresh staging on every run: the demo tag is per-run, so notes and results
 # from an earlier run would be orphaned. Collect results before re-running.
 rm -rf "${SCRATCH_DIR}"
-mkdir -p "${SCRATCH_DIR}/leaves"
+mkdir -p "${SCRATCH_DIR}"
 
 # Stage parent-specific config + skill. Both agents consume the SAME upstream
 # SKILL.md verbatim; only the config dir name, config file format, and
@@ -249,10 +259,10 @@ cat >> "${SCRATCH_DIR}/.gitignore" <<'EOF'
 
 # Parent-side bookkeeping (added by setup.sh). The scratch dir is also the
 # project, so these paths sit alongside src/, tests/, etc.
-/leaves/
 /MOCA.md
 /.envrc
 /.moca-delegate/
+/results/
 EOF
 # Parent-specific ignores: contextctl auto-skips .claude/ but NOT .opencode/,
 # so without this the parent-side skill + permission config would leak into
@@ -306,8 +316,8 @@ Control plane URL:     ${CP_URL}
 Harness URL:           ${HARNESS_URL}
 Config digest public:  ${DIGEST_PUBLIC}
 Config digest full:    ${DIGEST_FULL}
-Project to pack:       .   (the scratch dir IS the project)
-Leaves dir:            ./leaves
+Project to pack:       .   (fixture copied into the scratch root)
+Results dir:           ./results   (created on first `mocactl get --out results`)
 
 Every mocactl command run from this directory needs the port-forward URLs
 in the environment. ${PARENT_ENV_NOTE}
