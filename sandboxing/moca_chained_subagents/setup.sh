@@ -9,10 +9,10 @@
 #      end (mocactl doctor).
 #   2. Stage a scratch dir whose contents are the example_repo project
 #      (so `./` at the parent's cwd matches `./` at the leaf's cwd),
-#      plus a leaves/ dir for prompts/notes/results, a moca-delegate-task
-#      skill (upstream SKILL.md, verbatim), and the parent coding agent's
-#      config pointing at this run (Claude Code or OpenCode — pick with
-#      PARENT=claude|opencode, default claude).
+#      plus a moca-delegate-task skill (upstream SKILL.md, verbatim)
+#      and the parent coding agent's config pointing at this run
+#      (Claude Code or OpenCode — pick with PARENT=claude|opencode,
+#      default claude).
 #
 # Pack + workload create + workload delete happen per leaf at dispatch
 # time, driven by the agent through the skill — not by this script.
@@ -190,7 +190,7 @@ echo "==> Staging scratch dir at ${SCRATCH_DIR} (parent: ${PARENT})..."
 # Fresh staging on every run: the demo tag is per-run, so notes and results
 # from an earlier run would be orphaned. Collect results before re-running.
 rm -rf "${SCRATCH_DIR}"
-mkdir -p "${SCRATCH_DIR}/leaves"
+mkdir -p "${SCRATCH_DIR}"
 
 # Stage parent-specific config + skill. Both agents consume the SAME upstream
 # SKILL.md verbatim; only the config dir name, config file format, and
@@ -259,10 +259,10 @@ cat >> "${SCRATCH_DIR}/.gitignore" <<'EOF'
 
 # Parent-side bookkeeping (added by setup.sh). The scratch dir is also the
 # project, so these paths sit alongside src/, tests/, etc.
-/leaves/
 /MOCA.md
 /.envrc
 /.moca-delegate/
+/results/
 EOF
 # Parent-specific ignores: contextctl auto-skips .claude/ but NOT .opencode/,
 # so without this the parent-side skill + permission config would leak into
@@ -316,8 +316,8 @@ Control plane URL:     ${CP_URL}
 Harness URL:           ${HARNESS_URL}
 Config digest public:  ${DIGEST_PUBLIC}
 Config digest full:    ${DIGEST_FULL}
-Project to pack:       .   (the scratch dir IS the project)
-Leaves dir:            ./leaves
+Project to pack:       .   (fixture copied into the scratch root)
+Results dir:           ./results   (created on first `mocactl get --out results`)
 
 Every mocactl command run from this directory needs the port-forward URLs
 in the environment. ${PARENT_ENV_NOTE}
